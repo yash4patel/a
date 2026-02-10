@@ -1,0 +1,19 @@
+[INPUT]
+account_file = /path/to/account_reference.csv
+party_file = /path/to/party_reference.csv
+ach_dir = /path/to/ach/files
+check_dir = /path/to/check/xml
+wire_dir = /path/to/wire/logs
+ach_glob = *ACH,*ach
+check_glob = *.xml,*.XML
+wire_glob = **/*.log,**/*.LOG
+
+[OUTPUT]
+output_dir = /path/to/output
+
+[OPTIONS]
+cross_check_party = true
+cross_check_ach = true
+cross_check_check = true
+cross_check_wire = true
+strip_leading_zeros = true
