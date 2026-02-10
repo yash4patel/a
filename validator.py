@@ -1,391 +1,1240 @@
 #!/usr/bin/env python3
 """
 Cross-Channel Reference Validator
+Validates Account & Party reference CSVs with comprehensive logging and error handling.
 
-Purpose:
-- Verify reference Account/Party files against historical channel data
-  (ACH, Check, Wire).
-- Report match percentages for accounts and parties per channel.
-- Produce TSV outputs for unmatched accounts/parties and a summary file.
+Cross-checks:
+- Verify that accounts and parties in reference data match historical
+  channel data for ACH, Check, and Wire.
+- Report match percentages for each channel.
 
 Usage:
-    python validator.py /path/to/config.ini
+    python validator.py <config.ini>
 """
 
-import argparse
-import configparser
-import glob
 import os
+import glob
 import re
-from collections import Counter
-from typing import Dict, Iterable, List, Set, Tuple
+import json
+import sys
+import configparser
+import logging
+from typing import Dict, Any, List, Tuple, Iterable, Set, Optional
+from datetime import datetime
+from collections import defaultdict, Counter
 
 import pandas as pd
+
+# Import LogManager from separate module
+from log_manager import LogManager
 
 ACCOUNT_COL = "AccountNumber"
 PARTY_COL = "PartyID"
 
-ON_US_RE = re.compile(r"<ON_US>(.*?)</ON_US>")
-WIRE_ID_RE = re.compile(r"<q1:ID>(.*?)</q1:ID>")
 
+class ValidationConfig:
+    """Configuration manager for validation settings."""
 
-def read_pipe_csv(path: str) -> pd.DataFrame:
-    try:
-        return pd.read_csv(path, sep="|", dtype=str, keep_default_na=False, encoding="utf-8")
-    except Exception:
-        return pd.read_csv(path, sep="|", dtype=str, keep_default_na=False, encoding="latin-1")
+    def __init__(self, config_path: str = "config.ini"):
+        self.config = self._load_config(config_path)
 
+        # Load file paths - empty string if not provided or path doesn't exist
+        self.account_file = self._get_valid_path("INPUT", "account_file")
+        self.party_file = self._get_valid_path("INPUT", "party_file")
+        self.achodfi_file = self._get_valid_path("INPUT", "achodfi_file")
+        self.online_business_file = self._get_valid_path("INPUT", "online_business_file")
+        self.retail_file = self._get_valid_path("INPUT", "retail_file")
 
-def load_config(path: str) -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    read_files = cfg.read(path)
-    if not read_files:
-        raise FileNotFoundError(f"Config file not found: {path}")
-    return cfg
+        # Historical channel inputs
+        self.ach_dir = self._get_valid_path("INPUT", "ach_dir")
+        self.check_dir = self._get_valid_path("INPUT", "check_dir")
+        self.wire_dir = self._get_valid_path("INPUT", "wire_dir")
 
+        self.ach_globs = self._get_list("INPUT", "ach_glob", "*ACH,*ach")
+        self.check_globs = self._get_list("INPUT", "check_glob", "*.xml,*.XML")
+        self.wire_globs = self._get_list("INPUT", "wire_glob", "**/*.log,**/*.LOG")
 
-def get_cfg(cfg: configparser.ConfigParser, section: str, key: str, default: str = "") -> str:
-    if not cfg.has_section(section):
-        return default
-    return cfg.get(section, key, fallback=default).strip()
+        self.output_dir = self.config["OUTPUT"]["output_dir"].strip()
+        self.json_schema_file = self.config["SCHEMA"]["json_schema_file"].strip()
 
+        # Load tenant name from config
+        self.tenant_name = self.config.get("GENERAL", "tenant_name", fallback="Unknown").strip()
 
-def get_bool(cfg: configparser.ConfigParser, section: str, key: str, default: bool) -> bool:
-    raw = get_cfg(cfg, section, key, str(default))
-    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
+        # Cross-check options
+        self.cross_check_party = self._get_bool("OPTIONS", "cross_check_party", True)
+        self.cross_check_ach = self._get_bool("OPTIONS", "cross_check_ach", True)
+        self.cross_check_check = self._get_bool("OPTIONS", "cross_check_check", True)
+        self.cross_check_wire = self._get_bool("OPTIONS", "cross_check_wire", True)
+        self.strip_leading_zeros = self._get_bool("OPTIONS", "strip_leading_zeros", True)
 
-
-def normalize_account(value: str, strip_leading_zeros: bool) -> str:
-    val = value.strip()
-    if not val:
-        return ""
-    if strip_leading_zeros and val.isdigit():
-        stripped = val.lstrip("0")
-        return stripped if stripped else "0"
-    return val
-
-
-def normalize_party(value: str) -> str:
-    return value.strip()
-
-
-def resolve_globs(base_dir: str, patterns: Iterable[str]) -> List[str]:
-    files: List[str] = []
-    for pat in patterns:
-        files.extend(glob.glob(os.path.join(base_dir, pat), recursive=True))
-    return sorted(set(files))
-
-
-def parse_ach_accounts(ach_dir: str, patterns: Iterable[str]) -> List[str]:
-    accounts: List[str] = []
-    if not ach_dir or not os.path.isdir(ach_dir):
-        return accounts
-    for path in resolve_globs(ach_dir, patterns):
+    def _get_valid_path(self, section: str, key: str) -> str:
+        """Get file path from config, return empty string if invalid or not provided."""
         try:
-            with open(path, "r", encoding="latin-1", errors="ignore") as handle:
-                for line in handle:
-                    if line.startswith("6") and len(line) >= 29:
-                        acct = line[12:29].strip()
-                        if acct:
-                            accounts.append(acct)
+            path = self.config.get(section, key, fallback="").strip()
+            if not path or path.lower() in ("", "none", "null", "n/a"):
+                return ""
+            # Return path even if it doesn't exist - let validation handle the error
+            return path
         except Exception:
-            continue
-    return accounts
+            return ""
 
-
-def parse_check_accounts(check_dir: str, patterns: Iterable[str]) -> List[str]:
-    accounts: List[str] = []
-    if not check_dir or not os.path.isdir(check_dir):
-        return accounts
-    for path in resolve_globs(check_dir, patterns):
+    def _get_list(self, section: str, key: str, default: str) -> List[str]:
         try:
-            with open(path, "r", encoding="latin-1", errors="ignore") as handle:
-                for line in handle:
-                    for match in ON_US_RE.finditer(line):
-                        raw = match.group(1).strip()
-                        if "/" in raw:
-                            raw = raw.split("/")[0]
-                        if raw:
-                            accounts.append(raw)
+            raw = self.config.get(section, key, fallback=default).strip()
         except Exception:
-            continue
-    return accounts
+            raw = default
+        return [v.strip() for v in raw.split(",") if v.strip()]
 
-
-def parse_wire_accounts(wire_dir: str, patterns: Iterable[str]) -> List[str]:
-    accounts: List[str] = []
-    if not wire_dir or not os.path.isdir(wire_dir):
-        return accounts
-    for path in resolve_globs(wire_dir, patterns):
+    def _get_bool(self, section: str, key: str, default: bool) -> bool:
         try:
-            with open(path, "r", encoding="latin-1", errors="ignore") as handle:
-                for line in handle:
-                    for match in WIRE_ID_RE.finditer(line):
-                        raw = match.group(1).strip()
-                        if raw and raw.lower() != "unknown":
-                            accounts.append(raw)
+            raw = self.config.get(section, key, fallback=str(default)).strip()
         except Exception:
-            continue
-    return accounts
+            return default
+        return raw.lower() in ("1", "true", "yes", "y", "on")
+
+    @staticmethod
+    def _load_config(path: str) -> configparser.ConfigParser:
+        """Load configuration from INI file."""
+        cfg = configparser.ConfigParser()
+        read_files = cfg.read(path)
+        if not read_files:
+            raise FileNotFoundError(f"Config file not found: {path}")
+        return cfg
 
 
-def load_reference_data(
-    account_file: str,
-    party_file: str,
-    strip_leading_zeros: bool,
-) -> Tuple[Dict[str, str], Set[str]]:
-    account_df = read_pipe_csv(account_file)
-    if ACCOUNT_COL not in account_df.columns or PARTY_COL not in account_df.columns:
-        raise ValueError(
-            f"Account file must include columns: {ACCOUNT_COL}, {PARTY_COL}"
+class ValidationRules:
+    """Validation rules and normalization functions."""
+
+    # Regular expressions
+    DATE_YMD_RE = re.compile(r"^\d{8}$")
+    MONEY_RE = re.compile(r"^-?\d+\.\d{2}$")
+
+    @staticmethod
+    def normalize_status(value: str) -> str:
+        """Normalize status values to capitalized format."""
+        value = value.strip()
+        if not value:
+            return value
+        lower = value.lower()
+        return lower.capitalize() if lower in ("open", "closed", "dormant") else value
+
+    @staticmethod
+    def normalize_tf(value: str) -> str:
+        value = value.strip().upper()
+        if value == "":
+            return value
+        if value in ("Y", "T"):
+            return "T"
+        if value in ("N", "F"):
+            return "F"
+        return value
+
+    @staticmethod
+    def normalize_money(value: str) -> str:
+        """Normalize money values to 2 decimal places."""
+        value = value.strip()
+        if not value:
+            return value
+        try:
+            return f"{float(value):.2f}"
+        except Exception:
+            return value
+
+    @staticmethod
+    def normalize_customer_type(value: str) -> str:
+        """Normalize customer type to capitalized format."""
+        value = value.strip()
+        if not value:
+            return value
+        lower = value.lower()
+        return lower.capitalize() if lower in ("business", "personal") else value
+
+    @staticmethod
+    def validate_status(value: str) -> bool:
+        """Validate status is one of: Open, Closed, Dormant."""
+        return value in ("Open", "Closed", "Dormant")
+
+    @staticmethod
+    def validate_tf(value: str) -> bool:
+        """Validate T/F flag."""
+        return value in ("T", "F")
+
+    @staticmethod
+    def validate_customer_type(value: str) -> bool:
+        """Validate customer type."""
+        return value in ("Business", "Personal")
+
+
+class SchemaManager:
+    """Manages validation schemas and JSON configurations."""
+
+    # Schema definitions: (required, validator, max_len, fixer)
+    SCHEMAS: Dict[str, Dict[str, Tuple[bool, Any, Any, Any]]] = {
+        "Account": {
+            "AccountNumber": (True, lambda v: len(v) > 0, 100, None),
+            "PartyID": (True, lambda v: len(v) > 0, 100, None),
+            "AdditionalSigners": (False, lambda v: len(v) <= 200, 200, None),
+            "AccountCreated": (True, lambda v: bool(ValidationRules.DATE_YMD_RE.match(v)), None, None),
+            "isDDA": (True, ValidationRules.validate_tf, None, ValidationRules.normalize_tf),
+            "isChecking": (True, ValidationRules.validate_tf, None, ValidationRules.normalize_tf),
+            "isSavings": (True, ValidationRules.validate_tf, None, ValidationRules.normalize_tf),
+            "isCommercial": (True, ValidationRules.validate_tf, None, ValidationRules.normalize_tf),
+            "isGL": (True, ValidationRules.validate_tf, None, ValidationRules.normalize_tf),
+            "Status": (True, ValidationRules.validate_status, None, ValidationRules.normalize_status),
+            "LastDormancyStart": (
+                True,
+                lambda v: v == "" or bool(ValidationRules.DATE_YMD_RE.match(v)),
+                None,
+                None,
+            ),
+            "BalanceAvailable": (
+                False,
+                lambda v: v == "" or bool(ValidationRules.MONEY_RE.match(v)),
+                None,
+                ValidationRules.normalize_money,
+            ),
+            "BalanceLedger": (
+                False,
+                lambda v: v == "" or bool(ValidationRules.MONEY_RE.match(v)),
+                None,
+                ValidationRules.normalize_money,
+            ),
+            "BalanceCollected": (
+                False,
+                lambda v: v == "" or bool(ValidationRules.MONEY_RE.match(v)),
+                None,
+                ValidationRules.normalize_money,
+            ),
+            "BranchState": (False, lambda v: v == "" or (len(v) == 2 and v.isalpha()), None, None),
+            "BranchCountry": (False, lambda v: v == "" or (len(v) == 2 and v.isalpha()), None, None),
+            "BranchID": (False, lambda v: v == "" or len(v) <= 20, 20, None),
+            "PositivePay": (False, lambda v: v == "" or ValidationRules.validate_tf(v), None, ValidationRules.normalize_tf),
+            "ReversePositivePay": (
+                False,
+                lambda v: v == "" or ValidationRules.validate_tf(v),
+                None,
+                ValidationRules.normalize_tf,
+            ),
+            "CompanyName": (False, lambda v: v == "" or len(v) <= 100, 100, None),
+            "OverdraftLimit": (
+                False,
+                lambda v: v == "" or bool(ValidationRules.MONEY_RE.match(v)),
+                None,
+                ValidationRules.normalize_money,
+            ),
+        },
+        "Party": {
+            "PartyID": (True, lambda v: len(v) > 0, 100, None),
+            "PartyName": (False, lambda v: v == "" or len(v) <= 100, 100, None),
+            "CustomerType": (True, ValidationRules.validate_customer_type, None, ValidationRules.normalize_customer_type),
+            "CustomerSince": (True, lambda v: bool(ValidationRules.DATE_YMD_RE.match(v)), None, None),
+            "Address": (False, lambda v: v == "" or len(v) <= 250, 250, None),
+            "PhoneHome": (False, lambda v: v == "" or len(v) <= 20, 20, None),
+            "PhoneWork": (False, lambda v: v == "" or len(v) <= 20, 20, None),
+            "PhoneMobile": (False, lambda v: v == "" or len(v) <= 20, 20, None),
+            "Email": (False, lambda v: v == "" or len(v) <= 50, 50, None),
+            "isEmployee": (False, lambda v: v == "" or ValidationRules.validate_tf(v), None, ValidationRules.normalize_tf),
+            "BirthYear": (False, lambda v: v == "" or (v.isdigit() and len(v) == 4), None, None),
+        },
+        "ACHODFI": {
+            "PartyID": (True, lambda v: len(v) > 0 and len(v) <= 100, 100, None),
+            "ACHCompanyID": (True, lambda v: len(v) > 0 and len(v) <= 100, 100, None),
+            "TIN": (False, lambda v: v == "" or len(v) <= 100, 100, None),
+            "RelatedSettlementAccount": (True, lambda v: len(v) > 0, None, None),
+            "OriginationSetupDate": (
+                False,
+                lambda v: v == "" or bool(re.match(r"^\d{4}-\d{2}-\d{2}$", v)),
+                None,
+                None,
+            ),
+        },
+        "OnlineBusiness": {
+            "PartyID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
+            "OnlineCompanyID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
+            "UserID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
+        },
+        "OnlineRetail": {
+            "PartyID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
+            "UserID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
+        },
+    }
+
+    PRIMARY_KEYS = {
+        "Account": "AccountNumber",
+        "Party": "PartyID",
+        "ACHODFI": "ACHCompanyID",
+        "OnlineBusiness": ("OnlineCompanyID", "UserID"),
+        "OnlineRetail": "UserID",
+    }
+
+    def __init__(self, json_schema_path: str, logger: logging.Logger):
+        self.logger = logger
+        self.json_schemas = self._load_json_schema(json_schema_path)
+
+    def _load_json_schema(self, path: str) -> List[Dict[str, Any]]:
+        """Load JSON schema configuration."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                schemas = json.load(f)
+            self.logger.info(f"Loaded JSON schema from: {path}")
+            return schemas
+        except Exception as e:
+            self.logger.error(f"Failed to load JSON schema: {e}")
+            raise
+
+    def find_json_block_for_file(self, filepath: str) -> Dict[str, Any]:
+        """Find matching JSON block for a file based on file_pattern."""
+        fname = os.path.basename(filepath)
+        for block in self.json_schemas:
+            pattern = block.get("file_pattern")
+            if not pattern:
+                continue
+            try:
+                if re.search(pattern, fname, re.IGNORECASE):
+                    self.logger.debug(f"Matched pattern '{pattern}' for file: {fname}")
+                    return block
+            except re.error as e:
+                self.logger.warning(f"Invalid regex pattern '{pattern}': {e}")
+
+        self.logger.warning(f"No matching JSON block found for: {fname}")
+        return {}
+
+    def extract_expected_columns(self, block: Dict[str, Any]) -> List[str]:
+        """Extract expected column names from JSON header string."""
+        header_str = block.get("header", "")
+        if not header_str:
+            return []
+        return [c.strip() for c in header_str.split(",") if c.strip()]
+
+
+class FileValidator:
+    """Handles file validation operations."""
+
+    def __init__(self, schema_manager: SchemaManager, logger: logging.Logger, tenant_name: str):
+        self.schema_manager = schema_manager
+        self.logger = logger
+        self.tenant_name = tenant_name
+
+        # Track error statistics by file type
+        self.error_stats = defaultdict(lambda: defaultdict(int))
+
+    @staticmethod
+    def read_pipe_csv(path: str, logger: logging.Logger) -> pd.DataFrame:
+        """Read pipe-delimited CSV with encoding fallback."""
+        try:
+            df = pd.read_csv(path, sep="|", dtype=str, keep_default_na=False, encoding="utf-8")
+            logger.debug(f"Read file with UTF-8 encoding: {path}")
+            return df
+        except Exception as e:
+            logger.warning(f"UTF-8 failed, trying latin-1: {e}")
+            df = pd.read_csv(path, sep="|", dtype=str, keep_default_na=False, encoding="latin-1")
+            logger.debug(f"Read file with latin-1 encoding: {path}")
+            return df
+
+    def validate_reference_file(
+        self,
+        filepath: str,
+        filetype: str,
+        output_dir: str,
+    ) -> Dict[str, Any]:
+        """Validate a reference file (Account/Party/ACHODFI)."""
+        self.logger.info("=" * 80)
+        self.logger.info(f"[{self.tenant_name}] Validating {filetype} file: {filepath}")
+        self.logger.info("=" * 80)
+
+        try:
+            df = self.read_pipe_csv(filepath, self.logger)
+            self.logger.info(f"[{self.tenant_name}] Loaded {len(df)} rows from {filetype} file")
+        except Exception as e:
+            self.logger.error(f"[{self.tenant_name}] Failed to read file: {e}")
+            raise
+
+        schema = self.schema_manager.SCHEMAS[filetype]
+        primary_col = self.schema_manager.PRIMARY_KEYS[filetype]
+
+        # Get JSON configuration
+        json_block = self.schema_manager.find_json_block_for_file(filepath)
+        expected_cols = self.schema_manager.extract_expected_columns(json_block)
+
+        errors_rows: List[List[str]] = []
+        total_errors = 0
+
+        # Check for missing columns - DETAILED REPORTING
+        if expected_cols:
+            missing_cols = [c for c in expected_cols if c not in df.columns]
+            present_cols = [c for c in expected_cols if c in df.columns]
+
+            if missing_cols:
+                self.logger.error("=" * 80)
+                self.logger.error(f"[{self.tenant_name}] MISSING COLUMNS ({len(missing_cols)} total):")
+                for col in missing_cols:
+                    self.logger.error(f"   {col}")
+                    errors_rows.append(["-", f"{col}: missing column (expected from JSON config)"])
+                    total_errors += 1
+                self.logger.error("=" * 80)
+
+            self.logger.info("=" * 80)
+            self.logger.info(f"[{self.tenant_name}] COLUMNS PRESENT IN FILE ({len(present_cols)} total):")
+            for col in present_cols:
+                self.logger.info(f"   {col}")
+            self.logger.info("=" * 80)
+
+            # Show columns in CSV but NOT in JSON schema (will be ignored)
+            extra_cols = [c for c in df.columns if c not in expected_cols]
+            if extra_cols:
+                self.logger.warning("=" * 80)
+                self.logger.warning(
+                    f"[{self.tenant_name}] EXTRA COLUMNS IN CSV (will be IGNORED) "
+                    f"({len(extra_cols)} total):"
+                )
+                for col in extra_cols:
+                    self.logger.warning(f"   {col}")
+                self.logger.warning("=" * 80)
+
+        # Determine columns to validate
+        if expected_cols:
+            cols_to_validate = [c for c in schema.keys() if c in expected_cols and c in df.columns]
+        else:
+            cols_to_validate = [c for c in schema.keys() if c in df.columns]
+
+        self.logger.info("=" * 80)
+        self.logger.info(f"[{self.tenant_name}] COLUMNS TO VALIDATE ({len(cols_to_validate)} total):")
+        for col in cols_to_validate:
+            required, _, _, _ = schema[col]
+            req_str = "REQUIRED" if required else "optional"
+            self.logger.info(f"   {col} ({req_str})")
+        self.logger.info("=" * 80)
+
+        # Track primary key uniqueness
+        seen_primary: Dict[str, int] = {}
+
+        # Validate rows with progress reporting
+        self.logger.info(f"[{self.tenant_name}] Starting row validation for {len(df)} rows...")
+        for idx, row in df.iterrows():
+            # Progress reporting every 10,000 rows
+            if (idx + 1) % 10000 == 0:
+                self.logger.info(
+                    f"[{self.tenant_name}]   Progress: {idx + 1:,} / {len(df):,} rows "
+                    f"processed ({(idx + 1) / len(df) * 100:.1f}%)"
+                )
+
+            row_errors = self._validate_row(
+                row, idx, filetype, cols_to_validate, schema, df, primary_col, seen_primary
+            )
+
+            if row_errors:
+                errors_rows.append([str(idx + 2), " | ".join(row_errors)])
+                total_errors += len(row_errors)
+
+        self.logger.info(f"[{self.tenant_name}] Row validation complete: {len(df):,} rows processed")
+
+        # Write outputs
+        return self._write_validation_outputs(df, errors_rows, total_errors, filetype, output_dir, cols_to_validate)
+
+    def _validate_row(
+        self,
+        row: pd.Series,
+        idx: int,
+        filetype: str,
+        cols_to_validate: List[str],
+        schema: Dict[str, Tuple],
+        df: pd.DataFrame,
+        primary_col: str,
+        seen_primary: Dict[str, int],
+    ) -> List[str]:
+        """Validate a single row and return list of errors."""
+        row_errors: List[str] = []
+
+        # Validate each column
+        for col in cols_to_validate:
+            required, validator, max_len, fixer = schema[col]
+            val = str(row[col]).strip()
+
+            # Apply fixer if available
+            if fixer is not None:
+                new_val = fixer(val)
+                if new_val != val:
+                    df.at[idx, col] = new_val
+                    val = new_val
+
+            # Check required fields
+            if val == "":
+                if required:
+                    try:
+                        if not validator(val):
+                            error_msg = f"{col}: required but empty"
+                            row_errors.append(error_msg)
+                            # Track error statistics
+                            self.error_stats[filetype][error_msg] += 1
+                    except Exception:
+                        error_msg = f"{col}: validation error"
+                        row_errors.append(error_msg)
+                        # Track error statistics
+                        self.error_stats[filetype][error_msg] += 1
+                continue
+
+            if val != "":
+                # Check max length
+                if max_len and len(val) > max_len:
+                    error_msg = f"{col}: exceeds max length ({len(val)} > {max_len})"
+                    row_errors.append(error_msg)
+                    # Track error statistics
+                    self.error_stats[filetype][error_msg] += 1
+
+                # Run validator
+                try:
+                    if not validator(val):
+                        if col in ("BalanceAvailable", "BalanceLedger", "BalanceCollected", "OverdraftLimit"):
+                            error_msg = f"{col}: invalid money format"
+                        else:
+                            error_msg = f"{col}: invalid value"
+                        row_errors.append(error_msg)
+                        # Track error statistics
+                        self.error_stats[filetype][error_msg] += 1
+                except Exception:
+                    error_msg = f"{col}: validation error"
+                    row_errors.append(error_msg)
+                    # Track error statistics
+                    self.error_stats[filetype][error_msg] += 1
+
+        # Account-specific: check at least one balance field
+        if filetype == "Account":
+            bal_cols = ["BalanceAvailable", "BalanceLedger", "BalanceCollected"]
+            bal_vals = [str(df.at[idx, bc]).strip() for bc in bal_cols if bc in df.columns]
+            if bal_vals and all(v == "" for v in bal_vals):
+                error_msg = "Balance: at least one balance field required"
+                row_errors.append(error_msg)
+                # Track error statistics
+                self.error_stats[filetype][error_msg] += 1
+
+        # Check primary key uniqueness (supports single and composite keys)
+        if primary_col:
+            # Composite primary key (tuple of columns)
+            if isinstance(primary_col, tuple):
+                # Build composite key value
+                prim_val = tuple(str(df.at[idx, col]).strip() for col in primary_col if col in df.columns)
+
+                # Proceed only if all parts of composite key are present
+                if len(prim_val) == len(primary_col) and all(prim_val):
+                    if prim_val in seen_primary:
+                        first_row = seen_primary[prim_val]
+                        error_msg = f"{' + '.join(primary_col)}: duplicate"
+                        row_errors.append(f"{error_msg} (first at row {first_row}) <{prim_val}>")
+                        # Track error statistics (without row-specific details)
+                        self.error_stats[filetype][error_msg] += 1
+                    else:
+                        seen_primary[prim_val] = idx + 2
+
+            # Single-column primary key
+            else:
+                if primary_col in df.columns:
+                    prim_val = str(df.at[idx, primary_col]).strip()
+                    if prim_val:
+                        if prim_val in seen_primary:
+                            first_row = seen_primary[prim_val]
+                            error_msg = f"{primary_col}: duplicate"
+                            row_errors.append(f"{error_msg} (first at row {first_row}) <{prim_val}>")
+                            # Track error statistics (without row-specific details)
+                            self.error_stats[filetype][error_msg] += 1
+                        else:
+                            seen_primary[prim_val] = idx + 2
+
+        return row_errors
+
+    def _log_error_summary(self, filetype: str, total_rows: int):
+        """Log categorized error summary statistics."""
+        if filetype not in self.error_stats or not self.error_stats[filetype]:
+            self.logger.info("=" * 80)
+            self.logger.info(f"[{self.tenant_name}] NO ERRORS FOUND - FILE IS VALID!")
+            self.logger.info("=" * 80)
+            return
+
+        stats = self.error_stats[filetype]
+
+        # Categorize errors
+        required_errors = {}
+        format_errors = {}
+        length_errors = {}
+        duplicate_errors = {}
+        business_rule_errors = {}
+        other_errors = {}
+
+        for error_msg, count in stats.items():
+            if "required but empty" in error_msg:
+                required_errors[error_msg] = count
+            elif "duplicate" in error_msg:
+                duplicate_errors[error_msg] = count
+            elif "exceeds max length" in error_msg:
+                length_errors[error_msg] = count
+            elif "invalid money format" in error_msg or "invalid date format" in error_msg or "invalid value" in error_msg:
+                format_errors[error_msg] = count
+            elif "Balance:" in error_msg or "at least one" in error_msg:
+                business_rule_errors[error_msg] = count
+            else:
+                other_errors[error_msg] = count
+
+        # Calculate totals
+        total_errors = sum(stats.values())
+
+        # Calculate affected rows (approximate - some rows may have multiple errors)
+        rows_with_errors = min(total_errors, total_rows)
+        error_row_pct = (rows_with_errors / total_rows * 100.0) if total_rows else 0.0
+        valid_rows = total_rows - rows_with_errors
+        valid_row_pct = (valid_rows / total_rows * 100.0) if total_rows else 100.0
+
+        # Log summary
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info(f"[{self.tenant_name}] ERROR SUMMARY BY TYPE")
+        self.logger.info("=" * 80)
+
+        if required_errors:
+            req_total = sum(required_errors.values())
+            self.logger.info(f"\n[{self.tenant_name}] REQUIRED FIELD VIOLATIONS ({req_total} total):")
+            for msg, count in sorted(required_errors.items(), key=lambda x: -x[1]):
+                padding = "." * max(1, 60 - len(msg))
+                self.logger.info(f"  {msg} {padding} {count:>5} occurrences")
+
+        if format_errors:
+            fmt_total = sum(format_errors.values())
+            self.logger.info(f"\n[{self.tenant_name}] DATA FORMAT/VALIDATION VIOLATIONS ({fmt_total} total):")
+            for msg, count in sorted(format_errors.items(), key=lambda x: -x[1]):
+                padding = "." * max(1, 60 - len(msg))
+                self.logger.info(f"  {msg} {padding} {count:>5} occurrences")
+
+        if length_errors:
+            len_total = sum(length_errors.values())
+            self.logger.info(f"\n[{self.tenant_name}] LENGTH CONSTRAINT VIOLATIONS ({len_total} total):")
+            for msg, count in sorted(length_errors.items(), key=lambda x: -x[1]):
+                padding = "." * max(1, 60 - len(msg))
+                self.logger.info(f"  {msg} {padding} {count:>5} occurrences")
+
+        if duplicate_errors:
+            dup_total = sum(duplicate_errors.values())
+            self.logger.info(f"\n[{self.tenant_name}] DUPLICATE KEY VIOLATIONS ({dup_total} total):")
+            for msg, count in sorted(duplicate_errors.items(), key=lambda x: -x[1]):
+                padding = "." * max(1, 60 - len(msg))
+                self.logger.info(f"  {msg} {padding} {count:>5} occurrences")
+                self.logger.info(f"   Approximately {count} duplicate records")
+
+        if business_rule_errors:
+            biz_total = sum(business_rule_errors.values())
+            self.logger.info(f"\n[{self.tenant_name}] BUSINESS RULE VIOLATIONS ({biz_total} total):")
+            for msg, count in sorted(business_rule_errors.items(), key=lambda x: -x[1]):
+                padding = "." * max(1, 60 - len(msg))
+                self.logger.info(f"  {msg} {padding} {count:>5} occurrences")
+
+        if other_errors:
+            other_total = sum(other_errors.values())
+            self.logger.info(f"\n[{self.tenant_name}] OTHER VALIDATION ERRORS ({other_total} total):")
+            for msg, count in sorted(other_errors.items(), key=lambda x: -x[1]):
+                padding = "." * max(1, 60 - len(msg))
+                self.logger.info(f"  {msg} {padding} {count:>5} occurrences")
+
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info(f"[{self.tenant_name}] TOTAL ERRORS: {total_errors}")
+        self.logger.info(
+            f"[{self.tenant_name}] ROWS AFFECTED (approximate): {rows_with_errors:,} "
+            f"({error_row_pct:.1f}%)"
+        )
+        self.logger.info(f"[{self.tenant_name}] VALID ROWS (approximate): {valid_rows:,} ({valid_row_pct:.1f}%)")
+        self.logger.info("=" * 80)
+
+    def _write_validation_outputs(
+        self,
+        df: pd.DataFrame,
+        errors_rows: List[List[str]],
+        total_errors: int,
+        filetype: str,
+        output_dir: str,
+        cols_to_validate: List[str],
+    ) -> Dict[str, Any]:
+        """Write validation outputs and return summary."""
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Get current datetime for filename
+        current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Write error TSV (detailed line-by-line errors)
+        tsv_path = os.path.join(
+            output_dir, f"{filetype.lower()}_validation_{self.tenant_name}_{current_datetime}.tsv"
+        )
+        errors_df = pd.DataFrame(errors_rows, columns=["row", "errors"])
+        errors_df.to_csv(tsv_path, sep="\t", index=False)
+        self.logger.info(f"[{self.tenant_name}] Detailed error report: {tsv_path}")
+
+        # Write cleaned CSV (with auto-fixes applied)
+        cleaned_path = os.path.join(
+            output_dir, f"{filetype.lower()}_cleaned_{self.tenant_name}_{current_datetime}.csv"
+        )
+        df = df.head(10)
+        df.to_csv(cleaned_path, sep="|", index=False)
+        self.logger.info(f"[{self.tenant_name}] Cleaned file (with auto-fixes): {cleaned_path}")
+
+        # Calculate statistics
+        total_rows = len(df)
+        possible = total_rows * max(len(cols_to_validate), 1) if total_rows else 0
+        error_pct = (total_errors / possible * 100.0) if possible else 0.0
+
+        # Log error summary to log file
+        self._log_error_summary(filetype, total_rows)
+
+        self.logger.info(f"\n[{self.tenant_name}] Quick Summary: {total_rows:,} rows | {total_errors} errors ({error_pct:.3f}%)")
+
+        return {
+            "filetype": filetype,
+            "rows": total_rows,
+            "errors": total_errors,
+            "error_pct": error_pct,
+            "tsv": tsv_path,
+            "cleaned": cleaned_path,
+        }
+
+
+class CrossChannelChecker:
+    """Cross-checks reference data against historical channel files."""
+
+    ON_US_RE = re.compile(r"<ON_US>(.*?)</ON_US>")
+    WIRE_ID_RE = re.compile(r"<q1:ID>(.*?)</q1:ID>")
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        tenant_name: str,
+        output_dir: str,
+        strip_leading_zeros: bool,
+        ach_globs: List[str],
+        check_globs: List[str],
+        wire_globs: List[str],
+    ):
+        self.logger = logger
+        self.tenant_name = tenant_name
+        self.output_dir = output_dir
+        self.strip_leading_zeros = strip_leading_zeros
+        self.ach_globs = ach_globs
+        self.check_globs = check_globs
+        self.wire_globs = wire_globs
+
+    def _normalize_account(self, value: str) -> str:
+        val = value.strip()
+        if not val:
+            return ""
+        if self.strip_leading_zeros and val.isdigit():
+            stripped = val.lstrip("0")
+            return stripped if stripped else "0"
+        return val
+
+    @staticmethod
+    def _normalize_party(value: str) -> str:
+        return value.strip()
+
+    @staticmethod
+    def _resolve_globs(base_dir: str, patterns: Iterable[str]) -> List[str]:
+        files: List[str] = []
+        for pat in patterns:
+            files.extend(glob.glob(os.path.join(base_dir, pat), recursive=True))
+        return sorted(set(files))
+
+    def _parse_ach_accounts(self, ach_dir: str) -> List[str]:
+        accounts: List[str] = []
+        if not ach_dir or not os.path.isdir(ach_dir):
+            return accounts
+        for path in self._resolve_globs(ach_dir, self.ach_globs):
+            try:
+                with open(path, "r", encoding="latin-1", errors="ignore") as handle:
+                    for line in handle:
+                        if line.startswith("6") and len(line) >= 29:
+                            acct = line[12:29].strip()
+                            if acct:
+                                accounts.append(acct)
+            except Exception as e:
+                self.logger.warning(f"[{self.tenant_name}] Failed to read ACH file {path}: {e}")
+        return accounts
+
+    def _parse_check_accounts(self, check_dir: str) -> List[str]:
+        accounts: List[str] = []
+        if not check_dir or not os.path.isdir(check_dir):
+            return accounts
+        for path in self._resolve_globs(check_dir, self.check_globs):
+            try:
+                with open(path, "r", encoding="latin-1", errors="ignore") as handle:
+                    for line in handle:
+                        for match in self.ON_US_RE.finditer(line):
+                            raw = match.group(1).strip()
+                            if "/" in raw:
+                                raw = raw.split("/")[0]
+                            if raw:
+                                accounts.append(raw)
+            except Exception as e:
+                self.logger.warning(f"[{self.tenant_name}] Failed to read Check file {path}: {e}")
+        return accounts
+
+    def _parse_wire_accounts(self, wire_dir: str) -> List[str]:
+        accounts: List[str] = []
+        if not wire_dir or not os.path.isdir(wire_dir):
+            return accounts
+        for path in self._resolve_globs(wire_dir, self.wire_globs):
+            try:
+                with open(path, "r", encoding="latin-1", errors="ignore") as handle:
+                    for line in handle:
+                        for match in self.WIRE_ID_RE.finditer(line):
+                            raw = match.group(1).strip()
+                            if raw and raw.lower() != "unknown":
+                                accounts.append(raw)
+            except Exception as e:
+                self.logger.warning(f"[{self.tenant_name}] Failed to read Wire log {path}: {e}")
+        return accounts
+
+    def load_reference_sets(
+        self,
+        account_file: str,
+        party_file: str,
+    ) -> Tuple[Dict[str, str], Set[str]]:
+        account_df = FileValidator.read_pipe_csv(account_file, self.logger)
+        if ACCOUNT_COL not in account_df.columns or PARTY_COL not in account_df.columns:
+            raise ValueError(f"Account file must include columns: {ACCOUNT_COL}, {PARTY_COL}")
+
+        account_map: Dict[str, str] = {}
+        for _, row in account_df.iterrows():
+            acct = self._normalize_account(str(row[ACCOUNT_COL]))
+            party = self._normalize_party(str(row[PARTY_COL]))
+            if acct:
+                if acct not in account_map or (not account_map[acct] and party):
+                    account_map[acct] = party
+
+        party_df = FileValidator.read_pipe_csv(party_file, self.logger)
+        if PARTY_COL not in party_df.columns:
+            raise ValueError(f"Party file must include column: {PARTY_COL}")
+
+        party_set = {
+            self._normalize_party(str(v))
+            for v in party_df[PARTY_COL].astype(str).tolist()
+            if self._normalize_party(str(v))
+        }
+
+        return account_map, party_set
+
+    def _write_tsv(self, rows: List[List[str]], path: str, headers: List[str]) -> None:
+        os.makedirs(self.output_dir, exist_ok=True)
+        pd.DataFrame(rows, columns=headers).to_csv(path, sep="\t", index=False)
+
+    def cross_check_reference_party(
+        self,
+        account_map: Dict[str, str],
+        party_set: Set[str],
+        run_id: str,
+    ) -> str:
+        rows: List[List[str]] = []
+        for acct, party in account_map.items():
+            if not party:
+                rows.append([acct, "", "Missing PartyID in Account reference"])
+            elif party not in party_set:
+                rows.append([acct, party, "PartyID missing from Party reference"])
+
+        path = os.path.join(
+            self.output_dir, f"cross_party_reference_issues_{self.tenant_name}_{run_id}.tsv"
+        )
+        self._write_tsv(rows, path, ["AccountNumber", "PartyID", "issue"])
+        self.logger.info(f"[{self.tenant_name}] Account->Party reference issues: {len(rows)}")
+        return path
+
+    def cross_check_channel(
+        self,
+        name: str,
+        raw_accounts: List[str],
+        account_map: Dict[str, str],
+        party_set: Set[str],
+        run_id: str,
+    ) -> Dict[str, str]:
+        normalized = [self._normalize_account(str(a)) for a in raw_accounts if str(a).strip()]
+        total_records = len(normalized)
+
+        account_match = 0
+        party_match = 0
+        unmatched_accounts = Counter()
+        unmatched_parties = Counter()
+
+        for acct in normalized:
+            party = account_map.get(acct)
+            if party is None:
+                unmatched_accounts[acct] += 1
+                continue
+            account_match += 1
+            if party and party in party_set:
+                party_match += 1
+            else:
+                label = party if party else "<EMPTY>"
+                unmatched_parties[label] += 1
+
+        account_match_pct = (account_match / total_records * 100.0) if total_records else 0.0
+        party_match_pct = (party_match / total_records * 100.0) if total_records else 0.0
+
+        unmatched_accounts_path = os.path.join(
+            self.output_dir, f"{name.lower()}_unmatched_accounts_{self.tenant_name}_{run_id}.tsv"
+        )
+        unmatched_parties_path = os.path.join(
+            self.output_dir, f"{name.lower()}_unmatched_parties_{self.tenant_name}_{run_id}.tsv"
         )
 
-    account_map: Dict[str, str] = {}
-    for _, row in account_df.iterrows():
-        acct = normalize_account(str(row[ACCOUNT_COL]), strip_leading_zeros)
-        party = normalize_party(str(row[PARTY_COL]))
-        if acct:
-            if acct not in account_map or (not account_map[acct] and party):
-                account_map[acct] = party
+        unmatched_account_rows = [
+            [acct, str(count), "Account missing from reference"]
+            for acct, count in unmatched_accounts.most_common()
+        ]
+        unmatched_party_rows = [
+            [party, str(count), "Party missing from reference"]
+            for party, count in unmatched_parties.most_common()
+        ]
 
-    party_df = read_pipe_csv(party_file)
-    if PARTY_COL not in party_df.columns:
-        raise ValueError(f"Party file must include column: {PARTY_COL}")
+        self._write_tsv(unmatched_account_rows, unmatched_accounts_path, ["AccountNumber", "count", "issue"])
+        self._write_tsv(unmatched_party_rows, unmatched_parties_path, ["PartyID", "count", "issue"])
 
-    party_set = {
-        normalize_party(str(v))
-        for v in party_df[PARTY_COL].astype(str).tolist()
-        if normalize_party(str(v))
-    }
+        self.logger.info(
+            f"[{self.tenant_name}] {name} cross-check: total records {total_records:,} | "
+            f"account matches {account_match:,} ({account_match_pct:.2f}%) | "
+            f"party matches {party_match:,} ({party_match_pct:.2f}%)"
+        )
 
-    return account_map, party_set
+        return {
+            "channel": name,
+            "total_records": str(total_records),
+            "account_matches": str(account_match),
+            "account_match_pct": f"{account_match_pct:.3f}",
+            "party_matches": str(party_match),
+            "party_match_pct": f"{party_match_pct:.3f}",
+            "unmatched_accounts_tsv": unmatched_accounts_path,
+            "unmatched_parties_tsv": unmatched_parties_path,
+        }
 
+    def cross_check_ach(
+        self,
+        ach_dir: str,
+        account_map: Dict[str, str],
+        party_set: Set[str],
+        run_id: str,
+    ) -> Optional[Dict[str, str]]:
+        if not ach_dir or not os.path.isdir(ach_dir):
+            self.logger.warning(f"[{self.tenant_name}] ACH directory not provided or missing. Skipping.")
+            return None
+        accounts = self._parse_ach_accounts(ach_dir)
+        if not accounts:
+            self.logger.warning(f"[{self.tenant_name}] No ACH records found. Skipping.")
+            return None
+        return self.cross_check_channel("ACH", accounts, account_map, party_set, run_id)
 
-def write_counter_tsv(
-    rows: List[Tuple[str, int, str]],
-    path: str,
-    headers: List[str],
-) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    pd.DataFrame(rows, columns=headers).to_csv(path, sep="\t", index=False)
+    def cross_check_check(
+        self,
+        check_dir: str,
+        account_map: Dict[str, str],
+        party_set: Set[str],
+        run_id: str,
+    ) -> Optional[Dict[str, str]]:
+        if not check_dir or not os.path.isdir(check_dir):
+            self.logger.warning(f"[{self.tenant_name}] Check directory not provided or missing. Skipping.")
+            return None
+        accounts = self._parse_check_accounts(check_dir)
+        if not accounts:
+            self.logger.warning(f"[{self.tenant_name}] No Check records found. Skipping.")
+            return None
+        return self.cross_check_channel("Check", accounts, account_map, party_set, run_id)
 
+    def cross_check_wire(
+        self,
+        wire_dir: str,
+        account_map: Dict[str, str],
+        party_set: Set[str],
+        run_id: str,
+    ) -> Optional[Dict[str, str]]:
+        if not wire_dir or not os.path.isdir(wire_dir):
+            self.logger.warning(f"[{self.tenant_name}] Wire directory not provided or missing. Skipping.")
+            return None
+        accounts = self._parse_wire_accounts(wire_dir)
+        if not accounts:
+            self.logger.warning(f"[{self.tenant_name}] No Wire records found. Skipping.")
+            return None
+        return self.cross_check_channel("Wire", accounts, account_map, party_set, run_id)
 
-def cross_check_reference_party(
-    account_map: Dict[str, str],
-    party_set: Set[str],
-    output_dir: str,
-) -> str:
-    rows: List[Tuple[str, str, str]] = []
-    for acct, party in account_map.items():
-        if not party:
-            rows.append((acct, "", "Missing PartyID in Account reference"))
-            continue
-        if party not in party_set:
-            rows.append((acct, party, "PartyID missing from Party reference"))
-
-    path = os.path.join(output_dir, "cross_party_reference_issues.tsv")
-    write_counter_tsv(
-        rows,
-        path,
-        ["AccountNumber", "PartyID", "issue"],
-    )
-    return path
-
-
-def cross_check_channel(
-    name: str,
-    raw_accounts: List[str],
-    account_map: Dict[str, str],
-    party_set: Set[str],
-    output_dir: str,
-    strip_leading_zeros: bool,
-) -> Dict[str, str]:
-    normalized = [
-        normalize_account(str(a), strip_leading_zeros)
-        for a in raw_accounts
-        if str(a).strip()
-    ]
-    total_records = len(normalized)
-
-    account_match = 0
-    party_match = 0
-    unmatched_accounts = Counter()
-    unmatched_parties = Counter()
-
-    for acct in normalized:
-        party = account_map.get(acct)
-        if party is None:
-            unmatched_accounts[acct] += 1
-            continue
-        account_match += 1
-        if party and party in party_set:
-            party_match += 1
-        else:
-            label = party if party else "<EMPTY>"
-            unmatched_parties[label] += 1
-
-    account_match_pct = (account_match / total_records * 100.0) if total_records else 0.0
-    party_match_pct = (party_match / total_records * 100.0) if total_records else 0.0
-
-    unmatched_accounts_path = os.path.join(output_dir, f"{name.lower()}_unmatched_accounts.tsv")
-    unmatched_parties_path = os.path.join(output_dir, f"{name.lower()}_unmatched_parties.tsv")
-
-    unmatched_account_rows = [
-        (acct, count, "Account missing from reference")
-        for acct, count in unmatched_accounts.most_common()
-    ]
-    unmatched_party_rows = [
-        (party, count, "Party missing from reference")
-        for party, count in unmatched_parties.most_common()
-    ]
-
-    write_counter_tsv(
-        unmatched_account_rows,
-        unmatched_accounts_path,
-        ["AccountNumber", "count", "issue"],
-    )
-    write_counter_tsv(
-        unmatched_party_rows,
-        unmatched_parties_path,
-        ["PartyID", "count", "issue"],
-    )
-
-    return {
-        "channel": name,
-        "total_records": str(total_records),
-        "account_matches": str(account_match),
-        "account_match_pct": f"{account_match_pct:.3f}",
-        "party_matches": str(party_match),
-        "party_match_pct": f"{party_match_pct:.3f}",
-        "unmatched_accounts_tsv": unmatched_accounts_path,
-        "unmatched_parties_tsv": unmatched_parties_path,
-    }
-
-
-def write_summary(results: List[Dict[str, str]], output_dir: str) -> str:
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, "validation_summary.tsv")
-    rows = []
-    for r in results:
-        rows.append(
+    def write_summary(self, results: List[Dict[str, str]], run_id: str) -> str:
+        path = os.path.join(self.output_dir, f"cross_channel_summary_{self.tenant_name}_{run_id}.tsv")
+        rows = []
+        for r in results:
+            rows.append(
+                [
+                    r.get("channel", ""),
+                    r.get("total_records", ""),
+                    r.get("account_matches", ""),
+                    r.get("account_match_pct", ""),
+                    r.get("party_matches", ""),
+                    r.get("party_match_pct", ""),
+                    r.get("unmatched_accounts_tsv", ""),
+                    r.get("unmatched_parties_tsv", ""),
+                ]
+            )
+        self._write_tsv(
+            rows,
+            path,
             [
-                r.get("channel", ""),
-                r.get("total_records", ""),
-                r.get("account_matches", ""),
-                r.get("account_match_pct", ""),
-                r.get("party_matches", ""),
-                r.get("party_match_pct", ""),
-                r.get("unmatched_accounts_tsv", ""),
-                r.get("unmatched_parties_tsv", ""),
-            ]
+                "channel",
+                "total_records",
+                "account_matches",
+                "account_match_pct",
+                "party_matches",
+                "party_match_pct",
+                "unmatched_accounts_tsv",
+                "unmatched_parties_tsv",
+            ],
         )
-    pd.DataFrame(
-        rows,
-        columns=[
-            "channel",
-            "total_records",
-            "account_matches",
-            "account_match_pct",
-            "party_matches",
-            "party_match_pct",
-            "unmatched_accounts_tsv",
-            "unmatched_parties_tsv",
-        ],
-    ).to_csv(path, sep="\t", index=False)
-    return path
+        return path
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Cross-channel reference validator")
-    parser.add_argument("config", nargs="?", default="config.ini")
-    args = parser.parse_args()
+class ReferenceValidator:
+    """Main validator orchestrator."""
 
-    cfg = load_config(args.config)
-    account_file = get_cfg(cfg, "INPUT", "account_file")
-    party_file = get_cfg(cfg, "INPUT", "party_file")
-    ach_dir = get_cfg(cfg, "INPUT", "ach_dir")
-    check_dir = get_cfg(cfg, "INPUT", "check_dir")
-    wire_dir = get_cfg(cfg, "INPUT", "wire_dir")
-    output_dir = get_cfg(cfg, "OUTPUT", "output_dir", "output")
+    def __init__(self, config_path: str = "config.ini"):
+        self.config = ValidationConfig(config_path)
 
-    if not account_file or not os.path.exists(account_file):
-        raise FileNotFoundError(f"Account file not found: {account_file}")
-    if not party_file or not os.path.exists(party_file):
-        raise FileNotFoundError(f"Party file not found: {party_file}")
+        # Initialize LogManager from separate module
+        self.log_manager = LogManager(
+            log_dir=os.path.join(self.config.output_dir, "logs"),
+            log_level=logging.INFO,
+            tenant_name=self.config.tenant_name,
+        )
+        self.logger = self.log_manager.get_logger()
 
-    strip_leading_zeros = get_bool(cfg, "OPTIONS", "strip_leading_zeros", True)
+        # Log tenant name at startup
+        self.logger.info(f"[{self.config.tenant_name}] Validator starting...")
 
-    account_map, party_set = load_reference_data(
-        account_file,
-        party_file,
-        strip_leading_zeros,
-    )
+        self.schema_manager = SchemaManager(self.config.json_schema_file, self.logger)
+        self.file_validator = FileValidator(self.schema_manager, self.logger, self.config.tenant_name)
 
-    if get_bool(cfg, "OPTIONS", "cross_check_party", True):
-        party_issue_path = cross_check_reference_party(account_map, party_set, output_dir)
-        print(f"Reference Party issues: {party_issue_path}")
+        self.cross_checker = CrossChannelChecker(
+            logger=self.logger,
+            tenant_name=self.config.tenant_name,
+            output_dir=self.config.output_dir,
+            strip_leading_zeros=self.config.strip_leading_zeros,
+            ach_globs=self.config.ach_globs,
+            check_globs=self.config.check_globs,
+            wire_globs=self.config.wire_globs,
+        )
 
-    results: List[Dict[str, str]] = []
+    def run(self):
+        """Execute the full validation process."""
+        self.logger.info("*" * 80)
+        self.logger.info(f"[{self.config.tenant_name}] CROSS-CHANNEL REFERENCE VALIDATOR - STARTING")
+        self.logger.info(f"[{self.config.tenant_name}] Enhanced with Error Summary Statistics")
+        self.logger.info("*" * 80)
 
-    if get_bool(cfg, "OPTIONS", "cross_check_ach", True):
-        ach_patterns = get_cfg(cfg, "INPUT", "ach_glob", "*ACH,*ach").split(",")
-        ach_accounts = parse_ach_accounts(ach_dir, ach_patterns)
-        if ach_accounts:
-            results.append(
-                cross_check_channel(
-                    "ACH",
-                    ach_accounts,
-                    account_map,
-                    party_set,
-                    output_dir,
-                    strip_leading_zeros,
+        start_time = datetime.now()
+        run_id = start_time.strftime("%Y%m%d_%H%M%S")
+        results: List[Dict[str, Any]] = []
+        cross_results: List[Dict[str, str]] = []
+
+        try:
+            # Phase 1: Validate reference files
+            self.logger.info("\n" + "=" * 80)
+            self.logger.info(f"[{self.config.tenant_name}] PHASE 1: Reference File Validation")
+            self.logger.info("=" * 80)
+
+            # Validate Account file if path provided
+            if self.config.account_file:
+                if os.path.exists(self.config.account_file):
+                    self.logger.info(
+                        f"[{self.config.tenant_name}] Validating Account file: {self.config.account_file}"
+                    )
+                    results.append(
+                        self.file_validator.validate_reference_file(
+                            self.config.account_file,
+                            "Account",
+                            self.config.output_dir,
+                        )
+                    )
+                else:
+                    self.logger.error(
+                        f"[{self.config.tenant_name}] Account file NOT FOUND: {self.config.account_file}"
+                    )
+            else:
+                self.logger.warning(f"[{self.config.tenant_name}] No path provided for Account file - SKIPPING")
+
+            # Validate Party file if path provided
+            if self.config.party_file:
+                if os.path.exists(self.config.party_file):
+                    self.logger.info(
+                        f"[{self.config.tenant_name}] Validating Party file: {self.config.party_file}"
+                    )
+                    results.append(
+                        self.file_validator.validate_reference_file(
+                            self.config.party_file,
+                            "Party",
+                            self.config.output_dir,
+                        )
+                    )
+                else:
+                    self.logger.error(
+                        f"[{self.config.tenant_name}] Party file NOT FOUND: {self.config.party_file}"
+                    )
+            else:
+                self.logger.warning(f"[{self.config.tenant_name}] No path provided for Party file - SKIPPING")
+
+            # Validate ACHODFI file if path provided
+            if self.config.achodfi_file:
+                if os.path.exists(self.config.achodfi_file):
+                    self.logger.info(
+                        f"[{self.config.tenant_name}] Validating ACHODFI file: {self.config.achodfi_file}"
+                    )
+                    results.append(
+                        self.file_validator.validate_reference_file(
+                            self.config.achodfi_file,
+                            "ACHODFI",
+                            self.config.output_dir,
+                        )
+                    )
+                else:
+                    self.logger.error(
+                        f"[{self.config.tenant_name}] ACHODFI file NOT FOUND: {self.config.achodfi_file}"
+                    )
+            else:
+                self.logger.warning(f"[{self.config.tenant_name}] No path provided for ACHODFI file - SKIPPING")
+
+            # Validate OnlineBusiness file if path provided
+            if self.config.online_business_file:
+                if os.path.exists(self.config.online_business_file):
+                    self.logger.info(
+                        f"[{self.config.tenant_name}] Validating OnlineBusiness file: "
+                        f"{self.config.online_business_file}"
+                    )
+                    results.append(
+                        self.file_validator.validate_reference_file(
+                            self.config.online_business_file,
+                            "OnlineBusiness",
+                            self.config.output_dir,
+                        )
+                    )
+                else:
+                    self.logger.error(
+                        f"[{self.config.tenant_name}] OnlineBusiness file NOT FOUND: "
+                        f"{self.config.online_business_file}"
+                    )
+            else:
+                self.logger.warning(
+                    f"[{self.config.tenant_name}] No path provided for OnlineBusiness file - SKIPPING"
                 )
-            )
-        else:
-            print("No ACH accounts found. Skipping ACH cross-check.")
 
-    if get_bool(cfg, "OPTIONS", "cross_check_check", True):
-        check_patterns = get_cfg(cfg, "INPUT", "check_glob", "*.xml,*.XML").split(",")
-        check_accounts = parse_check_accounts(check_dir, check_patterns)
-        if check_accounts:
-            results.append(
-                cross_check_channel(
-                    "Check",
-                    check_accounts,
-                    account_map,
-                    party_set,
-                    output_dir,
-                    strip_leading_zeros,
+            # Validate OnlineRetail file if path provided
+            if self.config.retail_file:
+                if os.path.exists(self.config.retail_file):
+                    self.logger.info(
+                        f"[{self.config.tenant_name}] Validating OnlineRetail file: {self.config.retail_file}"
+                    )
+                    results.append(
+                        self.file_validator.validate_reference_file(
+                            self.config.retail_file,
+                            "OnlineRetail",
+                            self.config.output_dir,
+                        )
+                    )
+                else:
+                    self.logger.error(
+                        f"[{self.config.tenant_name}] OnlineRetail file NOT FOUND: {self.config.retail_file}"
+                    )
+            else:
+                self.logger.warning(f"[{self.config.tenant_name}] No path provided for OnlineRetail file - SKIPPING")
+
+            # Phase 2: Cross-channel matching
+            self.logger.info("\n" + "=" * 80)
+            self.logger.info(f"[{self.config.tenant_name}] PHASE 2: Cross-Channel Matching")
+            self.logger.info("=" * 80)
+
+            if self.config.account_file and self.config.party_file:
+                if os.path.exists(self.config.account_file) and os.path.exists(self.config.party_file):
+                    account_map, party_set = self.cross_checker.load_reference_sets(
+                        self.config.account_file,
+                        self.config.party_file,
+                    )
+
+                    if self.config.cross_check_party:
+                        self.cross_checker.cross_check_reference_party(account_map, party_set, run_id)
+
+                    if self.config.cross_check_ach:
+                        ach_result = self.cross_checker.cross_check_ach(
+                            self.config.ach_dir,
+                            account_map,
+                            party_set,
+                            run_id,
+                        )
+                        if ach_result:
+                            cross_results.append(ach_result)
+
+                    if self.config.cross_check_check:
+                        check_result = self.cross_checker.cross_check_check(
+                            self.config.check_dir,
+                            account_map,
+                            party_set,
+                            run_id,
+                        )
+                        if check_result:
+                            cross_results.append(check_result)
+
+                    if self.config.cross_check_wire:
+                        wire_result = self.cross_checker.cross_check_wire(
+                            self.config.wire_dir,
+                            account_map,
+                            party_set,
+                            run_id,
+                        )
+                        if wire_result:
+                            cross_results.append(wire_result)
+                else:
+                    self.logger.warning(
+                        f"[{self.config.tenant_name}] Account/Party reference files missing - "
+                        "cross-channel checks skipped"
+                    )
+            else:
+                self.logger.warning(
+                    f"[{self.config.tenant_name}] Account/Party paths not provided - "
+                    "cross-channel checks skipped"
                 )
-            )
-        else:
-            print("No Check accounts found. Skipping Check cross-check.")
 
-    if get_bool(cfg, "OPTIONS", "cross_check_wire", True):
-        wire_patterns = get_cfg(cfg, "INPUT", "wire_glob", "**/*.log,**/*.LOG").split(",")
-        wire_accounts = parse_wire_accounts(wire_dir, wire_patterns)
-        if wire_accounts:
-            results.append(
-                cross_check_channel(
-                    "Wire",
-                    wire_accounts,
-                    account_map,
-                    party_set,
-                    output_dir,
-                    strip_leading_zeros,
-                )
-            )
-        else:
-            print("No Wire accounts found. Skipping Wire cross-check.")
+            if cross_results:
+                summary_path = self.cross_checker.write_summary(cross_results, run_id)
+                self.logger.info(f"[{self.config.tenant_name}] Cross-channel summary: {summary_path}")
+            else:
+                self.logger.warning(f"[{self.config.tenant_name}] No cross-channel results generated")
 
-    if results:
-        summary_path = write_summary(results, output_dir)
-        print(f"Summary written: {summary_path}")
-    else:
-        print("No channel results were generated.")
+            # Final summary
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
 
-    return 0
+            self.logger.info("\n" + "*" * 80)
+            self.logger.info(f"[{self.config.tenant_name}] VALIDATION COMPLETED SUCCESSFULLY")
+            self.logger.info(f"[{self.config.tenant_name}] Files validated: {len(results)}")
+            self.logger.info(f"[{self.config.tenant_name}] Channels checked: {len(cross_results)}")
+            self.logger.info(f"[{self.config.tenant_name}] Duration: {duration:.2f} seconds")
+            self.logger.info(f"[{self.config.tenant_name}] Log file: {self.log_manager.get_log_file_path()}")
+            self.logger.info("*" * 80)
+
+        except Exception as e:
+            self.logger.error("\n" + "*" * 80)
+            self.logger.error(f"[{self.config.tenant_name}] VALIDATION FAILED: {e}")
+            self.logger.error("*" * 80)
+            raise
+
+
+def main():
+    """Entry point for the validator."""
+    try:
+        # Read config path from command line
+        if len(sys.argv) < 2:
+            print("USAGE: python validator.py <config.ini path>")
+            return 1
+
+        config_path = sys.argv[1]
+
+        validator = ReferenceValidator(config_path)
+        validator.run()
+        return 0
+
+    except Exception as e:
+        print(f"FATAL ERROR: {e}")
+        return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit(main())

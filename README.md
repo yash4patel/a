@@ -1,8 +1,8 @@
 # Cross-Channel Reference Validator
 
-This tool verifies that reference Account/Party files match historical
-channel data (ACH, Check, Wire) and reports the percentage of records
-that match per channel.
+This tool validates reference Account/Party files and verifies that
+historical channel data (ACH, Check, Wire) matches those references.
+It reports the percentage of records that match per channel.
 
 ## Usage
 
@@ -22,14 +22,18 @@ python validator.py config.ini
 
 All outputs are written to `OUTPUT.output_dir`:
 
-- `cross_party_reference_issues.tsv`
-- `ach_unmatched_accounts.tsv`
-- `ach_unmatched_parties.tsv`
-- `check_unmatched_accounts.tsv`
-- `check_unmatched_parties.tsv`
-- `wire_unmatched_accounts.tsv`
-- `wire_unmatched_parties.tsv`
-- `validation_summary.tsv`
+- `account_validation_<tenant>_<timestamp>.tsv`
+- `account_cleaned_<tenant>_<timestamp>.csv`
+- `party_validation_<tenant>_<timestamp>.tsv`
+- `party_cleaned_<tenant>_<timestamp>.csv`
+- `cross_party_reference_issues_<tenant>_<timestamp>.tsv`
+- `ach_unmatched_accounts_<tenant>_<timestamp>.tsv`
+- `ach_unmatched_parties_<tenant>_<timestamp>.tsv`
+- `check_unmatched_accounts_<tenant>_<timestamp>.tsv`
+- `check_unmatched_parties_<tenant>_<timestamp>.tsv`
+- `wire_unmatched_accounts_<tenant>_<timestamp>.tsv`
+- `wire_unmatched_parties_<tenant>_<timestamp>.tsv`
+- `cross_channel_summary_<tenant>_<timestamp>.tsv`
 
 ## Notes
 
