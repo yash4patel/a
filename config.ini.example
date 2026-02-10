@@ -1,6 +1,9 @@
 [INPUT]
 account_file = /path/to/account_reference.csv
 party_file = /path/to/party_reference.csv
+achodfi_file = /path/to/achodfi_reference.csv
+online_business_file = /path/to/online_business_reference.csv
+retail_file = /path/to/online_retail_reference.csv
 ach_dir = /path/to/ach/files
 check_dir = /path/to/check/xml
 wire_dir = /path/to/wire/logs
@@ -8,8 +11,14 @@ ach_glob = *ACH,*ach
 check_glob = *.xml,*.XML
 wire_glob = **/*.log,**/*.LOG
 
+[SCHEMA]
+json_schema_file = /path/to/jsonFileConfig.json
+
 [OUTPUT]
 output_dir = /path/to/output
+
+[GENERAL]
+tenant_name = ExampleTenant
 
 [OPTIONS]
 cross_check_party = true
