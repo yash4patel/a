@@ -131,9 +131,45 @@ X9_FIELDS = {
         "endorsing_bank_correction_indicator": (39, 40),
         "return_reason": (40, 41),
     },
+    # Minimal control-record slices used for required record and critical field checks.
+    "50": {
+        "cash_letter_item_count": (3, 11),
+        "cash_letter_amount_total": (11, 23),
+    },
+    "52": {
+        "bundle_item_count": (3, 11),
+        "bundle_amount_total": (11, 23),
+    },
 }
 
 HEADER_SEQUENCE = ("01", "10", "20")
+REQUIRED_RECORD_TYPES = ("25", "26", "50", "52")
+MAX_ISSUES_PER_FILE = 100
+
+# (field_name, start, end, validation_type, expected_length)
+# validation_type values:
+# - "digits": required numeric with expected_length
+# - "non_empty": required non-blank
+CRITICAL_FIELD_RULES = {
+    "25": [
+        ("payor_bank_routing_number", 19, 27, "digits", 8),
+        ("payor_bank_routing_number_check_digit", 27, 28, "digits", 1),
+        ("on_us", 28, 48, "non_empty", None),
+        ("item_amount", 48, 58, "digits", 10),
+    ],
+    "26": [
+        ("bofd_routing_number", 4, 13, "digits", 9),
+        ("deposit_account_number_at_bofd", 36, 54, "non_empty", None),
+    ],
+    "50": [
+        ("cash_letter_item_count", 3, 11, "digits", 8),
+        ("cash_letter_amount_total", 11, 23, "digits", 12),
+    ],
+    "52": [
+        ("bundle_item_count", 3, 11, "digits", 8),
+        ("bundle_amount_total", 11, 23, "digits", 12),
+    ],
+}
 
 
 def get_record_type(line: str) -> str:
@@ -155,12 +191,46 @@ def get_record_type_values(line: str):
     return result
 
 
+def validate_critical_fields_for_record(line: str, record_type: str, line_number: int):
+    """Validate critical field presence and basic format on selected record types."""
+    issues = []
+    for field_name, start, end, validation_type, expected_len in CRITICAL_FIELD_RULES.get(record_type, []):
+        value = ""
+        if len(line) >= end:
+            value = line[start:end].strip()
+        elif len(line) > start:
+            value = line[start:].strip()
+
+        if validation_type == "non_empty":
+            if not value:
+                issues.append(
+                    f"Record {record_type} line {line_number}: missing required field {field_name}"
+                )
+        elif validation_type == "digits":
+            if not value:
+                issues.append(
+                    f"Record {record_type} line {line_number}: missing required field {field_name}"
+                )
+            elif not value.isdigit():
+                issues.append(
+                    f"Record {record_type} line {line_number}: field {field_name} must be numeric, got '{value}'"
+                )
+            elif expected_len is not None and len(value) != expected_len:
+                issues.append(
+                    f"Record {record_type} line {line_number}: field {field_name} must be "
+                    f"{expected_len} digits, got {len(value)}"
+                )
+    return issues
+
+
 def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
     """
     Validate core X9 file structure based on meeting notes:
     1) File must begin with 01 -> 10 -> 20.
     2) Record 26 must always be preceded by record 25.
     3) Every record 25 must have at least one record 26 before next 25/31/trailer/header.
+    4) Required record types 25/26/50/52 must be present.
+    5) Critical fields on 25/26/50/52 must be populated and correctly formatted.
     """
     issues = []
     header_ok = False
@@ -168,17 +238,27 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
     missing_26_after_25_count = 0
     rec25_total = 0
     rec26_total = 0
+    record_type_counts = {rt: 0 for rt in REQUIRED_RECORD_TYPES}
+    critical_field_error_count = 0
+    dropped_issue_count = 0
+
+    def add_issue(message: str):
+        nonlocal dropped_issue_count
+        if len(issues) < MAX_ISSUES_PER_FILE:
+            issues.append(message)
+        else:
+            dropped_issue_count += 1
 
     if len(records) >= 3:
         first_three = [get_record_type(records[0]), get_record_type(records[1]), get_record_type(records[2])]
         if first_three == list(HEADER_SEQUENCE):
             header_ok = True
         else:
-            issues.append(
+            add_issue(
                 f"Header sequence must start with 01->10->20, found {'->'.join(first_three)}"
             )
     else:
-        issues.append("File does not have at least 3 records for required 01->10->20 header")
+        add_issue("File does not have at least 3 records for required 01->10->20 header")
 
     open_25_line = None
     open_25_has_26 = False
@@ -188,12 +268,18 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
 
     for idx, line in enumerate(records, start=1):
         rt = get_record_type(line)
+        if rt in record_type_counts:
+            record_type_counts[rt] += 1
+            critical_field_issues = validate_critical_fields_for_record(line, rt, idx)
+            critical_field_error_count += len(critical_field_issues)
+            for msg in critical_field_issues:
+                add_issue(msg)
 
         if rt == "25":
             rec25_total += 1
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
-                issues.append(
+                add_issue(
                     f"Record 25 at line {open_25_line} has no corresponding 26 before next 25"
                 )
             open_25_line = idx
@@ -202,13 +288,13 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             rec26_total += 1
             if open_25_line is None:
                 orphan_26_count += 1
-                issues.append(f"Record 26 at line {idx} is not preceded by record 25")
+                add_issue(f"Record 26 at line {idx} is not preceded by record 25")
             else:
                 open_25_has_26 = True
         elif rt in close_25_context:
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
-                issues.append(
+                add_issue(
                     f"Record 25 at line {open_25_line} has no corresponding 26 before record {rt} at line {idx}"
                 )
             open_25_line = None
@@ -216,14 +302,34 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
 
     if open_25_line is not None and not open_25_has_26:
         missing_26_after_25_count += 1
-        issues.append(f"Record 25 at line {open_25_line} has no corresponding 26 before end of file")
+        add_issue(f"Record 25 at line {open_25_line} has no corresponding 26 before end of file")
+
+    missing_required_record_types = [rt for rt, count in record_type_counts.items() if count == 0]
+    if missing_required_record_types:
+        add_issue(
+            "Missing required record types: " + ", ".join(missing_required_record_types)
+        )
+
+    if dropped_issue_count:
+        issues.append(
+            f"... plus {dropped_issue_count} additional issues omitted for brevity."
+        )
 
     return {
         "file": file_name,
-        "is_valid": header_ok and orphan_26_count == 0 and missing_26_after_25_count == 0,
+        "is_valid": (
+            header_ok
+            and orphan_26_count == 0
+            and missing_26_after_25_count == 0
+            and len(missing_required_record_types) == 0
+            and critical_field_error_count == 0
+        ),
         "header_ok": header_ok,
         "orphan_26_count": orphan_26_count,
         "missing_26_after_25_count": missing_26_after_25_count,
+        "missing_required_record_types": missing_required_record_types,
+        "critical_field_error_count": critical_field_error_count,
+        "record_type_counts": record_type_counts,
         "record_25_count": rec25_total,
         "record_26_count": rec26_total,
         "issues": issues,
@@ -507,6 +613,8 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "header_ok": False,
                     "orphan_26_count": 0,
                     "missing_26_after_25_count": 0,
+                    "missing_required_record_types": ",".join(REQUIRED_RECORD_TYPES),
+                    "critical_field_error_count": 0,
                     "issues": f"Unable to read file: {e}",
                 }
             )
@@ -529,6 +637,8 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "header_ok": structure["header_ok"],
                     "orphan_26_count": structure["orphan_26_count"],
                     "missing_26_after_25_count": structure["missing_26_after_25_count"],
+                    "missing_required_record_types": ",".join(structure["missing_required_record_types"]),
+                    "critical_field_error_count": structure["critical_field_error_count"],
                     "issues": " | ".join(issues) if issues else "Unknown validation issue",
                 }
             )
@@ -636,6 +746,13 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     header_fail_files = sum(1 for r in structure_results if not r["header_ok"])
     orphan_26_total = sum(r["orphan_26_count"] for r in structure_results)
     missing_26_total = sum(r["missing_26_after_25_count"] for r in structure_results)
+    files_missing_required = sum(1 for r in structure_results if r["missing_required_record_types"])
+    files_with_critical_field_errors = sum(1 for r in structure_results if r["critical_field_error_count"] > 0)
+    critical_field_error_total = sum(r["critical_field_error_count"] for r in structure_results)
+    required_record_type_totals = {
+        rt: sum(r["record_type_counts"].get(rt, 0) for r in structure_results)
+        for rt in REQUIRED_RECORD_TYPES
+    }
     invalid_files_count = len(invalid_file_rows)
 
     structure_status = "PASS" if invalid_files_count == 0 else "FAIL"
@@ -646,6 +763,13 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         f"Files failing 01->10->20 header sequence: {header_fail_files:,}",
         f"Orphan 26 records (26 without preceding 25): {orphan_26_total:,}",
         f"25 records missing corresponding 26: {missing_26_total:,}",
+        (
+            "Required record totals: "
+            + ", ".join([f"{rt}={required_record_type_totals[rt]:,}" for rt in REQUIRED_RECORD_TYPES])
+        ),
+        f"Files missing one or more required record types (25/26/50/52): {files_missing_required:,}",
+        f"Files with critical field issues on 25/26/50/52: {files_with_critical_field_errors:,}",
+        f"Total critical field issues: {critical_field_error_total:,}",
     ]
     if invalid_structure_report:
         detail_lines.append(f"Invalid file report: {invalid_structure_report}")
@@ -659,6 +783,63 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         structure_status,
         "\n".join(detail_lines),
         "X9 file must start with 01->10->20, each 26 must follow 25, and each 25 must include at least one 26.",
+    )
+
+    required_record_status = "PASS" if files_missing_required == 0 else "FAIL"
+    required_examples = [
+        f"{r['file']}: missing {','.join(r['missing_required_record_types'])}"
+        for r in structure_results
+        if r["missing_required_record_types"]
+    ][:10]
+    required_details = [
+        "File-level required record type presence (25/26/50/52)",
+        (
+            "Totals across scanned files: "
+            + ", ".join([f"{rt}={required_record_type_totals[rt]:,}" for rt in REQUIRED_RECORD_TYPES])
+        ),
+        f"Files missing required record types: {files_missing_required:,}",
+    ]
+    if required_examples:
+        required_details.append("Examples:\n - " + "\n - ".join(required_examples))
+    log_check(
+        "Basic Validation: Required Record Types (25/26/50/52)",
+        required_record_status,
+        "\n".join(required_details),
+        "Each file must contain record types 25, 26, 50, and 52.",
+    )
+
+    critical_status = "PASS" if critical_field_error_total == 0 else "FAIL"
+    critical_examples = []
+    for result in structure_results:
+        if result["critical_field_error_count"] > 0 and result["issues"]:
+            # Pick first issue from this file that references critical fields.
+            first_match = next(
+                (
+                    issue
+                    for issue in result["issues"]
+                    if "missing required field" in issue
+                    or "must be numeric" in issue
+                    or "must be " in issue
+                ),
+                "",
+            )
+            if first_match:
+                critical_examples.append(f"{result['file']}: {first_match}")
+        if len(critical_examples) >= 10:
+            break
+    critical_details = [
+        "Critical fields validated on record types 25/26/50/52.",
+        "Fields include routing/account identifiers and control totals.",
+        f"Files with critical field issues: {files_with_critical_field_errors:,}",
+        f"Total critical field issues: {critical_field_error_total:,}",
+    ]
+    if critical_examples:
+        critical_details.append("Examples:\n - " + "\n - ".join(critical_examples))
+    log_check(
+        "Basic Validation: Critical Fields Presence (25/26/50/52)",
+        critical_status,
+        "\n".join(critical_details),
+        "Critical fields (e.g., ABA/routing and account/control fields) must be populated and valid.",
     )
 
     # 1.4 Record Type Summary
