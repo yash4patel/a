@@ -707,8 +707,8 @@ class FileValidator:
         cleaned_path = os.path.join(
             output_dir, f"{filetype.lower()}_cleaned_{self.tenant_name}_{current_datetime}.csv"
         )
-        df = df.head(10)
-        df.to_csv(cleaned_path, sep="|", index=False)
+        df_head = df.head(10)
+        df_head.to_csv(cleaned_path, sep="|", index=False)
         self.logger.info(f"[{self.tenant_name}] Cleaned file (with auto-fixes): {cleaned_path}")
 
         # Calculate statistics
