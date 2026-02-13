@@ -164,6 +164,39 @@ class ValidationRules:
         """Validate customer type."""
         return value in ("Business", "Personal")
 
+    @staticmethod
+    def normalize_account_type(value: str) -> str:
+        """Normalize account type to capitalized format."""
+        value = value.strip()
+        if not value:
+            return value
+        lower = value.lower()
+        return lower.capitalize() if lower in ("business", "personal", "other") else value
+
+    @staticmethod
+    def validate_account_type(value: str) -> bool:
+        """Validate account type."""
+        return value in ("Business", "Personal", "Other")
+
+    @staticmethod
+    def validate_display_fields(value: str) -> bool:
+        """
+        Validate DisplayFields format:
+        - key=value pairs
+        - '#%#' delimiter between pairs
+        """
+        value = value.strip()
+        if not value:
+            return True
+        parts = value.split("#%#")
+        for part in parts:
+            if "=" not in part:
+                return False
+            key, val = part.split("=", 1)
+            if key.strip() == "" or val.strip() == "":
+                return False
+        return True
+
 
 class SchemaManager:
     """Manages validation schemas and JSON configurations."""
@@ -175,6 +208,7 @@ class SchemaManager:
             "PartyID": (True, lambda v: len(v) > 0, 100, None),
             "AdditionalSigners": (False, lambda v: len(v) <= 200, 200, None),
             "AccountCreated": (True, lambda v: bool(ValidationRules.DATE_YMD_RE.match(v)), None, None),
+            "AccountType": (True, ValidationRules.validate_account_type, None, ValidationRules.normalize_account_type),
             "isDDA": (True, ValidationRules.validate_tf, None, ValidationRules.normalize_tf),
             "isChecking": (True, ValidationRules.validate_tf, None, ValidationRules.normalize_tf),
             "isSavings": (True, ValidationRules.validate_tf, None, ValidationRules.normalize_tf),
@@ -216,6 +250,13 @@ class SchemaManager:
                 ValidationRules.normalize_tf,
             ),
             "CompanyName": (False, lambda v: v == "" or len(v) <= 100, 100, None),
+            "AccountName": (False, lambda v: v == "" or len(v) < 100, 100, None),
+            "DisplayFields": (
+                False,
+                lambda v: v == "" or ValidationRules.validate_display_fields(v),
+                1000,
+                None,
+            ),
             "OverdraftLimit": (
                 False,
                 lambda v: v == "" or bool(ValidationRules.MONEY_RE.match(v)),

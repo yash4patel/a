@@ -89,6 +89,9 @@ strip_leading_zeros = true
 - Primary Key: `AccountNumber`
 - At least one balance field required
 - Validates dates, money fields, flags, and account status
+- `AccountType` required (Business|Personal|Other)
+- `AccountName` optional (< 100 chars)
+- `DisplayFields` optional (`key=value` pairs separated by `#%#`, < 1000 chars)
 
 ### Party
 - Primary Key: `PartyID`
