@@ -161,6 +161,7 @@ All outputs are written to `OUTPUT.output_dir`:
 - `retail_validation_<tenant>_<timestamp>.tsv`
 - `retail_cleaned_<tenant>_<timestamp>.csv`
 - `cross_party_reference_issues_<tenant>_<timestamp>.tsv`
+- `cross_reference_summary_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_accounts_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_parties_<tenant>_<timestamp>.tsv`
 - `check_unmatched_accounts_<tenant>_<timestamp>.tsv`
