@@ -1,9 +1,11 @@
-[INPUT]
-account_file = /path/to/account_reference.csv
-party_file = /path/to/party_reference.csv
-achodfi_file = /path/to/achodfi_reference.csv
-online_business_file = /path/to/online_business_reference.csv
-retail_file = /path/to/online_retail_reference.csv
+[CSV FILE INPUT]
+account = /path/to/account_reference.csv
+party = /path/to/party_reference.csv
+achodfi = /path/to/achodfi_reference.csv
+retail = /path/to/retail_reference.csv
+business = /path/to/business_reference.csv
+
+[CROSS-CHANNEL]
 ach_dir = /path/to/ach/files
 check_dir = /path/to/check/xml
 wire_dir = /path/to/wire/logs
