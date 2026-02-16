@@ -1,9 +1,9 @@
 # Cross-Channel Reference Validator
 
 A Python-based validation framework to validate reference CSV files such as
-Account, Party, ACH ODFI, Online Business, and Online Retail. It also performs
-cross-channel matching against historical ACH, Check, and Wire data to report
-the percentage of records that match the reference files.
+Account, Party, ACH ODFI, Business, and Retail. It also performs cross-channel
+matching against historical ACH, Check, and Wire data to report the percentage
+of records that match the reference files.
 
 ---
 
@@ -13,15 +13,15 @@ the percentage of records that match the reference files.
   - Account
   - Party
   - ACH ODFI
-  - Online Business
-  - Online Retail
+  - Business
+  - Retail
 - Schema-driven validation using JSON configuration
 - Required and optional field validation
 - Format validation (dates, money, flags, ASCII)
 - Automatic normalization (T/F flags, money values, status)
 - Single and composite primary key validation
 - Progress logging for large files
-- Cross-channel matching for ACH, Check, and Wire
+- Cross-reference (Account <-> Party) and cross-channel matching (ACH/Check/Wire)
 - Generates cleaned CSVs, error reports, and cross-channel summaries
 - Centralized logging with per-run log files
 
@@ -52,14 +52,14 @@ the percentage of records that match the reference files.
 [GENERAL]
 tenant_name = MyTenant
 
-[INPUT]
-account_file = /path/to/Account.csv
-party_file = /path/to/Party.csv
-achodfi_file = /path/to/ACHODFI.csv
-online_business_file = /path/to/OnlineBusiness.csv
-retail_file = /path/to/Retail_ABC_20260131.csv
+[CSV FILE INPUT]
+account = /path/to/Account.csv
+party = /path/to/Party.csv
+achodfi = /path/to/ACHODFI.csv
+business = /path/to/Business.csv
+retail = /path/to/Retail_ABC_20260131.csv
 
-# Historical channel data
+[CROSS-CHANNEL]
 ach_dir = /path/to/ach/files
 check_dir = /path/to/check/xml
 wire_dir = /path/to/wire/logs
@@ -101,12 +101,12 @@ strip_leading_zeros = true
 - Primary Key: `ACHCompanyID`
 - Validates ODFI setup and settlement details
 
-### Online Business
+### Business
 - Composite Primary Key: `(OnlineCompanyID, UserID)`
 - Required columns: `PartyID`, `OnlineCompanyID`, `UserID`
 - All values must be ASCII and < 100 characters
 
-### Online Retail
+### Retail
 - Primary Key: `UserID`
 - Required columns: `PartyID`, `UserID`
 
@@ -130,7 +130,13 @@ Example:
 
 ---
 
-## Cross-Channel Matching (ACH / Check / Wire)
+## Cross-Reference and Cross-Channel Matching
+
+Phase 2 (Cross-Reference) checks Account ↔ Party consistency and writes:
+`cross_party_reference_issues_<tenant>_<timestamp>.tsv`.
+
+Phase 3 (Cross-Channel) checks accounts/parties against ACH, Check, and Wire
+transaction files.
 
 For each channel, the validator computes:
 - Account match percentage (historical accounts found in Account reference)
@@ -148,6 +154,12 @@ All outputs are written to `OUTPUT.output_dir`:
 - `account_cleaned_<tenant>_<timestamp>.csv`
 - `party_validation_<tenant>_<timestamp>.tsv`
 - `party_cleaned_<tenant>_<timestamp>.csv`
+- `achodfi_validation_<tenant>_<timestamp>.tsv`
+- `achodfi_cleaned_<tenant>_<timestamp>.csv`
+- `business_validation_<tenant>_<timestamp>.tsv`
+- `business_cleaned_<tenant>_<timestamp>.csv`
+- `retail_validation_<tenant>_<timestamp>.tsv`
+- `retail_cleaned_<tenant>_<timestamp>.csv`
 - `cross_party_reference_issues_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_accounts_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_parties_<tenant>_<timestamp>.tsv`

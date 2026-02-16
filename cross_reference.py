@@ -64,12 +64,16 @@ class CrossChannelChecker:
     def _resolve_globs(base_dir: str, patterns: Iterable[str]) -> List[str]:
         files: List[str] = []
         for pat in patterns:
-            files.extend(glob.glob(os.path.join(base_dir, pat), recursive=True))
+            if base_dir:
+                pattern = os.path.join(base_dir, pat)
+            else:
+                pattern = pat
+            files.extend(glob.glob(pattern, recursive=True))
         return sorted(set(files))
 
     def _parse_ach_accounts(self, ach_dir: str) -> List[str]:
         accounts: List[str] = []
-        if not ach_dir or not os.path.isdir(ach_dir):
+        if ach_dir and not os.path.isdir(ach_dir):
             return accounts
         for path in self._resolve_globs(ach_dir, self.ach_globs):
             try:
@@ -85,7 +89,7 @@ class CrossChannelChecker:
 
     def _parse_check_accounts(self, check_dir: str) -> List[str]:
         accounts: List[str] = []
-        if not check_dir or not os.path.isdir(check_dir):
+        if check_dir and not os.path.isdir(check_dir):
             return accounts
         for path in self._resolve_globs(check_dir, self.check_globs):
             try:
@@ -103,7 +107,7 @@ class CrossChannelChecker:
 
     def _parse_wire_accounts(self, wire_dir: str) -> List[str]:
         accounts: List[str] = []
-        if not wire_dir or not os.path.isdir(wire_dir):
+        if wire_dir and not os.path.isdir(wire_dir):
             return accounts
         for path in self._resolve_globs(wire_dir, self.wire_globs):
             try:
@@ -244,7 +248,7 @@ class CrossChannelChecker:
         party_set: Set[str],
         run_id: str,
     ) -> Optional[Dict[str, str]]:
-        if not ach_dir or not os.path.isdir(ach_dir):
+        if ach_dir and not os.path.isdir(ach_dir):
             self.logger.warning(f"[{self.tenant_name}] ACH directory not provided or missing. Skipping.")
             return None
         accounts = self._parse_ach_accounts(ach_dir)
@@ -260,7 +264,7 @@ class CrossChannelChecker:
         party_set: Set[str],
         run_id: str,
     ) -> Optional[Dict[str, str]]:
-        if not check_dir or not os.path.isdir(check_dir):
+        if check_dir and not os.path.isdir(check_dir):
             self.logger.warning(f"[{self.tenant_name}] Check directory not provided or missing. Skipping.")
             return None
         accounts = self._parse_check_accounts(check_dir)
@@ -276,7 +280,7 @@ class CrossChannelChecker:
         party_set: Set[str],
         run_id: str,
     ) -> Optional[Dict[str, str]]:
-        if not wire_dir or not os.path.isdir(wire_dir):
+        if wire_dir and not os.path.isdir(wire_dir):
             self.logger.warning(f"[{self.tenant_name}] Wire directory not provided or missing. Skipping.")
             return None
         accounts = self._parse_wire_accounts(wire_dir)

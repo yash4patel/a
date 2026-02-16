@@ -39,20 +39,42 @@ class ValidationConfig:
         self.config = self._load_config(config_path)
 
         # Load file paths - empty string if not provided or path doesn't exist
-        self.account_file = self._get_valid_path("INPUT", "account_file")
-        self.party_file = self._get_valid_path("INPUT", "party_file")
-        self.achodfi_file = self._get_valid_path("INPUT", "achodfi_file")
-        self.online_business_file = self._get_valid_path("INPUT", "online_business_file")
-        self.retail_file = self._get_valid_path("INPUT", "retail_file")
+        self.account_file = self._get_value(
+            [("CSV FILE INPUT", "account"), ("INPUT", "account_file")]
+        )
+        self.party_file = self._get_value([("CSV FILE INPUT", "party"), ("INPUT", "party_file")])
+        self.achodfi_file = self._get_value(
+            [("CSV FILE INPUT", "achodfi"), ("INPUT", "achodfi_file")]
+        )
+        self.business_file = self._get_value(
+            [
+                ("CSV FILE INPUT", "business"),
+                ("INPUT", "business_file"),
+                ("INPUT", "online_business_file"),
+            ]
+        )
+        self.retail_file = self._get_value(
+            [
+                ("CSV FILE INPUT", "retail"),
+                ("INPUT", "retail_file"),
+                ("INPUT", "online_retail_file"),
+            ]
+        )
 
         # Historical channel inputs
-        self.ach_dir = self._get_valid_path("INPUT", "ach_dir")
-        self.check_dir = self._get_valid_path("INPUT", "check_dir")
-        self.wire_dir = self._get_valid_path("INPUT", "wire_dir")
+        self.ach_dir = self._get_value([("CROSS-CHANNEL", "ach_dir"), ("INPUT", "ach_dir")])
+        self.check_dir = self._get_value([("CROSS-CHANNEL", "check_dir"), ("INPUT", "check_dir")])
+        self.wire_dir = self._get_value([("CROSS-CHANNEL", "wire_dir"), ("INPUT", "wire_dir")])
 
-        self.ach_globs = self._get_list("INPUT", "ach_glob", "*ACH,*ach")
-        self.check_globs = self._get_list("INPUT", "check_glob", "*.xml,*.XML")
-        self.wire_globs = self._get_list("INPUT", "wire_glob", "**/*.log,**/*.LOG")
+        self.ach_globs = self._get_list(
+            [("CROSS-CHANNEL", "ach_glob"), ("INPUT", "ach_glob")], "*ACH,*ach"
+        )
+        self.check_globs = self._get_list(
+            [("CROSS-CHANNEL", "check_glob"), ("INPUT", "check_glob")], "*.xml,*.XML"
+        )
+        self.wire_globs = self._get_list(
+            [("CROSS-CHANNEL", "wire_glob"), ("INPUT", "wire_glob")], "**/*.log,**/*.LOG"
+        )
 
         self.output_dir = self.config["OUTPUT"]["output_dir"].strip()
         self.json_schema_file = self.config["SCHEMA"]["json_schema_file"].strip()
@@ -67,22 +89,20 @@ class ValidationConfig:
         self.cross_check_wire = self._get_bool("OPTIONS", "cross_check_wire", True)
         self.strip_leading_zeros = self._get_bool("OPTIONS", "strip_leading_zeros", True)
 
-    def _get_valid_path(self, section: str, key: str) -> str:
-        """Get file path from config, return empty string if invalid or not provided."""
-        try:
-            path = self.config.get(section, key, fallback="").strip()
-            if not path or path.lower() in ("", "none", "null", "n/a"):
-                return ""
-            # Return path even if it doesn't exist - let validation handle the error
-            return path
-        except Exception:
-            return ""
+    def _get_value(self, options: List[Tuple[str, str]], default: str = "") -> str:
+        for section, key in options:
+            try:
+                if not self.config.has_option(section, key):
+                    continue
+                value = self.config.get(section, key, fallback="").strip()
+            except Exception:
+                continue
+            if value and value.lower() not in ("", "none", "null", "n/a"):
+                return value
+        return default
 
-    def _get_list(self, section: str, key: str, default: str) -> List[str]:
-        try:
-            raw = self.config.get(section, key, fallback=default).strip()
-        except Exception:
-            raw = default
+    def _get_list(self, options: List[Tuple[str, str]], default: str) -> List[str]:
+        raw = self._get_value(options, default)
         return [v.strip() for v in raw.split(",") if v.strip()]
 
     def _get_bool(self, section: str, key: str, default: bool) -> bool:
@@ -289,12 +309,12 @@ class SchemaManager:
                 None,
             ),
         },
-        "OnlineBusiness": {
+        "Business": {
             "PartyID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
             "OnlineCompanyID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
             "UserID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
         },
-        "OnlineRetail": {
+        "Retail": {
             "PartyID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
             "UserID": (True, lambda v: len(v) > 0 and len(v) < 100 and v.isascii(), 100, None),
         },
@@ -304,8 +324,8 @@ class SchemaManager:
         "Account": "AccountNumber",
         "Party": "PartyID",
         "ACHODFI": "ACHCompanyID",
-        "OnlineBusiness": ("OnlineCompanyID", "UserID"),
-        "OnlineRetail": "UserID",
+        "Business": ("OnlineCompanyID", "UserID"),
+        "Retail": "UserID",
     }
 
     def __init__(self, json_schema_path: str, logger: logging.Logger):
@@ -775,7 +795,7 @@ class ReferenceValidator:
         try:
             # Phase 1: Validate reference files
             self.logger.info("\n" + "=" * 80)
-            self.logger.info(f"[{self.config.tenant_name}] PHASE 1: Reference File Validation")
+            self.logger.info(f"[{self.config.tenant_name}] PHASE 1: DATA VALIDATION")
             self.logger.info("=" * 80)
 
             # Validate Account file if path provided
@@ -838,55 +858,53 @@ class ReferenceValidator:
             else:
                 self.logger.warning(f"[{self.config.tenant_name}] No path provided for ACHODFI file - SKIPPING")
 
-            # Validate OnlineBusiness file if path provided
-            if self.config.online_business_file:
-                if os.path.exists(self.config.online_business_file):
+            # Validate Business file if path provided
+            if self.config.business_file:
+                if os.path.exists(self.config.business_file):
                     self.logger.info(
-                        f"[{self.config.tenant_name}] Validating OnlineBusiness file: "
-                        f"{self.config.online_business_file}"
+                        f"[{self.config.tenant_name}] Validating Business file: "
+                        f"{self.config.business_file}"
                     )
                     results.append(
                         self.file_validator.validate_reference_file(
-                            self.config.online_business_file,
-                            "OnlineBusiness",
+                            self.config.business_file,
+                            "Business",
                             self.config.output_dir,
                         )
                     )
                 else:
                     self.logger.error(
-                        f"[{self.config.tenant_name}] OnlineBusiness file NOT FOUND: "
-                        f"{self.config.online_business_file}"
+                        f"[{self.config.tenant_name}] Business file NOT FOUND: "
+                        f"{self.config.business_file}"
                     )
             else:
-                self.logger.warning(
-                    f"[{self.config.tenant_name}] No path provided for OnlineBusiness file - SKIPPING"
-                )
+                self.logger.warning(f"[{self.config.tenant_name}] No path provided for Business file - SKIPPING")
 
-            # Validate OnlineRetail file if path provided
+            # Validate Retail file if path provided
             if self.config.retail_file:
                 if os.path.exists(self.config.retail_file):
                     self.logger.info(
-                        f"[{self.config.tenant_name}] Validating OnlineRetail file: {self.config.retail_file}"
+                        f"[{self.config.tenant_name}] Validating Retail file: {self.config.retail_file}"
                     )
                     results.append(
                         self.file_validator.validate_reference_file(
                             self.config.retail_file,
-                            "OnlineRetail",
+                            "Retail",
                             self.config.output_dir,
                         )
                     )
                 else:
-                    self.logger.error(
-                        f"[{self.config.tenant_name}] OnlineRetail file NOT FOUND: {self.config.retail_file}"
-                    )
+                    self.logger.error(f"[{self.config.tenant_name}] Retail file NOT FOUND: {self.config.retail_file}")
             else:
-                self.logger.warning(f"[{self.config.tenant_name}] No path provided for OnlineRetail file - SKIPPING")
+                self.logger.warning(f"[{self.config.tenant_name}] No path provided for Retail file - SKIPPING")
 
-            # Phase 2: Cross-channel matching
+            # Phase 2: Cross-reference (CSV to CSV)
             self.logger.info("\n" + "=" * 80)
-            self.logger.info(f"[{self.config.tenant_name}] PHASE 2: Cross-Channel Matching")
+            self.logger.info(f"[{self.config.tenant_name}] PHASE 2: CROSS-REFERENCE (CSV to CSV)")
             self.logger.info("=" * 80)
 
+            account_map = None
+            party_set = None
             if self.config.account_file and self.config.party_file:
                 if os.path.exists(self.config.account_file) and os.path.exists(self.config.party_file):
                     account_map, party_set = self.cross_checker.load_reference_sets(
@@ -895,53 +913,79 @@ class ReferenceValidator:
                     )
 
                     if self.config.cross_check_party:
-                        self.cross_checker.cross_check_reference_party(account_map, party_set, run_id)
-
-                    if self.config.cross_check_ach:
-                        ach_result = self.cross_checker.cross_check_ach(
-                            self.config.ach_dir,
-                            account_map,
-                            party_set,
-                            run_id,
+                        ref_path = self.cross_checker.cross_check_reference_party(account_map, party_set, run_id)
+                        self.logger.info(
+                            f"[{self.config.tenant_name}] Cross-reference report: {ref_path}"
                         )
-                        if ach_result:
-                            cross_results.append(ach_result)
-
-                    if self.config.cross_check_check:
-                        check_result = self.cross_checker.cross_check_check(
-                            self.config.check_dir,
-                            account_map,
-                            party_set,
-                            run_id,
+                    else:
+                        self.logger.info(
+                            f"[{self.config.tenant_name}] Cross-reference disabled by config - SKIPPING"
                         )
-                        if check_result:
-                            cross_results.append(check_result)
-
-                    if self.config.cross_check_wire:
-                        wire_result = self.cross_checker.cross_check_wire(
-                            self.config.wire_dir,
-                            account_map,
-                            party_set,
-                            run_id,
-                        )
-                        if wire_result:
-                            cross_results.append(wire_result)
                 else:
                     self.logger.warning(
                         f"[{self.config.tenant_name}] Account/Party reference files missing - "
-                        "cross-channel checks skipped"
+                        "cross-reference skipped"
                     )
             else:
                 self.logger.warning(
-                    f"[{self.config.tenant_name}] Account/Party paths not provided - "
+                    f"[{self.config.tenant_name}] Account/Party paths not provided - cross-reference skipped"
+                )
+
+            # Phase 3: Cross-channel (CSV to transaction files)
+            self.logger.info("\n" + "=" * 80)
+            self.logger.info(f"[{self.config.tenant_name}] PHASE 3: CROSS-CHANNEL (CSV to transaction files)")
+            self.logger.info("=" * 80)
+
+            cross_channel_enabled = (
+                self.config.cross_check_ach or self.config.cross_check_check or self.config.cross_check_wire
+            )
+
+            if not cross_channel_enabled:
+                self.logger.info(
+                    f"[{self.config.tenant_name}] Cross-channel checks disabled by config - SKIPPING"
+                )
+            elif account_map is not None and party_set is not None:
+                if self.config.cross_check_ach:
+                    ach_result = self.cross_checker.cross_check_ach(
+                        self.config.ach_dir,
+                        account_map,
+                        party_set,
+                        run_id,
+                    )
+                    if ach_result:
+                        cross_results.append(ach_result)
+
+                if self.config.cross_check_check:
+                    check_result = self.cross_checker.cross_check_check(
+                        self.config.check_dir,
+                        account_map,
+                        party_set,
+                        run_id,
+                    )
+                    if check_result:
+                        cross_results.append(check_result)
+
+                if self.config.cross_check_wire:
+                    wire_result = self.cross_checker.cross_check_wire(
+                        self.config.wire_dir,
+                        account_map,
+                        party_set,
+                        run_id,
+                    )
+                    if wire_result:
+                        cross_results.append(wire_result)
+            else:
+                self.logger.warning(
+                    f"[{self.config.tenant_name}] Account/Party reference not available - "
                     "cross-channel checks skipped"
                 )
 
-            if cross_results:
-                summary_path = self.cross_checker.write_summary(cross_results, run_id)
-                self.logger.info(f"[{self.config.tenant_name}] Cross-channel summary: {summary_path}")
-            else:
-                self.logger.warning(f"[{self.config.tenant_name}] No cross-channel results generated")
+            if cross_channel_enabled:
+                if cross_results:
+                    summary_path = self.cross_checker.write_summary(cross_results, run_id)
+                    self.logger.info(f"[{self.config.tenant_name}] Cross-channel summary: {summary_path}")
+                else:
+                    self.logger.warning(f"[{self.config.tenant_name}] No cross-channel results generated")
 
             # Final summary
             end_time = datetime.now()
