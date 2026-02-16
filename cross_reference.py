@@ -150,6 +150,54 @@ class CrossChannelChecker:
 
         return account_map, party_set
 
+    def load_reference_sets_with_duplicates(
+        self,
+        account_file: str,
+        party_file: str,
+    ) -> Tuple[Dict[str, str], Set[str], Dict[str, int], Dict[str, int], Dict[str, int]]:
+        account_df = self._read_pipe_csv(account_file, self.logger)
+        if ACCOUNT_COL not in account_df.columns or PARTY_COL not in account_df.columns:
+            raise ValueError(f"Account file must include columns: {ACCOUNT_COL}, {PARTY_COL}")
+
+        account_values: List[str] = []
+        account_map: Dict[str, str] = {}
+        for _, row in account_df.iterrows():
+            acct = self._normalize_account(str(row[ACCOUNT_COL]))
+            party = self._normalize_party(str(row[PARTY_COL]))
+            if acct:
+                account_values.append(acct)
+                if acct not in account_map or (not account_map[acct] and party):
+                    account_map[acct] = party
+
+        account_counts = Counter(account_values)
+        account_duplicates = {acct: count for acct, count in account_counts.items() if count > 1}
+        account_dup_records = sum(count - 1 for count in account_duplicates.values())
+
+        party_df = self._read_pipe_csv(party_file, self.logger)
+        if PARTY_COL not in party_df.columns:
+            raise ValueError(f"Party file must include column: {PARTY_COL}")
+
+        party_values = [
+            self._normalize_party(str(v))
+            for v in party_df[PARTY_COL].astype(str).tolist()
+            if self._normalize_party(str(v))
+        ]
+        party_set = set(party_values)
+        party_counts = Counter(party_values)
+        party_duplicates = {pid: count for pid, count in party_counts.items() if count > 1}
+        party_dup_records = sum(count - 1 for count in party_duplicates.values())
+
+        stats = {
+            "total_account_rows": len(account_values),
+            "total_party_rows": len(party_values),
+            "duplicate_account_keys": len(account_duplicates),
+            "duplicate_account_records": account_dup_records,
+            "duplicate_party_keys": len(party_duplicates),
+            "duplicate_party_records": party_dup_records,
+        }
+
+        return account_map, party_set, account_duplicates, party_duplicates, stats
+
     def _write_tsv(self, rows: List[List[str]], path: str, headers: List[str]) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
         pd.DataFrame(rows, columns=headers).to_csv(path, sep="\t", index=False)
@@ -158,20 +206,59 @@ class CrossChannelChecker:
         self,
         account_map: Dict[str, str],
         party_set: Set[str],
+        account_duplicates: Dict[str, int],
+        party_duplicates: Dict[str, int],
+        stats: Dict[str, int],
         run_id: str,
-    ) -> str:
+    ) -> Dict[str, str]:
         rows: List[List[str]] = []
+        missing_party_in_account = 0
+        missing_party_in_party = 0
         for acct, party in account_map.items():
             if not party:
                 rows.append([acct, "", "Missing PartyID in Account reference"])
+                missing_party_in_account += 1
             elif party not in party_set:
                 rows.append([acct, party, "PartyID missing from Party reference"])
+                missing_party_in_party += 1
+
+        for acct, count in sorted(account_duplicates.items()):
+            rows.append([acct, "", f"AccountNumber duplicate (count={count})"])
+
+        for party, count in sorted(party_duplicates.items()):
+            rows.append(["", party, f"PartyID duplicate (count={count})"])
 
         path = os.path.join(
             self.output_dir, f"cross_party_reference_issues_{self.tenant_name}_{run_id}.tsv"
         )
         self._write_tsv(rows, path, ["AccountNumber", "PartyID", "issue"])
         self.logger.info(f"[{self.tenant_name}] Account->Party reference issues: {len(rows)}")
+        return {
+            "report_path": path,
+            "missing_party_in_account": str(missing_party_in_account),
+            "missing_party_in_party": str(missing_party_in_party),
+            "duplicate_account_keys": str(stats.get("duplicate_account_keys", 0)),
+            "duplicate_account_records": str(stats.get("duplicate_account_records", 0)),
+            "duplicate_party_keys": str(stats.get("duplicate_party_keys", 0)),
+            "duplicate_party_records": str(stats.get("duplicate_party_records", 0)),
+            "total_account_rows": str(stats.get("total_account_rows", 0)),
+            "total_party_rows": str(stats.get("total_party_rows", 0)),
+        }
+
+    def write_cross_reference_summary(self, summary: Dict[str, str], run_id: str) -> str:
+        path = os.path.join(self.output_dir, f"cross_reference_summary_{self.tenant_name}_{run_id}.tsv")
+        rows = [
+            ["total_account_rows", summary.get("total_account_rows", "0")],
+            ["total_party_rows", summary.get("total_party_rows", "0")],
+            ["missing_party_in_account", summary.get("missing_party_in_account", "0")],
+            ["missing_party_in_party", summary.get("missing_party_in_party", "0")],
+            ["duplicate_account_keys", summary.get("duplicate_account_keys", "0")],
+            ["duplicate_account_records", summary.get("duplicate_account_records", "0")],
+            ["duplicate_party_keys", summary.get("duplicate_party_keys", "0")],
+            ["duplicate_party_records", summary.get("duplicate_party_records", "0")],
+            ["report_path", summary.get("report_path", "")],
+        ]
+        self._write_tsv(rows, path, ["metric", "value"])
         return path
 
     def cross_check_channel(

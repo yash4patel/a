@@ -907,15 +907,32 @@ class ReferenceValidator:
             party_set = None
             if self.config.account_file and self.config.party_file:
                 if os.path.exists(self.config.account_file) and os.path.exists(self.config.party_file):
-                    account_map, party_set = self.cross_checker.load_reference_sets(
+                    (
+                        account_map,
+                        party_set,
+                        account_duplicates,
+                        party_duplicates,
+                        ref_stats,
+                    ) = self.cross_checker.load_reference_sets_with_duplicates(
                         self.config.account_file,
                         self.config.party_file,
                     )
 
                     if self.config.cross_check_party:
-                        ref_path = self.cross_checker.cross_check_reference_party(account_map, party_set, run_id)
+                        ref_result = self.cross_checker.cross_check_reference_party(
+                            account_map,
+                            party_set,
+                            account_duplicates,
+                            party_duplicates,
+                            ref_stats,
+                            run_id,
+                        )
                         self.logger.info(
-                            f"[{self.config.tenant_name}] Cross-reference report: {ref_path}"
+                            f"[{self.config.tenant_name}] Cross-reference report: {ref_result['report_path']}"
+                        )
+                        summary_path = self.cross_checker.write_cross_reference_summary(ref_result, run_id)
+                        self.logger.info(
+                            f"[{self.config.tenant_name}] Cross-reference summary: {summary_path}"
                         )
                     else:
                         self.logger.info(
