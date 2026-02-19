@@ -793,9 +793,11 @@ class ReferenceValidator:
         cross_results: List[Dict[str, str]] = []
 
         try:
-            # Phase 1: Validate reference files
+            # Phase 1: Validate reference files (CSV formats/columns/rules)
             self.logger.info("\n" + "=" * 80)
-            self.logger.info(f"[{self.config.tenant_name}] PHASE 1: DATA VALIDATION")
+            self.logger.info(
+                f"[{self.config.tenant_name}] PHASE 1: DATA VALIDATION (CSV validation only: formats, columns, rules)"
+            )
             self.logger.info("=" * 80)
 
             # Validate Account file if path provided
@@ -900,53 +902,70 @@ class ReferenceValidator:
 
             # Phase 2: Cross-reference (CSV to CSV)
             self.logger.info("\n" + "=" * 80)
-            self.logger.info(f"[{self.config.tenant_name}] PHASE 2: CROSS-REFERENCE (CSV to CSV)")
+            self.logger.info(
+                f"[{self.config.tenant_name}] PHASE 2: CROSS-REFERENCE (CSV to CSV validation: account/party linkage)"
+            )
             self.logger.info("=" * 80)
 
             account_map = None
             party_set = None
-            if self.config.account_file and self.config.party_file:
-                if os.path.exists(self.config.account_file) and os.path.exists(self.config.party_file):
-                    (
-                        account_map,
-                        party_set,
-                        account_duplicates,
-                        party_duplicates,
-                        ref_stats,
-                    ) = self.cross_checker.load_reference_sets_with_duplicates(
-                        self.config.account_file,
-                        self.config.party_file,
-                    )
+            account_duplicates = {}
+            party_duplicates = {}
 
-                    if self.config.cross_check_party:
-                        ref_result = self.cross_checker.cross_check_reference_party(
-                            account_map,
-                            party_set,
-                            account_duplicates,
-                            party_duplicates,
-                            ref_stats,
-                            run_id,
-                        )
-                        self.logger.info(
-                            f"[{self.config.tenant_name}] Cross-reference report: {ref_result['report_path']}"
-                        )
-                        summary_path = self.cross_checker.write_cross_reference_summary(ref_result, run_id)
-                        self.logger.info(
-                            f"[{self.config.tenant_name}] Cross-reference summary: {summary_path}"
-                        )
-                    else:
-                        self.logger.info(
-                            f"[{self.config.tenant_name}] Cross-reference disabled by config - SKIPPING"
-                        )
+            if self.config.cross_check_party:
+                # Load Party reference (required for all Phase 2 checks)
+                if self.config.party_file and os.path.exists(self.config.party_file):
+                    party_set, party_duplicates, _party_stats = self.cross_checker.load_party_set_with_duplicates(
+                        self.config.party_file
+                    )
                 else:
                     self.logger.warning(
-                        f"[{self.config.tenant_name}] Account/Party reference files missing - "
+                        f"[{self.config.tenant_name}] Party reference not provided or missing - "
                         "cross-reference skipped"
                     )
+
+                # Load Account reference map (used by Phase 2 Account->Party and Phase 3)
+                if self.config.account_file and os.path.exists(self.config.account_file):
+                    account_map, account_duplicates, _acct_stats = (
+                        self.cross_checker.load_account_map_with_duplicates(self.config.account_file)
+                    )
+                else:
+                    self.logger.warning(
+                        f"[{self.config.tenant_name}] Account reference not provided or missing - "
+                        "Account->Party linkage and cross-channel checks may be skipped"
+                    )
+
+                # Run Phase 2 checks if Party set is available
+                if party_set is not None:
+                    references_to_check = []
+                    if self.config.account_file and os.path.exists(self.config.account_file):
+                        references_to_check.append(("Account", self.config.account_file, ["AccountNumber"]))
+                    if self.config.achodfi_file and os.path.exists(self.config.achodfi_file):
+                        references_to_check.append(("ACHODFI", self.config.achodfi_file, ["ACHCompanyID"]))
+                    if self.config.business_file and os.path.exists(self.config.business_file):
+                        references_to_check.append(("Business", self.config.business_file, ["OnlineCompanyID", "UserID"]))
+                    if self.config.retail_file and os.path.exists(self.config.retail_file):
+                        references_to_check.append(("Retail", self.config.retail_file, ["UserID"]))
+
+                    if references_to_check:
+                        phase2_result = self.cross_checker.cross_check_reference_party_linkages(
+                            party_set=party_set,
+                            references=references_to_check,
+                            run_id=run_id,
+                            account_duplicates=account_duplicates if account_duplicates else None,
+                            party_duplicates=party_duplicates if party_duplicates else None,
+                        )
+                        self.logger.info(
+                            f"[{self.config.tenant_name}] Cross-reference report: {phase2_result['report_path']}"
+                        )
+                        summary_path = self.cross_checker.write_cross_reference_summary_phase2(phase2_result, run_id)
+                        self.logger.info(f"[{self.config.tenant_name}] Cross-reference summary: {summary_path}")
+                    else:
+                        self.logger.warning(
+                            f"[{self.config.tenant_name}] No reference files provided for Phase 2 - SKIPPING"
+                        )
             else:
-                self.logger.warning(
-                    f"[{self.config.tenant_name}] Account/Party paths not provided - cross-reference skipped"
-                )
+                self.logger.info(f"[{self.config.tenant_name}] Cross-reference disabled by config - SKIPPING")
 
             # Phase 3: Cross-channel (CSV to transaction files)
             self.logger.info("\n" + "=" * 80)

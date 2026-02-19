@@ -132,11 +132,22 @@ Example:
 
 ## Cross-Reference and Cross-Channel Matching
 
-Phase 2 (Cross-Reference) checks Account ↔ Party consistency and writes:
-`cross_party_reference_issues_<tenant>_<timestamp>.tsv`.
+### Phase 1: Data Validation (CSV validation only)
 
-Phase 3 (Cross-Channel) checks accounts/parties against ACH, Check, and Wire
-transaction files.
+- Validates CSV structure, expected columns (from JSON header blocks), and field-level formats/rules.
+- Outputs per-file error TSVs and cleaned CSVs.
+
+### Phase 2: Cross-Reference (CSV ↔ CSV)
+
+- Validates reference-to-reference consistency, focused on **account/party linkage**.
+- Checks PartyID linkage across reference CSVs (Account, ACH ODFI, Business, Retail) against the Party reference.
+- Produces a consolidated report:
+  - `cross_reference_issues_<tenant>_<timestamp>.tsv`
+  - `cross_reference_summary_<tenant>_<timestamp>.tsv`
+
+### Phase 3: Cross-Channel (CSV ↔ transaction files)
+
+- Checks that accounts/parties in transaction channels (ACH, Check, Wire) map back to the reference CSVs.
 
 For each channel, the validator computes:
 - Account match percentage (historical accounts found in Account reference)
@@ -182,7 +193,8 @@ Log files are written to:
 
 ```bash
 cp config.ini.example config.ini
-python validator.py config.ini
+python3 -m pip install -r requirements.txt
+python3 validator.py config.ini
 ```
 
 ---
