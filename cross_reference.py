@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from collections import Counter
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import pandas as pd
 
@@ -121,40 +121,10 @@ class CrossChannelChecker:
                 self.logger.warning(f"[{self.tenant_name}] Failed to read Wire log {path}: {e}")
         return accounts
 
-    def load_reference_sets(
+    def load_account_map_with_duplicates(
         self,
         account_file: str,
-        party_file: str,
-    ) -> Tuple[Dict[str, str], Set[str]]:
-        account_df = self._read_pipe_csv(account_file, self.logger)
-        if ACCOUNT_COL not in account_df.columns or PARTY_COL not in account_df.columns:
-            raise ValueError(f"Account file must include columns: {ACCOUNT_COL}, {PARTY_COL}")
-
-        account_map: Dict[str, str] = {}
-        for _, row in account_df.iterrows():
-            acct = self._normalize_account(str(row[ACCOUNT_COL]))
-            party = self._normalize_party(str(row[PARTY_COL]))
-            if acct:
-                if acct not in account_map or (not account_map[acct] and party):
-                    account_map[acct] = party
-
-        party_df = self._read_pipe_csv(party_file, self.logger)
-        if PARTY_COL not in party_df.columns:
-            raise ValueError(f"Party file must include column: {PARTY_COL}")
-
-        party_set = {
-            self._normalize_party(str(v))
-            for v in party_df[PARTY_COL].astype(str).tolist()
-            if self._normalize_party(str(v))
-        }
-
-        return account_map, party_set
-
-    def load_reference_sets_with_duplicates(
-        self,
-        account_file: str,
-        party_file: str,
-    ) -> Tuple[Dict[str, str], Set[str], Dict[str, int], Dict[str, int], Dict[str, int]]:
+    ) -> Tuple[Dict[str, str], Dict[str, int], Dict[str, int]]:
         account_df = self._read_pipe_csv(account_file, self.logger)
         if ACCOUNT_COL not in account_df.columns or PARTY_COL not in account_df.columns:
             raise ValueError(f"Account file must include columns: {ACCOUNT_COL}, {PARTY_COL}")
@@ -172,7 +142,17 @@ class CrossChannelChecker:
         account_counts = Counter(account_values)
         account_duplicates = {acct: count for acct, count in account_counts.items() if count > 1}
         account_dup_records = sum(count - 1 for count in account_duplicates.values())
+        account_stats = {
+            "total_account_rows": len(account_values),
+            "duplicate_account_keys": len(account_duplicates),
+            "duplicate_account_records": account_dup_records,
+        }
+        return account_map, account_duplicates, account_stats
 
+    def load_party_set_with_duplicates(
+        self,
+        party_file: str,
+    ) -> Tuple[Set[str], Dict[str, int], Dict[str, int]]:
         party_df = self._read_pipe_csv(party_file, self.logger)
         if PARTY_COL not in party_df.columns:
             raise ValueError(f"Party file must include column: {PARTY_COL}")
@@ -186,14 +166,37 @@ class CrossChannelChecker:
         party_counts = Counter(party_values)
         party_duplicates = {pid: count for pid, count in party_counts.items() if count > 1}
         party_dup_records = sum(count - 1 for count in party_duplicates.values())
-
-        stats = {
-            "total_account_rows": len(account_values),
+        party_stats = {
             "total_party_rows": len(party_values),
-            "duplicate_account_keys": len(account_duplicates),
-            "duplicate_account_records": account_dup_records,
             "duplicate_party_keys": len(party_duplicates),
             "duplicate_party_records": party_dup_records,
+        }
+        return party_set, party_duplicates, party_stats
+
+    def load_reference_sets(
+        self,
+        account_file: str,
+        party_file: str,
+    ) -> Tuple[Dict[str, str], Set[str]]:
+        account_map, _, _ = self.load_account_map_with_duplicates(account_file)
+        party_set, _, _ = self.load_party_set_with_duplicates(party_file)
+        return account_map, party_set
+
+    def load_reference_sets_with_duplicates(
+        self,
+        account_file: str,
+        party_file: str,
+    ) -> Tuple[Dict[str, str], Set[str], Dict[str, int], Dict[str, int], Dict[str, int]]:
+        account_map, account_duplicates, account_stats = self.load_account_map_with_duplicates(account_file)
+        party_set, party_duplicates, party_stats = self.load_party_set_with_duplicates(party_file)
+
+        stats = {
+            "total_account_rows": account_stats.get("total_account_rows", 0),
+            "total_party_rows": party_stats.get("total_party_rows", 0),
+            "duplicate_account_keys": account_stats.get("duplicate_account_keys", 0),
+            "duplicate_account_records": account_stats.get("duplicate_account_records", 0),
+            "duplicate_party_keys": party_stats.get("duplicate_party_keys", 0),
+            "duplicate_party_records": party_stats.get("duplicate_party_records", 0),
         }
 
         return account_map, party_set, account_duplicates, party_duplicates, stats
@@ -234,9 +237,15 @@ class CrossChannelChecker:
         self._write_tsv(rows, path, ["AccountNumber", "PartyID", "issue"])
         self.logger.info(f"[{self.tenant_name}] Account->Party reference issues: {len(rows)}")
         return {
+            "check_name": "account_to_party",
+            "source_name": "Account",
+            "total_source_rows": str(stats.get("total_account_rows", 0)),
             "report_path": path,
+            "missing_party_in_source": str(missing_party_in_account),
             "missing_party_in_account": str(missing_party_in_account),
             "missing_party_in_party": str(missing_party_in_party),
+            "duplicate_source_keys": str(stats.get("duplicate_account_keys", 0)),
+            "duplicate_source_records": str(stats.get("duplicate_account_records", 0)),
             "duplicate_account_keys": str(stats.get("duplicate_account_keys", 0)),
             "duplicate_account_records": str(stats.get("duplicate_account_records", 0)),
             "duplicate_party_keys": str(stats.get("duplicate_party_keys", 0)),
@@ -245,19 +254,135 @@ class CrossChannelChecker:
             "total_party_rows": str(stats.get("total_party_rows", 0)),
         }
 
-    def write_cross_reference_summary(self, summary: Dict[str, str], run_id: str) -> str:
+    @staticmethod
+    def _format_source_key(source_key_cols: Tuple[str, ...], values: Tuple[str, ...]) -> str:
+        if len(source_key_cols) == 1:
+            return values[0]
+        return " | ".join(f"{col}={val}" for col, val in zip(source_key_cols, values))
+
+    def cross_check_reference_file_party(
+        self,
+        source_file: str,
+        source_name: str,
+        source_key_cols: Tuple[str, ...],
+        party_set: Set[str],
+        run_id: str,
+    ) -> Optional[Dict[str, str]]:
+        if not source_file:
+            self.logger.info(f"[{self.tenant_name}] {source_name} path not provided. Skipping.")
+            return None
+        if not os.path.exists(source_file):
+            self.logger.warning(
+                f"[{self.tenant_name}] {source_name} file not found for cross-reference: {source_file}"
+            )
+            return None
+
+        source_df = self._read_pipe_csv(source_file, self.logger)
+        required_cols = list(source_key_cols) + [PARTY_COL]
+        missing_cols = [col for col in required_cols if col not in source_df.columns]
+        if missing_cols:
+            self.logger.warning(
+                f"[{self.tenant_name}] {source_name} cross-reference skipped, "
+                f"missing columns: {', '.join(missing_cols)}"
+            )
+            return None
+
+        rows: List[List[str]] = []
+        source_keys: List[Tuple[str, ...]] = []
+        missing_party_in_source = 0
+        missing_party_in_party = 0
+
+        for _, row in source_df.iterrows():
+            key_values = tuple(str(row[col]).strip() for col in source_key_cols)
+            source_key = self._format_source_key(source_key_cols, key_values)
+            if all(key_values):
+                source_keys.append(key_values)
+
+            party = self._normalize_party(str(row[PARTY_COL]))
+            if not party:
+                rows.append([source_name, source_key, "", f"Missing PartyID in {source_name} reference"])
+                missing_party_in_source += 1
+            elif party not in party_set:
+                rows.append([source_name, source_key, party, "PartyID missing from Party reference"])
+                missing_party_in_party += 1
+
+        source_counts = Counter(source_keys)
+        source_duplicates = {key: count for key, count in source_counts.items() if count > 1}
+        duplicate_source_records = sum(count - 1 for count in source_duplicates.values())
+
+        duplicate_label = " + ".join(source_key_cols)
+        for key_values, count in sorted(source_duplicates.items()):
+            rows.append(
+                [
+                    source_name,
+                    self._format_source_key(source_key_cols, key_values),
+                    "",
+                    f"{duplicate_label} duplicate (count={count})",
+                ]
+            )
+
+        report_name = f"cross_{source_name.lower()}_party_reference_issues_{self.tenant_name}_{run_id}.tsv"
+        path = os.path.join(self.output_dir, report_name)
+        self._write_tsv(rows, path, ["source", "source_key", "PartyID", "issue"])
+
+        self.logger.info(
+            f"[{self.tenant_name}] {source_name}->Party reference issues: {len(rows)} "
+            f"(missing party in source={missing_party_in_source}, "
+            f"missing party in Party={missing_party_in_party}, duplicates={len(source_duplicates)})"
+        )
+
+        return {
+            "check_name": f"{source_name.lower()}_to_party",
+            "source_name": source_name,
+            "total_source_rows": str(len(source_df)),
+            "missing_party_in_source": str(missing_party_in_source),
+            "missing_party_in_party": str(missing_party_in_party),
+            "duplicate_source_keys": str(len(source_duplicates)),
+            "duplicate_source_records": str(duplicate_source_records),
+            "report_path": path,
+        }
+
+    def write_cross_reference_summary(
+        self,
+        summaries: Union[Dict[str, str], List[Dict[str, str]]],
+        run_id: str,
+    ) -> str:
+        if isinstance(summaries, dict):
+            summary_list = [summaries]
+        else:
+            summary_list = summaries
+
         path = os.path.join(self.output_dir, f"cross_reference_summary_{self.tenant_name}_{run_id}.tsv")
-        rows = [
-            ["total_account_rows", summary.get("total_account_rows", "0")],
-            ["total_party_rows", summary.get("total_party_rows", "0")],
-            ["missing_party_in_account", summary.get("missing_party_in_account", "0")],
-            ["missing_party_in_party", summary.get("missing_party_in_party", "0")],
-            ["duplicate_account_keys", summary.get("duplicate_account_keys", "0")],
-            ["duplicate_account_records", summary.get("duplicate_account_records", "0")],
-            ["duplicate_party_keys", summary.get("duplicate_party_keys", "0")],
-            ["duplicate_party_records", summary.get("duplicate_party_records", "0")],
-            ["report_path", summary.get("report_path", "")],
+        rows: List[List[str]] = []
+        preferred_key_order = [
+            "source_name",
+            "total_source_rows",
+            "total_account_rows",
+            "total_party_rows",
+            "missing_party_in_source",
+            "missing_party_in_account",
+            "missing_party_in_party",
+            "duplicate_source_keys",
+            "duplicate_source_records",
+            "duplicate_account_keys",
+            "duplicate_account_records",
+            "duplicate_party_keys",
+            "duplicate_party_records",
+            "report_path",
         ]
+
+        for idx, summary in enumerate(summary_list, start=1):
+            check_name = summary.get("check_name", f"check_{idx}")
+            used_keys = {"check_name"}
+            for key in preferred_key_order:
+                if key in summary:
+                    rows.append([f"{check_name}.{key}", summary[key]])
+                    used_keys.add(key)
+            for key in sorted(summary.keys()):
+                if key in used_keys:
+                    continue
+                rows.append([f"{check_name}.{key}", summary[key]])
+
         self._write_tsv(rows, path, ["metric", "value"])
         return path
 

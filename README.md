@@ -75,6 +75,9 @@ json_schema_file = ./reference_schema2.json
 
 [OPTIONS]
 cross_check_party = true
+cross_check_achodfi_party = true
+cross_check_business_party = true
+cross_check_retail_party = true
 cross_check_ach = true
 cross_check_check = true
 cross_check_wire = true
@@ -132,8 +135,13 @@ Example:
 
 ## Cross-Reference and Cross-Channel Matching
 
-Phase 2 (Cross-Reference) checks Account ↔ Party consistency and writes:
-`cross_party_reference_issues_<tenant>_<timestamp>.tsv`.
+Phase 2 (Cross-Reference, CSV -> CSV) runs:
+- Account -> Party linkage validation
+- ACHODFI -> Party linkage validation
+- Business -> Party linkage validation
+- Retail -> Party linkage validation
+
+Reports are written per check plus an overall cross-reference summary.
 
 Phase 3 (Cross-Channel) checks accounts/parties against ACH, Check, and Wire
 transaction files.
@@ -161,6 +169,9 @@ All outputs are written to `OUTPUT.output_dir`:
 - `retail_validation_<tenant>_<timestamp>.tsv`
 - `retail_cleaned_<tenant>_<timestamp>.csv`
 - `cross_party_reference_issues_<tenant>_<timestamp>.tsv`
+- `cross_achodfi_party_reference_issues_<tenant>_<timestamp>.tsv`
+- `cross_business_party_reference_issues_<tenant>_<timestamp>.tsv`
+- `cross_retail_party_reference_issues_<tenant>_<timestamp>.tsv`
 - `cross_reference_summary_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_accounts_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_parties_<tenant>_<timestamp>.tsv`

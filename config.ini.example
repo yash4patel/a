@@ -24,6 +24,9 @@ tenant_name = ExampleTenant
 
 [OPTIONS]
 cross_check_party = true
+cross_check_achodfi_party = true
+cross_check_business_party = true
+cross_check_retail_party = true
 cross_check_ach = true
 cross_check_check = true
 cross_check_wire = true
