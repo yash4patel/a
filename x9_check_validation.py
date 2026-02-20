@@ -143,33 +143,10 @@ X9_FIELDS = {
 }
 
 HEADER_SEQUENCE = ("01", "10", "20")
-REQUIRED_RECORD_TYPES = ("25", "26", "50", "52")
-MAX_ISSUES_PER_FILE = 100
-
-# (field_name, start, end, validation_type, expected_length)
-# validation_type values:
-# - "digits": required numeric with expected_length
-# - "non_empty": required non-blank
-CRITICAL_FIELD_RULES = {
-    "25": [
-        ("payor_bank_routing_number", 19, 27, "digits", 8),
-        ("payor_bank_routing_number_check_digit", 27, 28, "digits", 1),
-        ("on_us", 28, 48, "non_empty", None),
-        ("item_amount", 48, 58, "digits", 10),
-    ],
-    "26": [
-        ("bofd_routing_number", 4, 13, "digits", 9),
-        ("deposit_account_number_at_bofd", 36, 54, "non_empty", None),
-    ],
-    "50": [
-        ("cash_letter_item_count", 3, 11, "digits", 8),
-        ("cash_letter_amount_total", 11, 23, "digits", 12),
-    ],
-    "52": [
-        ("bundle_item_count", 3, 11, "digits", 8),
-        ("bundle_amount_total", 11, 23, "digits", 12),
-    ],
-}
+PRESENTMENT_REQUIRED_TYPES = ("25", "26", "50", "52")
+RETURN_REQUIRED_TYPES = ("31", "32", "50", "52")
+TRACKED_RECORD_TYPES = ("25", "26", "31", "32", "50", "52")
+MAX_ISSUES_PER_FILE = 120
 
 
 def get_record_type(line: str) -> str:
@@ -191,46 +168,157 @@ def get_record_type_values(line: str):
     return result
 
 
-def validate_critical_fields_for_record(line: str, record_type: str, line_number: int):
-    """Validate critical field presence and basic format on selected record types."""
-    issues = []
-    for field_name, start, end, validation_type, expected_len in CRITICAL_FIELD_RULES.get(record_type, []):
-        value = ""
-        if len(line) >= end:
-            value = line[start:end].strip()
-        elif len(line) > start:
-            value = line[start:].strip()
+def _slice(line: str, start: int, end: int = None) -> str:
+    """Safe string slice with stripping."""
+    if len(line) <= start:
+        return ""
+    if end is None:
+        return line[start:].strip()
+    return line[start:end].strip()
 
-        if validation_type == "non_empty":
-            if not value:
+
+def _is_valid_aba_routing(routing9: str) -> bool:
+    """Validate ABA routing using checksum (3-7-1 weighting)."""
+    if len(routing9) != 9 or not routing9.isdigit():
+        return False
+    weights = [3, 7, 1, 3, 7, 1, 3, 7, 1]
+    checksum = sum(int(d) * w for d, w in zip(routing9, weights))
+    return checksum % 10 == 0
+
+
+def _infer_image_side_from_50(line: str) -> str:
+    """Infer FRONT/BACK/UNKNOWN from type 50 metadata."""
+    raw_upper = line.upper()
+    if "FRONT" in raw_upper:
+        return "FRONT"
+    if "BACK" in raw_upper:
+        return "BACK"
+
+    # Heuristic based on common side-indicator positions/values.
+    for pos in (31, 32, 33):
+        if len(line) > pos:
+            marker = line[pos].strip().upper()
+            if marker in {"0", "F"}:
+                return "FRONT"
+            if marker in {"1", "B"}:
+                return "BACK"
+    return "UNKNOWN"
+
+
+def _infer_image_format(meta_50_line: str, data_52_line: str) -> str:
+    """Infer TIFF/NON_TIFF/UNKNOWN based on metadata and bytes hints."""
+    meta_upper = meta_50_line.upper()
+    data_upper = _slice(data_52_line, 3).upper()
+
+    non_tiff_tokens = ("JPEG", "JPG", "PNG", "GIF", "BMP", "PDF", "FFD8FF", "89504E47", "47494638", "25504446")
+    tiff_tokens = ("TIFF", "TIF", "49492A00", "4D4D002A")
+
+    if any(token in meta_upper for token in non_tiff_tokens) or any(
+        token in data_upper for token in non_tiff_tokens
+    ):
+        return "NON_TIFF"
+    if any(token in meta_upper for token in tiff_tokens) or any(token in data_upper for token in tiff_tokens):
+        return "TIFF"
+
+    # Common format indicator value where 0 typically means TIFF.
+    if len(meta_50_line) > 21 and meta_50_line[21].strip() == "0":
+        return "TIFF"
+    return "UNKNOWN"
+
+
+def validate_critical_fields_for_record(line: str, record_type: str, line_number: int):
+    """Validate critical fields (RT/account/MICR/image presence) by record type."""
+    issues = []
+
+    if record_type == "25":
+        payor_rt = _slice(line, 19, 27)
+        payor_cd = _slice(line, 27, 28)
+        on_us = _slice(line, 28, 48)
+        item_amount = _slice(line, 48, 58)
+        if not payor_rt or not payor_rt.isdigit() or len(payor_rt) != 8:
+            issues.append(
+                f"Record 25 line {line_number}: invalid/missing payor_bank_routing_number (8 digits required)"
+            )
+        if not payor_cd or not payor_cd.isdigit() or len(payor_cd) != 1:
+            issues.append(
+                f"Record 25 line {line_number}: invalid/missing payor_bank_routing_number_check_digit (1 digit required)"
+            )
+        if payor_rt.isdigit() and len(payor_rt) == 8 and payor_cd.isdigit() and len(payor_cd) == 1:
+            if not _is_valid_aba_routing(payor_rt + payor_cd):
                 issues.append(
-                    f"Record {record_type} line {line_number}: missing required field {field_name}"
+                    f"Record 25 line {line_number}: invalid ABA routing checksum for {payor_rt + payor_cd}"
                 )
-        elif validation_type == "digits":
-            if not value:
+        if not on_us:
+            issues.append(f"Record 25 line {line_number}: missing ON_US (MICR) data")
+        if not item_amount or not item_amount.isdigit():
+            issues.append(f"Record 25 line {line_number}: missing/invalid item_amount")
+
+    elif record_type == "26":
+        bofd_rt = _slice(line, 4, 13)
+        bofd_account = _slice(line, 36, 54)
+        if not bofd_rt or not bofd_rt.isdigit() or len(bofd_rt) != 9:
+            issues.append(f"Record 26 line {line_number}: invalid/missing bofd_routing_number (9 digits required)")
+        elif not _is_valid_aba_routing(bofd_rt):
+            issues.append(f"Record 26 line {line_number}: invalid ABA routing checksum for {bofd_rt}")
+        if not bofd_account:
+            issues.append(f"Record 26 line {line_number}: missing deposit_account_number_at_bofd")
+
+    elif record_type == "31":
+        payor_rt = _slice(line, 3, 11)
+        payor_cd = _slice(line, 11, 12)
+        on_us_return = _slice(line, 12, 32)
+        item_amount = _slice(line, 32, 42)
+        if not payor_rt or not payor_rt.isdigit() or len(payor_rt) != 8:
+            issues.append(
+                f"Record 31 line {line_number}: invalid/missing payor_bank_routing_number (8 digits required)"
+            )
+        if not payor_cd or not payor_cd.isdigit() or len(payor_cd) != 1:
+            issues.append(
+                f"Record 31 line {line_number}: invalid/missing payor_bank_routing_number_check_digit (1 digit required)"
+            )
+        if payor_rt.isdigit() and len(payor_rt) == 8 and payor_cd.isdigit() and len(payor_cd) == 1:
+            if not _is_valid_aba_routing(payor_rt + payor_cd):
                 issues.append(
-                    f"Record {record_type} line {line_number}: missing required field {field_name}"
+                    f"Record 31 line {line_number}: invalid ABA routing checksum for {payor_rt + payor_cd}"
                 )
-            elif not value.isdigit():
-                issues.append(
-                    f"Record {record_type} line {line_number}: field {field_name} must be numeric, got '{value}'"
-                )
-            elif expected_len is not None and len(value) != expected_len:
-                issues.append(
-                    f"Record {record_type} line {line_number}: field {field_name} must be "
-                    f"{expected_len} digits, got {len(value)}"
-                )
+        if not on_us_return:
+            issues.append(f"Record 31 line {line_number}: missing ON_US_RETURN_RECORD (MICR) data")
+        if not item_amount or not item_amount.isdigit():
+            issues.append(f"Record 31 line {line_number}: missing/invalid item_amount")
+
+    elif record_type == "32":
+        bofd_rt = _slice(line, 4, 13)
+        bofd_account = _slice(line, 36, 54)
+        if not bofd_rt or not bofd_rt.isdigit() or len(bofd_rt) != 9:
+            issues.append(f"Record 32 line {line_number}: invalid/missing bofd_routing_number (9 digits required)")
+        elif not _is_valid_aba_routing(bofd_rt):
+            issues.append(f"Record 32 line {line_number}: invalid ABA routing checksum for {bofd_rt}")
+        if not bofd_account:
+            issues.append(f"Record 32 line {line_number}: missing deposit_account_number_at_bofd")
+
+    elif record_type == "50":
+        if not _slice(line, 3):
+            issues.append(f"Record 50 line {line_number}: missing image metadata")
+
+    elif record_type == "52":
+        if not _slice(line, 3):
+            issues.append(f"Record 52 line {line_number}: missing image bytes/data")
+
     return issues
 
 
 def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
     """
-    Validate core X9 file structure based on meeting notes:
+    Phase 1 - Basic Validation:
     1) File must begin with 01 -> 10 -> 20.
-    2) Record 26 must always be preceded by record 25.
-    3) Every record 25 must have at least one record 26 before next 25/31/trailer/header.
-    4) Required record types 25/26/50/52 must be present.
-    5) Critical fields on 25/26/50/52 must be populated and correctly formatted.
+    2) Enforce 25/26 ordering: 26 must follow 25 and each 25 must have a 26.
+    3) Enforce required record types by collection mode:
+       - Presentment (01 / 25+26): require 25/26/50/52.
+       - Return (03 / 31+32): require 31/32/50/52.
+       Return mode is optional (absence does not fail).
+    4) Critical fields must be populated (routing/account/MICR/image fields).
+    5) Per check item (25 and 31), require at least one 50/52 pair and front image.
+       Non-TIFF hints fail the item; unknown format is allowed but logged as unknown.
     """
     issues = []
     header_ok = False
@@ -238,9 +326,23 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
     missing_26_after_25_count = 0
     rec25_total = 0
     rec26_total = 0
-    record_type_counts = {rt: 0 for rt in REQUIRED_RECORD_TYPES}
+    record_type_counts = {rt: 0 for rt in TRACKED_RECORD_TYPES}
+    collection_type_values = set()
+    return_records_present = False
     critical_field_error_count = 0
     dropped_issue_count = 0
+
+    presentment_item_count = 0
+    presentment_items_without_image_pair = 0
+    presentment_items_without_front_image = 0
+    presentment_items_non_tiff = 0
+
+    return_item_count = 0
+    return_items_without_image_pair = 0
+    return_items_without_front_image = 0
+    return_items_non_tiff = 0
+
+    current_item = None
 
     def add_issue(message: str):
         nonlocal dropped_issue_count
@@ -248,6 +350,68 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             issues.append(message)
         else:
             dropped_issue_count += 1
+
+    def finalize_current_item(reason: str):
+        nonlocal current_item
+        nonlocal presentment_item_count
+        nonlocal presentment_items_without_image_pair
+        nonlocal presentment_items_without_front_image
+        nonlocal presentment_items_non_tiff
+        nonlocal return_item_count
+        nonlocal return_items_without_image_pair
+        nonlocal return_items_without_front_image
+        nonlocal return_items_non_tiff
+
+        if current_item is None:
+            return
+
+        item_type = current_item["item_type"]
+        start_line = current_item["start_line"]
+        pair_count = current_item["pair_count"]
+        front_pair_count = current_item["front_pair_count"]
+        unknown_side_pair_count = current_item["unknown_side_pair_count"]
+        non_tiff_pair_count = current_item["non_tiff_pair_count"]
+
+        for pending in current_item["pending_50"]:
+            add_issue(
+                f"Record 50 at line {pending['line']} has no matching 52 before {reason} "
+                f"(item {item_type} started at line {start_line})"
+            )
+
+        is_presentment_item = item_type == "25"
+        if is_presentment_item:
+            presentment_item_count += 1
+        else:
+            return_item_count += 1
+
+        if pair_count == 0:
+            add_issue(f"Record {item_type} at line {start_line} has no corresponding 50/52 image pair")
+            if is_presentment_item:
+                presentment_items_without_image_pair += 1
+            else:
+                return_items_without_image_pair += 1
+        else:
+            # Treat UNKNOWN side as potentially front (to avoid false negative when side indicator is absent).
+            has_front_or_unknown = (front_pair_count + unknown_side_pair_count) > 0
+            if not has_front_or_unknown:
+                add_issue(
+                    f"Record {item_type} at line {start_line} has image pairs but no front image indicator"
+                )
+                if is_presentment_item:
+                    presentment_items_without_front_image += 1
+                else:
+                    return_items_without_front_image += 1
+
+            if non_tiff_pair_count > 0:
+                add_issue(
+                    f"Record {item_type} at line {start_line} has {non_tiff_pair_count} non-TIFF image pair(s)"
+                )
+                if is_presentment_item:
+                    presentment_items_non_tiff += 1
+                else:
+                    return_items_non_tiff += 1
+
+        current_item = None
 
     if len(records) >= 3:
         first_three = [get_record_type(records[0]), get_record_type(records[1]), get_record_type(records[2])]
@@ -268,14 +432,34 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
 
     for idx, line in enumerate(records, start=1):
         rt = get_record_type(line)
+        if rt == "10":
+            cti = _slice(line, 3, 5)
+            if cti:
+                collection_type_values.add(cti)
+
         if rt in record_type_counts:
             record_type_counts[rt] += 1
+        if rt in {"31", "32"}:
+            return_records_present = True
+
+        if rt in {"25", "26", "31", "32", "50", "52"}:
             critical_field_issues = validate_critical_fields_for_record(line, rt, idx)
             critical_field_error_count += len(critical_field_issues)
             for msg in critical_field_issues:
                 add_issue(msg)
 
+        # Start/end item contexts (for image pairing checks).
         if rt == "25":
+            finalize_current_item(f"record 25 at line {idx}")
+            current_item = {
+                "item_type": "25",
+                "start_line": idx,
+                "pending_50": [],
+                "pair_count": 0,
+                "front_pair_count": 0,
+                "unknown_side_pair_count": 0,
+                "non_tiff_pair_count": 0,
+            }
             rec25_total += 1
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
@@ -291,6 +475,24 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
                 add_issue(f"Record 26 at line {idx} is not preceded by record 25")
             else:
                 open_25_has_26 = True
+        elif rt == "31":
+            finalize_current_item(f"record 31 at line {idx}")
+            current_item = {
+                "item_type": "31",
+                "start_line": idx,
+                "pending_50": [],
+                "pair_count": 0,
+                "front_pair_count": 0,
+                "unknown_side_pair_count": 0,
+                "non_tiff_pair_count": 0,
+            }
+            if open_25_line is not None and not open_25_has_26:
+                missing_26_after_25_count += 1
+                add_issue(
+                    f"Record 25 at line {open_25_line} has no corresponding 26 before record 31 at line {idx}"
+                )
+            open_25_line = None
+            open_25_has_26 = False
         elif rt in close_25_context:
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
@@ -300,15 +502,67 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             open_25_line = None
             open_25_has_26 = False
 
+        if rt in {"10", "20", "61", "62", "70", "90", "99", "01"}:
+            finalize_current_item(f"record {rt} at line {idx}")
+
+        # Image pair checks per check item (25 or 31).
+        if rt == "50":
+            if current_item is None:
+                add_issue(f"Record 50 at line {idx} is not associated with a check item (25/31)")
+            else:
+                current_item["pending_50"].append(
+                    {"line": idx, "side": _infer_image_side_from_50(line), "meta_line": line}
+                )
+        elif rt == "52":
+            if current_item is None:
+                add_issue(f"Record 52 at line {idx} is not associated with a check item (25/31)")
+            elif not current_item["pending_50"]:
+                add_issue(
+                    f"Record 52 at line {idx} has no preceding 50 in item "
+                    f"{current_item['item_type']} started at line {current_item['start_line']}"
+                )
+            else:
+                meta = current_item["pending_50"].pop(0)
+                current_item["pair_count"] += 1
+                if meta["side"] == "FRONT":
+                    current_item["front_pair_count"] += 1
+                elif meta["side"] == "UNKNOWN":
+                    current_item["unknown_side_pair_count"] += 1
+
+                image_format = _infer_image_format(meta["meta_line"], line)
+                if image_format == "NON_TIFF":
+                    current_item["non_tiff_pair_count"] += 1
+
     if open_25_line is not None and not open_25_has_26:
         missing_26_after_25_count += 1
         add_issue(f"Record 25 at line {open_25_line} has no corresponding 26 before end of file")
+    finalize_current_item("end of file")
 
-    missing_required_record_types = [rt for rt, count in record_type_counts.items() if count == 0]
-    if missing_required_record_types:
-        add_issue(
-            "Missing required record types: " + ", ".join(missing_required_record_types)
-        )
+    presentment_mode = ("01" in collection_type_values) or record_type_counts["25"] > 0 or record_type_counts["26"] > 0
+    return_mode = ("03" in collection_type_values) or return_records_present
+
+    missing_presentment_types = []
+    if presentment_mode:
+        missing_presentment_types = [
+            rt for rt in PRESENTMENT_REQUIRED_TYPES if record_type_counts.get(rt, 0) == 0
+        ]
+        if missing_presentment_types:
+            add_issue(
+                "Missing presentment required record types: " + ", ".join(missing_presentment_types)
+            )
+
+    missing_return_types = []
+    if return_mode:
+        missing_return_types = [rt for rt in RETURN_REQUIRED_TYPES if record_type_counts.get(rt, 0) == 0]
+        if missing_return_types:
+            add_issue("Missing return required record types: " + ", ".join(missing_return_types))
+
+    if record_type_counts["25"] > 0 and "01" not in collection_type_values:
+        add_issue("Presentment check records found but collection type indicator 01 is missing")
+    if return_records_present and "03" not in collection_type_values:
+        add_issue("Return check records found but collection type indicator 03 is missing")
+
+    missing_required_record_types = sorted(set(missing_presentment_types + missing_return_types))
 
     if dropped_issue_count:
         issues.append(
@@ -327,11 +581,25 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         "header_ok": header_ok,
         "orphan_26_count": orphan_26_count,
         "missing_26_after_25_count": missing_26_after_25_count,
+        "collection_type_values": sorted(collection_type_values),
+        "presentment_mode": presentment_mode,
+        "return_mode": return_mode,
+        "return_records_present": return_records_present,
+        "missing_presentment_types": missing_presentment_types,
+        "missing_return_types": missing_return_types,
         "missing_required_record_types": missing_required_record_types,
         "critical_field_error_count": critical_field_error_count,
         "record_type_counts": record_type_counts,
         "record_25_count": rec25_total,
         "record_26_count": rec26_total,
+        "presentment_item_count": presentment_item_count,
+        "presentment_items_without_image_pair": presentment_items_without_image_pair,
+        "presentment_items_without_front_image": presentment_items_without_front_image,
+        "presentment_items_non_tiff": presentment_items_non_tiff,
+        "return_item_count": return_item_count,
+        "return_items_without_image_pair": return_items_without_image_pair,
+        "return_items_without_front_image": return_items_without_front_image,
+        "return_items_non_tiff": return_items_non_tiff,
         "issues": issues,
     }
 
@@ -513,6 +781,7 @@ def parse_x937_record(line: str):
         "35",
         "50",
         "52",
+        "54",
         "61",
         "62",
         "70",
@@ -613,8 +882,17 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "header_ok": False,
                     "orphan_26_count": 0,
                     "missing_26_after_25_count": 0,
-                    "missing_required_record_types": ",".join(REQUIRED_RECORD_TYPES),
+                    "collection_type_values": "",
+                    "missing_presentment_types": ",".join(PRESENTMENT_REQUIRED_TYPES),
+                    "missing_return_types": ",".join(RETURN_REQUIRED_TYPES),
+                    "missing_required_record_types": ",".join(PRESENTMENT_REQUIRED_TYPES),
                     "critical_field_error_count": 0,
+                    "presentment_items_without_image_pair": 0,
+                    "presentment_items_without_front_image": 0,
+                    "presentment_items_non_tiff": 0,
+                    "return_items_without_image_pair": 0,
+                    "return_items_without_front_image": 0,
+                    "return_items_non_tiff": 0,
                     "issues": f"Unable to read file: {e}",
                 }
             )
@@ -637,8 +915,17 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "header_ok": structure["header_ok"],
                     "orphan_26_count": structure["orphan_26_count"],
                     "missing_26_after_25_count": structure["missing_26_after_25_count"],
+                    "collection_type_values": ",".join(structure["collection_type_values"]),
+                    "missing_presentment_types": ",".join(structure["missing_presentment_types"]),
+                    "missing_return_types": ",".join(structure["missing_return_types"]),
                     "missing_required_record_types": ",".join(structure["missing_required_record_types"]),
                     "critical_field_error_count": structure["critical_field_error_count"],
+                    "presentment_items_without_image_pair": structure["presentment_items_without_image_pair"],
+                    "presentment_items_without_front_image": structure["presentment_items_without_front_image"],
+                    "presentment_items_non_tiff": structure["presentment_items_non_tiff"],
+                    "return_items_without_image_pair": structure["return_items_without_image_pair"],
+                    "return_items_without_front_image": structure["return_items_without_front_image"],
+                    "return_items_non_tiff": structure["return_items_non_tiff"],
                     "issues": " | ".join(issues) if issues else "Unknown validation issue",
                 }
             )
@@ -668,13 +955,24 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     df_all_forward = load_jsonl_df(forward_json_file)
     df_return = load_jsonl_df(return_json_file)
 
+    default_forward_columns = [
+        "filename",
+        "25_payor_bank_routing_number",
+        "25_payor_bank_routing_number_check_digit",
+        "26_bofd_routing_number",
+        "25_item_amount",
+        "25_on_us",
+        "25_auxiliary_on_us",
+        "25_ece_institution_item_sequence_number",
+        "20_bundle_business_date",
+    ]
     if df_all_forward.empty:
-        df_forward = pd.DataFrame()
+        df_forward = pd.DataFrame(columns=default_forward_columns)
     else:
         if "25_item_amount" in df_all_forward.columns:
             df_forward = df_all_forward[df_all_forward["25_item_amount"].notna()].copy()
         else:
-            df_forward = pd.DataFrame()
+            df_forward = pd.DataFrame(columns=default_forward_columns)
 
     print(f"Forward: {len(df_forward):,}, Return: {len(df_return):,}\n")
 
@@ -742,19 +1040,54 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         "FAIL if bad record percentage exceeds threshold.",
     )
 
-    # 1.3 Structural Record Order Check from meeting notes
+    # 1.3 Structural and Phase-1 Basic Validation Summary
     header_fail_files = sum(1 for r in structure_results if not r["header_ok"])
     orphan_26_total = sum(r["orphan_26_count"] for r in structure_results)
     missing_26_total = sum(r["missing_26_after_25_count"] for r in structure_results)
-    files_missing_required = sum(1 for r in structure_results if r["missing_required_record_types"])
+    files_missing_presentment_required = sum(1 for r in structure_results if r["missing_presentment_types"])
+    files_missing_return_required = sum(
+        1 for r in structure_results if r["return_mode"] and r["missing_return_types"]
+    )
     files_with_critical_field_errors = sum(1 for r in structure_results if r["critical_field_error_count"] > 0)
     critical_field_error_total = sum(r["critical_field_error_count"] for r in structure_results)
+    files_with_collection_01 = sum(1 for r in structure_results if "01" in r["collection_type_values"])
+    files_with_collection_03 = sum(1 for r in structure_results if "03" in r["collection_type_values"])
+    presentment_mode_files = sum(1 for r in structure_results if r["presentment_mode"])
+    return_mode_files = sum(1 for r in structure_results if r["return_mode"])
     required_record_type_totals = {
         rt: sum(r["record_type_counts"].get(rt, 0) for r in structure_results)
-        for rt in REQUIRED_RECORD_TYPES
+        for rt in TRACKED_RECORD_TYPES
     }
-    invalid_files_count = len(invalid_file_rows)
 
+    presentment_item_count = sum(r["presentment_item_count"] for r in structure_results)
+    presentment_missing_pairs = sum(r["presentment_items_without_image_pair"] for r in structure_results)
+    presentment_missing_front = sum(r["presentment_items_without_front_image"] for r in structure_results)
+    presentment_non_tiff = sum(r["presentment_items_non_tiff"] for r in structure_results)
+    return_item_count = sum(r["return_item_count"] for r in structure_results)
+    return_missing_pairs = sum(r["return_items_without_image_pair"] for r in structure_results)
+    return_missing_front = sum(r["return_items_without_front_image"] for r in structure_results)
+    return_non_tiff = sum(r["return_items_non_tiff"] for r in structure_results)
+
+    files_with_presentment_image_issues = sum(
+        1
+        for r in structure_results
+        if (
+            r["presentment_items_without_image_pair"] > 0
+            or r["presentment_items_without_front_image"] > 0
+            or r["presentment_items_non_tiff"] > 0
+        )
+    )
+    files_with_return_image_issues = sum(
+        1
+        for r in structure_results
+        if (
+            r["return_items_without_image_pair"] > 0
+            or r["return_items_without_front_image"] > 0
+            or r["return_items_non_tiff"] > 0
+        )
+    )
+
+    invalid_files_count = len(invalid_file_rows)
     structure_status = "PASS" if invalid_files_count == 0 else "FAIL"
     detail_lines = [
         f"Files scanned: {file_count:,}",
@@ -763,19 +1096,13 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         f"Files failing 01->10->20 header sequence: {header_fail_files:,}",
         f"Orphan 26 records (26 without preceding 25): {orphan_26_total:,}",
         f"25 records missing corresponding 26: {missing_26_total:,}",
-        (
-            "Required record totals: "
-            + ", ".join([f"{rt}={required_record_type_totals[rt]:,}" for rt in REQUIRED_RECORD_TYPES])
-        ),
-        f"Files missing one or more required record types (25/26/50/52): {files_missing_required:,}",
-        f"Files with critical field issues on 25/26/50/52: {files_with_critical_field_errors:,}",
-        f"Total critical field issues: {critical_field_error_total:,}",
+        f"Collection type 01 files: {files_with_collection_01:,}",
+        f"Collection type 03 files: {files_with_collection_03:,}",
     ]
     if invalid_structure_report:
         detail_lines.append(f"Invalid file report: {invalid_structure_report}")
     if invalid_file_rows:
-        examples = invalid_file_rows[:5]
-        preview = "\n".join([f" - {r['filename']}: {r['issues']}" for r in examples])
+        preview = "\n".join([f" - {r['filename']}: {r['issues']}" for r in invalid_file_rows[:5]])
         detail_lines.append(f"Sample issues:\n{preview}")
 
     log_check(
@@ -785,41 +1112,63 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         "X9 file must start with 01->10->20, each 26 must follow 25, and each 25 must include at least one 26.",
     )
 
-    required_record_status = "PASS" if files_missing_required == 0 else "FAIL"
-    required_examples = [
-        f"{r['file']}: missing {','.join(r['missing_required_record_types'])}"
-        for r in structure_results
-        if r["missing_required_record_types"]
-    ][:10]
+    required_record_status = (
+        "PASS"
+        if files_missing_presentment_required == 0 and files_missing_return_required == 0
+        else "FAIL"
+    )
+    required_examples = []
+    for result in structure_results:
+        if result["missing_presentment_types"]:
+            required_examples.append(
+                f"{result['file']}: presentment missing {','.join(result['missing_presentment_types'])}"
+            )
+        if result["return_mode"] and result["missing_return_types"]:
+            required_examples.append(
+                f"{result['file']}: return missing {','.join(result['missing_return_types'])}"
+            )
+        if len(required_examples) >= 10:
+            break
     required_details = [
-        "File-level required record type presence (25/26/50/52)",
+        "Collection-aware required record type presence.",
         (
-            "Totals across scanned files: "
-            + ", ".join([f"{rt}={required_record_type_totals[rt]:,}" for rt in REQUIRED_RECORD_TYPES])
+            "Tracked record totals: "
+            + ", ".join([f"{rt}={required_record_type_totals[rt]:,}" for rt in TRACKED_RECORD_TYPES])
         ),
-        f"Files missing required record types: {files_missing_required:,}",
+        (
+            "Presentment mode files (01 or 25/26 detected): "
+            f"{presentment_mode_files:,} | Missing presentment required set (25/26/50/52): "
+            f"{files_missing_presentment_required:,}"
+        ),
+        (
+            "Return mode files (03 or 31/32 detected): "
+            f"{return_mode_files:,} | Missing return required set (31/32/50/52): "
+            f"{files_missing_return_required:,}"
+        ),
     ]
+    if return_mode_files == 0:
+        required_details.append("No return records detected; return record-set validation is optional and not required.")
     if required_examples:
         required_details.append("Examples:\n - " + "\n - ".join(required_examples))
     log_check(
-        "Basic Validation: Required Record Types (25/26/50/52)",
+        "Basic Validation: Required Record Types by Collection Type",
         required_record_status,
         "\n".join(required_details),
-        "Each file must contain record types 25, 26, 50, and 52.",
+        "01 files require 25/26/50/52. 03 files require 31/32/50/52. Return absence does not fail validation.",
     )
 
     critical_status = "PASS" if critical_field_error_total == 0 else "FAIL"
     critical_examples = []
     for result in structure_results:
         if result["critical_field_error_count"] > 0 and result["issues"]:
-            # Pick first issue from this file that references critical fields.
             first_match = next(
                 (
                     issue
                     for issue in result["issues"]
-                    if "missing required field" in issue
-                    or "must be numeric" in issue
-                    or "must be " in issue
+                    if "invalid/missing" in issue
+                    or "missing " in issue
+                    or "checksum" in issue
+                    or "invalid ABA" in issue
                 ),
                 "",
             )
@@ -828,18 +1177,55 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         if len(critical_examples) >= 10:
             break
     critical_details = [
-        "Critical fields validated on record types 25/26/50/52.",
-        "Fields include routing/account identifiers and control totals.",
+        "Critical fields validated for presentment (25/26) and return (31/32 when present), plus 50/52 image fields.",
+        "Includes routing transit number format/checksum, account number presence, and MICR data checks.",
         f"Files with critical field issues: {files_with_critical_field_errors:,}",
         f"Total critical field issues: {critical_field_error_total:,}",
     ]
     if critical_examples:
         critical_details.append("Examples:\n - " + "\n - ".join(critical_examples))
     log_check(
-        "Basic Validation: Critical Fields Presence (25/26/50/52)",
+        "Basic Validation: Critical Fields Presence",
         critical_status,
         "\n".join(critical_details),
-        "Critical fields (e.g., ABA/routing and account/control fields) must be populated and valid.",
+        "Critical fields (ABA RTNs, account numbers, MICR data, and image metadata/data) must be populated and valid.",
+    )
+
+    image_status = (
+        "PASS"
+        if (
+            presentment_missing_pairs == 0
+            and presentment_missing_front == 0
+            and presentment_non_tiff == 0
+            and return_missing_pairs == 0
+            and return_missing_front == 0
+            and return_non_tiff == 0
+        )
+        else "FAIL"
+    )
+    image_details = [
+        (
+            f"Presentment items (RT25): {presentment_item_count:,} | "
+            f"Missing 50/52 pair: {presentment_missing_pairs:,} | "
+            f"Missing front image: {presentment_missing_front:,} | "
+            f"Non-TIFF image items: {presentment_non_tiff:,}"
+        ),
+        (
+            f"Return items (RT31): {return_item_count:,} | "
+            f"Missing 50/52 pair: {return_missing_pairs:,} | "
+            f"Missing front image: {return_missing_front:,} | "
+            f"Non-TIFF image items: {return_non_tiff:,}"
+        ),
+        f"Files with presentment image issues: {files_with_presentment_image_issues:,}",
+        f"Files with return image issues: {files_with_return_image_issues:,}",
+    ]
+    if return_item_count == 0:
+        image_details.append("No return items detected; return image checks are optional and not required.")
+    log_check(
+        "Basic Validation: Image Data Presence (50/52 Pairing + TIFF)",
+        image_status,
+        "\n".join(image_details),
+        "Each check item requires at least one 50/52 pair with front image; explicit non-TIFF indicators fail.",
     )
 
     # 1.4 Record Type Summary
@@ -864,17 +1250,26 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
 
     log_summary("File & Data Quality")
 
+    return_records_present = any(r["return_records_present"] for r in structure_results)
     if df_forward.empty:
-        log_check(
-            "Forward Record Availability",
-            "FAIL",
-            "No valid forward records available after structure and syntax validation.",
-            "Review invalid_x937_structure report and source files.",
-        )
-        log_summary("Processing Availability")
-        log_footer(check_results["FAIL"], check_results["WARN"])
-        print("\nX937 validation completed with critical issues.")
-        return
+        if return_records_present:
+            log_check(
+                "Forward Record Availability",
+                "INFO",
+                "No valid presentment records (RT25) found after structure validation; proceeding with return validation.",
+                "Return files are optional and may appear separately from presentment files.",
+            )
+        else:
+            log_check(
+                "Forward Record Availability",
+                "FAIL",
+                "No valid forward records available after structure and syntax validation.",
+                "Review invalid_x937_structure report and source files.",
+            )
+            log_summary("Processing Availability")
+            log_footer(check_results["FAIL"], check_results["WARN"])
+            print("\nX937 validation completed with critical issues.")
+            return
 
     # ============================================================
     # SECTION 2: TRANSACTION CLASSIFICATION & DISTRIBUTION
