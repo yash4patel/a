@@ -6,11 +6,17 @@ retail = /path/to/retail_reference.csv
 business = /path/to/business_reference.csv
 
 [CROSS-CHANNEL]
+# Directory to search for ACH files
 ach_dir = /path/to/ach/files
+# Directory to search for Check files
 check_dir = /path/to/check/xml
+# Directory to search for Wire log files
 wire_dir = /path/to/wire/logs
+# Filename patterns (comma-separated) used within ach_dir
 ach_glob = *ACH,*ach
+# Filename patterns (comma-separated) used within check_dir
 check_glob = *.xml,*.XML
+# Filename patterns (comma-separated) used within wire_dir (recursive)
 wire_glob = **/*.log,**/*.LOG
 
 [SCHEMA]

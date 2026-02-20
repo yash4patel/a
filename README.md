@@ -81,6 +81,11 @@ cross_check_wire = true
 strip_leading_zeros = true
 ```
 
+Notes:
+- `*_dir` values are the folders to search.
+- `*_glob` values are the filename patterns (comma-separated) used within those
+  folders (wire globs are recursive).
+
 ---
 
 ## Supported File Types and Rules
