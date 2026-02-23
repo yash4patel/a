@@ -170,6 +170,7 @@ All outputs are written to `OUTPUT.output_dir`:
 - `cross_party_reference_issues_<tenant>_<timestamp>.tsv`
 - `cross_reference_summary_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_company_ids_<tenant>_<timestamp>.tsv`
+- `ach_company_ids_missing_partyid_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_parties_<tenant>_<timestamp>.tsv`
 - `check_unmatched_accounts_<tenant>_<timestamp>.tsv`
 - `check_unmatched_parties_<tenant>_<timestamp>.tsv`
@@ -182,6 +183,10 @@ Cross-channel unmatched reports include:
 - count
 - percent of channel records
 - percent of unmatched records
+
+The cross-channel summary uses generic ID column names:
+- `id_matches`, `id_match_pct`
+- `unmatched_id_records`, `unmatched_id_pct`
 
 Log files are written to:
 

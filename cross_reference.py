@@ -302,6 +302,7 @@ class CrossChannelChecker:
         party_match = 0
         unmatched_accounts = Counter()
         unmatched_parties = Counter()
+        missing_party_company_counts = Counter()
 
         for acct in normalized:
             party = account_map.get(acct)
@@ -437,6 +438,7 @@ class CrossChannelChecker:
             if not party_id:
                 unmatched_parties["<EMPTY>"] += 1
                 unmatched_party_issues[("<EMPTY>", "PartyID missing in ACHODFI reference")] += 1
+                missing_party_company_counts[company_id] += 1
                 continue
 
             if party_set is not None and party_id not in party_set:
@@ -468,6 +470,9 @@ class CrossChannelChecker:
         unmatched_parties_path = os.path.join(
             self.output_dir, f"ach_unmatched_parties_{self.tenant_name}_{run_id}.tsv"
         )
+        missing_party_path = os.path.join(
+            self.output_dir, f"ach_company_ids_missing_partyid_{self.tenant_name}_{run_id}.tsv"
+        )
 
         unmatched_company_rows = []
         for rank, (cid, count) in enumerate(unmatched_companies.most_common(), start=1):
@@ -496,6 +501,20 @@ class CrossChannelChecker:
                 ]
             )
 
+        missing_party_rows = []
+        missing_total = sum(missing_party_company_counts.values())
+        for rank, (cid, count) in enumerate(missing_party_company_counts.most_common(), start=1):
+            missing_party_rows.append(
+                [
+                    str(rank),
+                    cid,
+                    str(count),
+                    _pct(count, total_records),
+                    _pct(count, missing_total),
+                    "PartyID missing in ACHODFI reference",
+                ]
+            )
+
         self._write_tsv(
             unmatched_company_rows,
             unmatched_companies_path,
@@ -506,11 +525,19 @@ class CrossChannelChecker:
             unmatched_parties_path,
             ["rank", "PartyID", "count", "pct_of_channel", "pct_of_unmatched", "issue"],
         )
+        self._write_tsv(
+            missing_party_rows,
+            missing_party_path,
+            ["rank", "ACHCompanyID", "count", "pct_of_channel", "pct_of_unmatched", "issue"],
+        )
 
         self.logger.info(
             f"[{self.tenant_name}] ACH cross-check (CompanyID): total records {total_records:,} | "
             f"company matches {company_match:,} ({company_match_pct:.2f}%) | "
             f"party matches {party_match:,} ({party_match_pct:.2f}%)"
+        )
+        self.logger.info(
+            f"[{self.tenant_name}] ACH missing PartyID report: {missing_party_path}"
         )
 
         return {
@@ -527,6 +554,7 @@ class CrossChannelChecker:
             "unmatched_party_pct": f"{unmatched_party_pct:.3f}",
             "unmatched_accounts_tsv": unmatched_companies_path,
             "unmatched_parties_tsv": unmatched_parties_path,
+            "missing_partyid_tsv": missing_party_path,
         }
 
     def cross_check_check(
@@ -589,12 +617,12 @@ class CrossChannelChecker:
                 "id_type",
                 "channel",
                 "total_records",
-                "account_matches",
-                "account_match_pct",
+                "id_matches",
+                "id_match_pct",
                 "party_matches",
                 "party_match_pct",
-                "unmatched_account_records",
-                "unmatched_account_pct",
+                "unmatched_id_records",
+                "unmatched_id_pct",
                 "unmatched_party_records",
                 "unmatched_party_pct",
                 "unmatched_accounts_tsv",
