@@ -242,17 +242,23 @@ class CrossChannelChecker:
         missing_party_in_party = 0
         for acct, party in account_map.items():
             if not party:
-                rows.append([acct, "", "Missing PartyID in Account reference"])
+                rows.append([acct, "", "AccountNumber present in Account file but PartyID is blank"])
                 missing_party_in_account += 1
             elif party not in party_set:
-                rows.append([acct, party, "PartyID missing from Party reference"])
+                rows.append(
+                    [
+                        acct,
+                        party,
+                        "AccountNumber present in Account file but PartyID missing in Party file",
+                    ]
+                )
                 missing_party_in_party += 1
 
         for acct, count in sorted(account_duplicates.items()):
-            rows.append([acct, "", f"AccountNumber duplicate (count={count})"])
+            rows.append([acct, "", f"AccountNumber duplicate in Account file (count={count})"])
 
         for party, count in sorted(party_duplicates.items()):
-            rows.append(["", party, f"PartyID duplicate (count={count})"])
+            rows.append(["", party, f"PartyID duplicate in Party file (count={count})"])
 
         path = os.path.join(
             self.output_dir, f"cross_party_reference_issues_{self.tenant_name}_{run_id}.tsv"
