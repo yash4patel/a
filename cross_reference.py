@@ -61,6 +61,10 @@ class CrossChannelChecker:
         return value.strip()
 
     @staticmethod
+    def _normalize_company_id(value: str) -> str:
+        return value.strip()
+
+    @staticmethod
     def _resolve_globs(base_dir: str, patterns: Iterable[str]) -> List[str]:
         files: List[str] = []
         for pat in patterns:
@@ -71,21 +75,43 @@ class CrossChannelChecker:
             files.extend(glob.glob(pattern, recursive=True))
         return sorted(set(files))
 
-    def _parse_ach_accounts(self, ach_dir: str) -> List[str]:
-        accounts: List[str] = []
+    def _parse_ach_company_ids(self, ach_dir: str) -> List[str]:
+        """
+        Parse ACH Company ID from batch header records (record type '5').
+        NACHA spec: Company Identification is positions 41-50 (1-indexed).
+        """
+        company_ids: List[str] = []
         if ach_dir and not os.path.isdir(ach_dir):
-            return accounts
+            return company_ids
         for path in self._resolve_globs(ach_dir, self.ach_globs):
             try:
                 with open(path, "r", encoding="latin-1", errors="ignore") as handle:
                     for line in handle:
-                        if line.startswith("6") and len(line) >= 29:
-                            acct = line[12:29].strip()
-                            if acct:
-                                accounts.append(acct)
+                        if line.startswith("5") and len(line) >= 50:
+                            company_id = self._normalize_company_id(line[40:50])
+                            if company_id:
+                                company_ids.append(company_id)
             except Exception as e:
                 self.logger.warning(f"[{self.tenant_name}] Failed to read ACH file {path}: {e}")
-        return accounts
+        return company_ids
+    def _load_achodfi_reference(self, achodfi_file: str) -> Tuple[Dict[str, str], Dict[str, int]]:
+        ach_df = self._read_pipe_csv(achodfi_file, self.logger)
+        if "ACHCompanyID" not in ach_df.columns or "PartyID" not in ach_df.columns:
+            raise ValueError("ACHODFI file must include columns: ACHCompanyID, PartyID")
+
+        company_values: List[str] = []
+        company_map: Dict[str, str] = {}
+        for _, row in ach_df.iterrows():
+            company_id = self._normalize_company_id(str(row["ACHCompanyID"]))
+            party_id = self._normalize_party(str(row["PartyID"]))
+            if company_id:
+                company_values.append(company_id)
+                if company_id not in company_map or (not company_map[company_id] and party_id):
+                    company_map[company_id] = party_id
+
+        counts = Counter(company_values)
+        duplicates = {cid: count for cid, count in counts.items() if count > 1}
+        return company_map, duplicates
 
     def _parse_check_accounts(self, check_dir: str) -> List[str]:
         accounts: List[str] = []
@@ -356,6 +382,7 @@ class CrossChannelChecker:
         )
 
         return {
+            "id_type": "AccountNumber",
             "channel": name,
             "total_records": str(total_records),
             "account_matches": str(account_match),
@@ -373,18 +400,134 @@ class CrossChannelChecker:
     def cross_check_ach(
         self,
         ach_dir: str,
-        account_map: Dict[str, str],
-        party_set: Set[str],
+        achodfi_file: str,
+        party_set: Optional[Set[str]],
         run_id: str,
     ) -> Optional[Dict[str, str]]:
         if ach_dir and not os.path.isdir(ach_dir):
             self.logger.warning(f"[{self.tenant_name}] ACH directory not provided or missing. Skipping.")
             return None
-        accounts = self._parse_ach_accounts(ach_dir)
-        if not accounts:
+        if not achodfi_file or not os.path.exists(achodfi_file):
+            self.logger.warning(f"[{self.tenant_name}] ACHODFI reference file not provided or missing. Skipping.")
+            return None
+
+        company_ids = self._parse_ach_company_ids(ach_dir)
+        if not company_ids:
             self.logger.warning(f"[{self.tenant_name}] No ACH records found. Skipping.")
             return None
-        return self.cross_check_channel("ACH", accounts, account_map, party_set, run_id)
+
+        reference_map, _duplicates = self._load_achodfi_reference(achodfi_file)
+
+        normalized = [self._normalize_company_id(str(c)) for c in company_ids if str(c).strip()]
+        total_records = len(normalized)
+
+        company_match = 0
+        party_match = 0
+        unmatched_companies = Counter()
+        unmatched_parties = Counter()
+        unmatched_party_issues = Counter()
+
+        for company_id in normalized:
+            party_id = reference_map.get(company_id)
+            if party_id is None:
+                unmatched_companies[company_id] += 1
+                continue
+            company_match += 1
+
+            if not party_id:
+                unmatched_parties["<EMPTY>"] += 1
+                unmatched_party_issues[("<EMPTY>", "PartyID missing in ACHODFI reference")] += 1
+                continue
+
+            if party_set is not None and party_id not in party_set:
+                unmatched_parties[party_id] += 1
+                unmatched_party_issues[(party_id, "PartyID missing from Party reference")] += 1
+                continue
+
+            party_match += 1
+
+        company_match_pct = (company_match / total_records * 100.0) if total_records else 0.0
+        party_match_pct = (party_match / total_records * 100.0) if total_records else 0.0
+        unmatched_company_records = sum(unmatched_companies.values())
+        unmatched_party_records = sum(unmatched_parties.values())
+        unmatched_company_pct = (
+            unmatched_company_records / total_records * 100.0 if total_records else 0.0
+        )
+        unmatched_party_pct = (
+            unmatched_party_records / total_records * 100.0 if total_records else 0.0
+        )
+
+        def _pct(value: int, total: int) -> str:
+            if not total:
+                return "0.000"
+            return f"{(value / total) * 100.0:.3f}"
+
+        unmatched_companies_path = os.path.join(
+            self.output_dir, f"ach_unmatched_company_ids_{self.tenant_name}_{run_id}.tsv"
+        )
+        unmatched_parties_path = os.path.join(
+            self.output_dir, f"ach_unmatched_parties_{self.tenant_name}_{run_id}.tsv"
+        )
+
+        unmatched_company_rows = []
+        for rank, (cid, count) in enumerate(unmatched_companies.most_common(), start=1):
+            unmatched_company_rows.append(
+                [
+                    str(rank),
+                    cid,
+                    str(count),
+                    _pct(count, total_records),
+                    _pct(count, unmatched_company_records),
+                    "ACHCompanyID missing from ACHODFI reference",
+                ]
+            )
+
+        unmatched_party_rows = []
+        for rank, (key, count) in enumerate(unmatched_party_issues.most_common(), start=1):
+            party_id, issue = key
+            unmatched_party_rows.append(
+                [
+                    str(rank),
+                    party_id,
+                    str(count),
+                    _pct(count, total_records),
+                    _pct(count, unmatched_party_records),
+                    issue,
+                ]
+            )
+
+        self._write_tsv(
+            unmatched_company_rows,
+            unmatched_companies_path,
+            ["rank", "ACHCompanyID", "count", "pct_of_channel", "pct_of_unmatched", "issue"],
+        )
+        self._write_tsv(
+            unmatched_party_rows,
+            unmatched_parties_path,
+            ["rank", "PartyID", "count", "pct_of_channel", "pct_of_unmatched", "issue"],
+        )
+
+        self.logger.info(
+            f"[{self.tenant_name}] ACH cross-check (CompanyID): total records {total_records:,} | "
+            f"company matches {company_match:,} ({company_match_pct:.2f}%) | "
+            f"party matches {party_match:,} ({party_match_pct:.2f}%)"
+        )
+
+        return {
+            "id_type": "ACHCompanyID",
+            "channel": "ACH",
+            "total_records": str(total_records),
+            "account_matches": str(company_match),
+            "account_match_pct": f"{company_match_pct:.3f}",
+            "party_matches": str(party_match),
+            "party_match_pct": f"{party_match_pct:.3f}",
+            "unmatched_account_records": str(unmatched_company_records),
+            "unmatched_account_pct": f"{unmatched_company_pct:.3f}",
+            "unmatched_party_records": str(unmatched_party_records),
+            "unmatched_party_pct": f"{unmatched_party_pct:.3f}",
+            "unmatched_accounts_tsv": unmatched_companies_path,
+            "unmatched_parties_tsv": unmatched_parties_path,
+        }
 
     def cross_check_check(
         self,
@@ -424,6 +567,7 @@ class CrossChannelChecker:
         for r in results:
             rows.append(
                 [
+                    r.get("id_type", ""),
                     r.get("channel", ""),
                     r.get("total_records", ""),
                     r.get("account_matches", ""),
@@ -442,6 +586,7 @@ class CrossChannelChecker:
             rows,
             path,
             [
+                "id_type",
                 "channel",
                 "total_records",
                 "account_matches",

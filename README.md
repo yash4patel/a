@@ -141,7 +141,9 @@ Phase 2 (Cross-Reference) checks Account ↔ Party consistency and writes:
 `cross_party_reference_issues_<tenant>_<timestamp>.tsv`.
 
 Phase 3 (Cross-Channel) checks accounts/parties against ACH, Check, and Wire
-transaction files.
+transaction files. For ACH, the validator extracts **Company IDs** from NACHA
+batch header records (type `5`, positions 41-50) and matches them to
+`ACHCompanyID` + `PartyID` in the ACHODFI reference CSV.
 
 For each channel, the validator computes:
 - Account match percentage (historical accounts found in Account reference)
@@ -167,7 +169,7 @@ All outputs are written to `OUTPUT.output_dir`:
 - `retail_cleaned_<tenant>_<timestamp>.csv`
 - `cross_party_reference_issues_<tenant>_<timestamp>.tsv`
 - `cross_reference_summary_<tenant>_<timestamp>.tsv`
-- `ach_unmatched_accounts_<tenant>_<timestamp>.tsv`
+- `ach_unmatched_company_ids_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_parties_<tenant>_<timestamp>.tsv`
 - `check_unmatched_accounts_<tenant>_<timestamp>.tsv`
 - `check_unmatched_parties_<tenant>_<timestamp>.tsv`

@@ -40,15 +40,30 @@ class ValidationConfig:
 
         # Load file paths - empty string if not provided or path doesn't exist
         self.account_file = self._get_value(
-            [("CSV FILE INPUT", "account"), ("INPUT", "account_file")]
+            [
+                ("CSV FILE INPUT", "account"),
+                ("CSV FILE INPUT", "account_file"),
+                ("INPUT", "account_file"),
+            ]
         )
-        self.party_file = self._get_value([("CSV FILE INPUT", "party"), ("INPUT", "party_file")])
+        self.party_file = self._get_value(
+            [
+                ("CSV FILE INPUT", "party"),
+                ("CSV FILE INPUT", "party_file"),
+                ("INPUT", "party_file"),
+            ]
+        )
         self.achodfi_file = self._get_value(
-            [("CSV FILE INPUT", "achodfi"), ("INPUT", "achodfi_file")]
+            [
+                ("CSV FILE INPUT", "achodfi"),
+                ("CSV FILE INPUT", "achodfi_file"),
+                ("INPUT", "achodfi_file"),
+            ]
         )
         self.business_file = self._get_value(
             [
                 ("CSV FILE INPUT", "business"),
+                ("CSV FILE INPUT", "business_file"),
                 ("INPUT", "business_file"),
                 ("INPUT", "online_business_file"),
             ]
@@ -56,6 +71,7 @@ class ValidationConfig:
         self.retail_file = self._get_value(
             [
                 ("CSV FILE INPUT", "retail"),
+                ("CSV FILE INPUT", "retail_file"),
                 ("INPUT", "retail_file"),
                 ("INPUT", "online_retail_file"),
             ]
@@ -965,7 +981,7 @@ class ReferenceValidator:
                 if self.config.cross_check_ach:
                     ach_result = self.cross_checker.cross_check_ach(
                         self.config.ach_dir,
-                        account_map,
+                        self.config.achodfi_file,
                         party_set,
                         run_id,
                     )
