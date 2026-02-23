@@ -175,6 +175,12 @@ All outputs are written to `OUTPUT.output_dir`:
 - `wire_unmatched_parties_<tenant>_<timestamp>.tsv`
 - `cross_channel_summary_<tenant>_<timestamp>.tsv`
 
+Cross-channel unmatched reports include:
+- rank
+- count
+- percent of channel records
+- percent of unmatched records
+
 Log files are written to:
 
 ```

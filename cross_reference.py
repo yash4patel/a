@@ -291,6 +291,14 @@ class CrossChannelChecker:
 
         account_match_pct = (account_match / total_records * 100.0) if total_records else 0.0
         party_match_pct = (party_match / total_records * 100.0) if total_records else 0.0
+        unmatched_account_records = sum(unmatched_accounts.values())
+        unmatched_party_records = sum(unmatched_parties.values())
+        unmatched_account_pct = (
+            unmatched_account_records / total_records * 100.0 if total_records else 0.0
+        )
+        unmatched_party_pct = (
+            unmatched_party_records / total_records * 100.0 if total_records else 0.0
+        )
 
         unmatched_accounts_path = os.path.join(
             self.output_dir, f"{name.lower()}_unmatched_accounts_{self.tenant_name}_{run_id}.tsv"
@@ -299,17 +307,47 @@ class CrossChannelChecker:
             self.output_dir, f"{name.lower()}_unmatched_parties_{self.tenant_name}_{run_id}.tsv"
         )
 
-        unmatched_account_rows = [
-            [acct, str(count), "Account missing from reference"]
-            for acct, count in unmatched_accounts.most_common()
-        ]
-        unmatched_party_rows = [
-            [party, str(count), "Party missing from reference"]
-            for party, count in unmatched_parties.most_common()
-        ]
+        def _pct(value: int, total: int) -> str:
+            if not total:
+                return "0.000"
+            return f"{(value / total) * 100.0:.3f}"
 
-        self._write_tsv(unmatched_account_rows, unmatched_accounts_path, ["AccountNumber", "count", "issue"])
-        self._write_tsv(unmatched_party_rows, unmatched_parties_path, ["PartyID", "count", "issue"])
+        unmatched_account_rows = []
+        for rank, (acct, count) in enumerate(unmatched_accounts.most_common(), start=1):
+            unmatched_account_rows.append(
+                [
+                    str(rank),
+                    acct,
+                    str(count),
+                    _pct(count, total_records),
+                    _pct(count, unmatched_account_records),
+                    "Account missing from reference",
+                ]
+            )
+
+        unmatched_party_rows = []
+        for rank, (party, count) in enumerate(unmatched_parties.most_common(), start=1):
+            unmatched_party_rows.append(
+                [
+                    str(rank),
+                    party,
+                    str(count),
+                    _pct(count, total_records),
+                    _pct(count, unmatched_party_records),
+                    "Party missing from reference",
+                ]
+            )
+
+        self._write_tsv(
+            unmatched_account_rows,
+            unmatched_accounts_path,
+            ["rank", "AccountNumber", "count", "pct_of_channel", "pct_of_unmatched", "issue"],
+        )
+        self._write_tsv(
+            unmatched_party_rows,
+            unmatched_parties_path,
+            ["rank", "PartyID", "count", "pct_of_channel", "pct_of_unmatched", "issue"],
+        )
 
         self.logger.info(
             f"[{self.tenant_name}] {name} cross-check: total records {total_records:,} | "
@@ -324,6 +362,10 @@ class CrossChannelChecker:
             "account_match_pct": f"{account_match_pct:.3f}",
             "party_matches": str(party_match),
             "party_match_pct": f"{party_match_pct:.3f}",
+            "unmatched_account_records": str(unmatched_account_records),
+            "unmatched_account_pct": f"{unmatched_account_pct:.3f}",
+            "unmatched_party_records": str(unmatched_party_records),
+            "unmatched_party_pct": f"{unmatched_party_pct:.3f}",
             "unmatched_accounts_tsv": unmatched_accounts_path,
             "unmatched_parties_tsv": unmatched_parties_path,
         }
@@ -388,6 +430,10 @@ class CrossChannelChecker:
                     r.get("account_match_pct", ""),
                     r.get("party_matches", ""),
                     r.get("party_match_pct", ""),
+                    r.get("unmatched_account_records", ""),
+                    r.get("unmatched_account_pct", ""),
+                    r.get("unmatched_party_records", ""),
+                    r.get("unmatched_party_pct", ""),
                     r.get("unmatched_accounts_tsv", ""),
                     r.get("unmatched_parties_tsv", ""),
                 ]
@@ -402,6 +448,10 @@ class CrossChannelChecker:
                 "account_match_pct",
                 "party_matches",
                 "party_match_pct",
+                "unmatched_account_records",
+                "unmatched_account_pct",
+                "unmatched_party_records",
+                "unmatched_party_pct",
                 "unmatched_accounts_tsv",
                 "unmatched_parties_tsv",
             ],
