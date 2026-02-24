@@ -94,20 +94,37 @@ class CrossChannelChecker:
             except Exception as e:
                 self.logger.warning(f"[{self.tenant_name}] Failed to read ACH file {path}: {e}")
         return company_ids
-    def _load_achodfi_reference(self, achodfi_file: str) -> Tuple[Dict[str, str], Dict[str, int]]:
+    def _load_achodfi_reference(
+        self, achodfi_file: str
+    ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, int]]:
         ach_df = self._read_pipe_csv(achodfi_file, self.logger)
         if "ACHCompanyID" not in ach_df.columns or "PartyID" not in ach_df.columns:
             raise ValueError("ACHODFI file must include columns: ACHCompanyID, PartyID")
 
         company_values: List[str] = []
-        company_map: Dict[str, str] = {}
+        company_map: Dict[str, Dict[str, str]] = {}
+        has_settlement = "RelatedSettlementAccount" in ach_df.columns
         for _, row in ach_df.iterrows():
             company_id = self._normalize_company_id(str(row["ACHCompanyID"]))
             party_id = self._normalize_party(str(row["PartyID"]))
+            settlement_account = ""
+            if has_settlement:
+                settlement_account = self._normalize_account(str(row["RelatedSettlementAccount"]))
             if company_id:
                 company_values.append(company_id)
-                if company_id not in company_map or (not company_map[company_id] and party_id):
-                    company_map[company_id] = party_id
+                if company_id not in company_map:
+                    company_map[company_id] = {
+                        "party_id": party_id,
+                        "related_settlement_account": settlement_account,
+                    }
+                else:
+                    if not company_map[company_id]["party_id"] and party_id:
+                        company_map[company_id]["party_id"] = party_id
+                    if (
+                        not company_map[company_id]["related_settlement_account"]
+                        and settlement_account
+                    ):
+                        company_map[company_id]["related_settlement_account"] = settlement_account
 
         counts = Counter(company_values)
         duplicates = {cid: count for cid, count in counts.items() if count > 1}
@@ -435,8 +452,9 @@ class CrossChannelChecker:
         unmatched_party_issues = Counter()
 
         for company_id in normalized:
-            party_id = reference_map.get(company_id)
-            if party_id is None:
+            reference = reference_map.get(company_id)
+            party_id = reference["party_id"] if reference else ""
+            if reference is None:
                 unmatched_companies[company_id] += 1
                 continue
             company_match += 1
@@ -478,6 +496,9 @@ class CrossChannelChecker:
         )
         missing_party_path = os.path.join(
             self.output_dir, f"ach_company_ids_missing_partyid_{self.tenant_name}_{run_id}.tsv"
+        )
+        originators_path = os.path.join(
+            self.output_dir, f"ach_originators_{self.tenant_name}_{run_id}.tsv"
         )
 
         unmatched_company_rows = []
@@ -537,6 +558,50 @@ class CrossChannelChecker:
             ["rank", "ACHCompanyID", "count", "pct_of_channel", "pct_of_unmatched", "issue"],
         )
 
+        originator_rows = []
+        company_counts = Counter(normalized)
+        for rank, (company_id, count) in enumerate(company_counts.most_common(), start=1):
+            reference = reference_map.get(company_id)
+            if reference is None:
+                party_id = ""
+                settlement = ""
+                party_status = "ACHCompanyID missing from ACHODFI reference"
+            else:
+                party_id = reference.get("party_id", "")
+                settlement = reference.get("related_settlement_account", "")
+                if not party_id:
+                    party_status = "PartyID missing in ACHODFI reference"
+                elif party_set is not None and party_id not in party_set:
+                    party_status = "PartyID missing from Party reference"
+                else:
+                    party_status = "OK"
+
+            originator_rows.append(
+                [
+                    str(rank),
+                    company_id,
+                    str(count),
+                    _pct(count, total_records),
+                    party_id,
+                    settlement,
+                    party_status,
+                ]
+            )
+
+        self._write_tsv(
+            originator_rows,
+            originators_path,
+            [
+                "rank",
+                "ACHCompanyID",
+                "ach_record_count",
+                "ach_record_pct",
+                "PartyID",
+                "RelatedSettlementAccount",
+                "party_status",
+            ],
+        )
+
         self.logger.info(
             f"[{self.tenant_name}] ACH cross-check (CompanyID): total records {total_records:,} | "
             f"company matches {company_match:,} ({company_match_pct:.2f}%) | "
@@ -544,6 +609,9 @@ class CrossChannelChecker:
         )
         self.logger.info(
             f"[{self.tenant_name}] ACH missing PartyID report: {missing_party_path}"
+        )
+        self.logger.info(
+            f"[{self.tenant_name}] ACH originator report: {originators_path}"
         )
 
         return {
@@ -561,6 +629,7 @@ class CrossChannelChecker:
             "unmatched_accounts_tsv": unmatched_companies_path,
             "unmatched_parties_tsv": unmatched_parties_path,
             "missing_partyid_tsv": missing_party_path,
+            "originators_tsv": originators_path,
         }
 
     def cross_check_check(

@@ -171,6 +171,7 @@ All outputs are written to `OUTPUT.output_dir`:
 - `cross_reference_summary_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_company_ids_<tenant>_<timestamp>.tsv`
 - `ach_company_ids_missing_partyid_<tenant>_<timestamp>.tsv`
+- `ach_originators_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_parties_<tenant>_<timestamp>.tsv`
 - `check_unmatched_accounts_<tenant>_<timestamp>.tsv`
 - `check_unmatched_parties_<tenant>_<timestamp>.tsv`
