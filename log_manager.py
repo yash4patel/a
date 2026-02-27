@@ -1,4 +1,5 @@
 import logging
+import os
 from datetime import datetime
 
 
@@ -9,63 +10,130 @@ check_results = {
     "FAIL": 0,
     "TOTAL": 0,
 }
+check_history = []
+_LOGGER_NAME = "X937_XML_Validator"
 
 
 def setup_logging(log_filename: str):
-    logging.basicConfig(
-        filename=log_filename,
-        filemode="w",
-        format="%(message)s",
-        level=logging.INFO,
-    )
+    """Configure file logging with ACH-like format and reset counters."""
+    global check_history
+    for key in check_results:
+        check_results[key] = 0
+    check_history = []
+
+    logger = logging.getLogger(_LOGGER_NAME)
+    if logger.handlers:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    file_handler = logging.FileHandler(log_filename, mode="w")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(file_handler)
+    logger.propagate = False
+
+    print(f"For more detail, please review the log file at: {os.path.abspath(log_filename)}")
+
+
+def _logger():
+    logger = logging.getLogger(_LOGGER_NAME)
+    if not logger.handlers:
+        # Fallback to root logger if setup_logging wasn't called for some reason.
+        return logging.getLogger()
+    return logger
+
+
+def log_section_start(title: str):
+    logger = _logger()
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info(f"=== STARTING {title} ===")
+    logger.info("=" * 70)
+
+
+def log_section_end(title: str):
+    logger = _logger()
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info(f"=== FINISHED {title} ===")
+    logger.info("=" * 70)
+    logger.info("")
 
 
 def log_header(dataset_name: str, file_count: int):
-    logging.info("=" * 60)
-    logging.info("DATA VALIDATION REPORT")
-    logging.info("=" * 60)
-    logging.info(f"Date: {datetime.now().strftime('%d-%b-%Y %H:%M')}")
-    logging.info(f"Dataset: {dataset_name}")
-    logging.info(f"Files processed: {file_count}\n")
+    logger = _logger()
+    logger.info("=" * 60)
+    logger.info(" DATA VALIDATION REPORT")
+    logger.info("=" * 60)
+    logger.info(f"Date: {datetime.now().strftime('%d-%b-%Y %H:%M')}")
+    logger.info(f"Dataset: {dataset_name}")
+    logger.info(f"Files processed: {file_count}")
+    logger.info("")
 
 
 def log_check(check_name: str, status: str, details: str, guideline: str):
+    logger = _logger()
+    normalized = status.upper()
+    if normalized not in check_results:
+        normalized = "INFO"
+
     check_results["TOTAL"] += 1
-    check_results[status] += 1
+    check_results[normalized] += 1
+    check_history.append({"name": check_name, "status": normalized})
 
-    status_symbol = {
-        "PASS": "[PASS]",
-        "WARN": "[WARN]",
-        "FAIL": "[FAIL]",
-        "INFO": "[INFO]",
-    }.get(status, "[INFO]")
-
-    logging.info(check_name)
-    logging.info(f"Status: {status_symbol} {status}")
-    logging.info(f"Details: {details}")
-    logging.info(f"Guideline: {guideline}\n")
+    logger.info(check_name)
+    if normalized == "PASS":
+        logger.info(f" Status : {normalized}")
+    elif normalized == "WARN":
+        logger.warning(f" Status : {normalized}")
+    elif normalized == "FAIL":
+        logger.error(f" Status : {normalized}")
+    else:
+        logger.info(f" Status : {normalized}")
+    logger.info(f" Details : {details}")
+    if guideline:
+        logger.info(f" Guideline: {guideline}")
+    logger.info("")
 
 
 def log_summary(section_name: str):
-    logging.info(f"\n========== {section_name} Summary ==========\n")
-    logging.info(f"Total checks conducted: {check_results['TOTAL']}")
-    logging.info(f"Passed: {check_results['PASS']}")
-    logging.info(f"Warnings: {check_results['WARN']}")
-    logging.info(f"Infos: {check_results['INFO']}")
-    logging.info(f"Failed: {check_results['FAIL']}")
-    logging.info("===========================================\n")
+    logger = _logger()
+    logger.info(f"========== {section_name} Summary ==========")
+    logger.info(f"Total checks conducted : {check_results['TOTAL']}")
+    logger.info(f"Passed : {check_results['PASS']}")
+    logger.info(f"Warnings : {check_results['WARN']}")
+    logger.info(f"Infos : {check_results['INFO']}")
+    logger.info(f"Failed : {check_results['FAIL']}")
+    logger.info("===========================================")
+    logger.info("")
+
+
+def log_individual_check_results():
+    """ACH-like compact list of individual check statuses."""
+    logger = _logger()
+    logger.info("Individual Check Results:")
+    logger.info("-" * 40)
+    if not check_history:
+        logger.info("No checks recorded.")
+        logger.info("")
+        return
+    for entry in check_history:
+        logger.info(f"{entry['name']:.<50} {entry['status']}")
+    logger.info("")
 
 
 def log_footer(critical_issues: int, warnings: int):
-    logging.info("=" * 60)
-    logging.info("CLOSING NOTES")
-    logging.info("=" * 60)
+    logger = _logger()
+    logger.info("=" * 60)
+    logger.info("CLOSING NOTES")
+    logger.info("=" * 60)
 
     if critical_issues:
-        logging.info(f"Critical issues: {critical_issues}")
+        logger.error(f" Critical issues: {critical_issues}")
 
     if warnings:
-        logging.info(f"Warnings: {warnings}")
+        logger.warning(f"Warnings: {warnings}")
 
     if not critical_issues and not warnings:
-        logging.info("No issues detected. Data looks clean.")
+        logger.info("No issues detected. Data looks clean.")
+    logger.info("")

@@ -9,7 +9,16 @@ from typing import Dict, List
 import chardet
 import pandas as pd
 
-from log_manager import check_results, log_check, log_footer, log_header, log_summary
+from log_manager import (
+    check_results,
+    log_check,
+    log_footer,
+    log_header,
+    log_individual_check_results,
+    log_section_end,
+    log_section_start,
+    log_summary,
+)
 
 # X9 Field Definitions
 X9_FIELDS = {
@@ -851,6 +860,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         return
 
     print(f"Configuration: OUR_ABA_LIST={our_aba_list}, Files={file_count}\n")
+    log_section_start("SECTION 1 X937 RDV VALIDATION TEST")
 
     # ============================================================
     # PRE-SCAN: syntax and structure validation per file
@@ -1267,7 +1277,9 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                 "Review invalid_x937_structure report and source files.",
             )
             log_summary("Processing Availability")
+            log_individual_check_results()
             log_footer(check_results["FAIL"], check_results["WARN"])
+            log_section_end("SECTION 1 X937 RDV VALIDATION TEST")
             print("\nX937 validation completed with critical issues.")
             return
 
@@ -1649,5 +1661,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                 )
 
     log_summary("Return Records Validation")
+    log_individual_check_results()
     log_footer(check_results["FAIL"], check_results["WARN"])
+    log_section_end("SECTION 1 X937 RDV VALIDATION TEST")
     print("\nX937 validation completed.")

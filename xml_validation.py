@@ -5,7 +5,16 @@ from datetime import datetime, timedelta
 import pandas as pd
 import warnings
 
-from log_manager import check_results, log_check, log_footer, log_header, log_summary
+from log_manager import (
+    check_results,
+    log_check,
+    log_footer,
+    log_header,
+    log_individual_check_results,
+    log_section_end,
+    log_section_start,
+    log_summary,
+)
 from xml_standard import Standard
 
 warnings.filterwarnings("ignore")
@@ -110,6 +119,7 @@ def run_xml_validation(config):
     # ============================================================
     # SECTION 1: FILE & DATA QUALITY
     # ============================================================
+    log_section_start("SECTION 1 XML RDV VALIDATION TEST")
     log_header("XML Dataset Validation", len(all_files))
 
     if enable_date_continuity:
@@ -188,7 +198,9 @@ def run_xml_validation(config):
             "Validate source XML structure and parser assumptions.",
         )
         log_summary("File & Data Quality")
+        log_individual_check_results()
         log_footer(check_results["FAIL"], check_results["WARN"])
+        log_section_end("SECTION 1 XML RDV VALIDATION TEST")
         return
 
     df_62 = df.filter(regex="62").dropna(how="all")
@@ -212,7 +224,9 @@ def run_xml_validation(config):
 
     if df_legit.empty:
         print("ERROR: No legit records")
+        log_individual_check_results()
         log_footer(check_results["FAIL"], check_results["WARN"])
+        log_section_end("SECTION 1 XML RDV VALIDATION TEST")
         return
 
     log_summary("File & Data Quality")
@@ -235,7 +249,9 @@ def run_xml_validation(config):
     )
     if not has_all_fields:
         print("Missing routing fields - cannot classify transactions")
+        log_individual_check_results()
         log_footer(check_results["FAIL"], check_results["WARN"])
+        log_section_end("SECTION 1 XML RDV VALIDATION TEST")
         return
 
     df_legit["PAYOR_ROUTING"] = df_legit[PAYOR_ABA_FIELD].astype(str) + df_legit[PAYOR_CHECK_DIGIT_FIELD].astype(
@@ -668,5 +684,7 @@ def run_xml_validation(config):
     if len(df_return) > 0:
         df_return.to_csv(f"return_result_{current_time}.tsv", sep="\t", index=False)
 
+    log_individual_check_results()
     log_footer(check_results["FAIL"], check_results["WARN"])
+    log_section_end("SECTION 1 XML RDV VALIDATION TEST")
     print("\nXML validation completed.")
