@@ -63,6 +63,7 @@ retail = /path/to/Retail_ABC_20260131.csv
 ach_dir = /path/to/ach/files
 check_dir = /path/to/check/xml
 wire_dir = /path/to/wire/logs
+aba_number = 123456789
 ach_glob = *ACH,*ach
 check_glob = *.xml,*.XML
 wire_glob = **/*.log,**/*.LOG
@@ -173,6 +174,7 @@ All outputs are written to `OUTPUT.output_dir`:
 - `ach_unmatched_company_ids_<tenant>_<timestamp>.tsv`
 - `ach_company_ids_missing_partyid_<tenant>_<timestamp>.tsv`
 - `ach_originators_<tenant>_<timestamp>.tsv`
+- `ach_company_id_aba_matches_<tenant>_<timestamp>.tsv`
 - `ach_unmatched_parties_<tenant>_<timestamp>.tsv`
 - `check_unmatched_accounts_<tenant>_<timestamp>.tsv`
 - `check_unmatched_parties_<tenant>_<timestamp>.tsv`

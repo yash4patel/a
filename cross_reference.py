@@ -30,6 +30,7 @@ class CrossChannelChecker:
         ach_globs: List[str],
         check_globs: List[str],
         wire_globs: List[str],
+        aba_number: str,
     ):
         self.logger = logger
         self.tenant_name = tenant_name
@@ -38,6 +39,7 @@ class CrossChannelChecker:
         self.ach_globs = ach_globs
         self.check_globs = check_globs
         self.wire_globs = wire_globs
+        self.aba_number = aba_number.strip() if aba_number else ""
 
     @staticmethod
     def _read_pipe_csv(path: str, logger: logging.Logger) -> pd.DataFrame:
@@ -570,6 +572,9 @@ class CrossChannelChecker:
         originators_path = os.path.join(
             self.output_dir, f"ach_originators_{self.tenant_name}_{run_id}.tsv"
         )
+        aba_match_path = os.path.join(
+            self.output_dir, f"ach_company_id_aba_matches_{self.tenant_name}_{run_id}.tsv"
+        )
 
         unmatched_company_rows = []
         for rank, (cid, count) in enumerate(unmatched_companies.most_common(), start=1):
@@ -671,6 +676,32 @@ class CrossChannelChecker:
                 "party_status",
             ],
         )
+
+        if self.aba_number:
+            aba_normalized = self._normalize_company_id(self.aba_number)
+            aba_counts = Counter([cid for cid in normalized if cid == aba_normalized])
+            aba_total = sum(aba_counts.values())
+            aba_rows = []
+            for rank, (cid, count) in enumerate(aba_counts.most_common(), start=1):
+                aba_rows.append(
+                    [
+                        str(rank),
+                        cid,
+                        str(count),
+                        _pct(count, total_records),
+                        "ACHCompanyID matches ABA number",
+                    ]
+                )
+            self._write_tsv(
+                aba_rows,
+                aba_match_path,
+                ["rank", "ACHCompanyID", "count", "pct_of_channel", "issue"],
+            )
+            self.logger.info(
+                f"[{self.tenant_name}] ACH CompanyID vs ABA check: "
+                f"ABA={aba_normalized or self.aba_number} | matches {aba_total} | "
+                f"report: {aba_match_path}"
+            )
 
         self.logger.info(
             f"[{self.tenant_name}] ACH cross-check (CompanyID): total records {total_records:,} | "

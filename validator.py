@@ -91,6 +91,9 @@ class ValidationConfig:
         self.wire_globs = self._get_list(
             [("CROSS-CHANNEL", "wire_glob"), ("INPUT", "wire_glob")], "**/*.log,**/*.LOG"
         )
+        self.aba_number = self._get_value(
+            [("CROSS-CHANNEL", "aba_number"), ("OPTIONS", "aba_number"), ("GENERAL", "aba_number")]
+        )
 
         self.output_dir = self.config["OUTPUT"]["output_dir"].strip()
         self.json_schema_file = self.config["SCHEMA"]["json_schema_file"].strip()
@@ -794,6 +797,7 @@ class ReferenceValidator:
             ach_globs=self.config.ach_globs,
             check_globs=self.config.check_globs,
             wire_globs=self.config.wire_globs,
+            aba_number=self.config.aba_number,
         )
 
     def run(self):
