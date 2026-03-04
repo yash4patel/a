@@ -964,6 +964,24 @@ class ReferenceValidator:
                     f"[{self.config.tenant_name}] Account/Party paths not provided - cross-reference skipped"
                 )
 
+            # ACHODFI cross-reference checks (PartyID + RelatedSettlementAccount)
+            if self.config.achodfi_file and os.path.exists(self.config.achodfi_file):
+                account_set = set(account_map.keys()) if account_map else None
+                achodfi_result = self.cross_checker.cross_check_achodfi_reference(
+                    self.config.achodfi_file,
+                    account_set,
+                    party_set,
+                    run_id,
+                )
+                self.logger.info(
+                    f"[{self.config.tenant_name}] ACHODFI cross-reference report: "
+                    f"{achodfi_result['report_path']}"
+                )
+            elif self.config.achodfi_file:
+                self.logger.warning(
+                    f"[{self.config.tenant_name}] ACHODFI file NOT FOUND: {self.config.achodfi_file}"
+                )
+
             # Phase 3: Cross-channel (CSV to transaction files)
             self.logger.info("\n" + "=" * 80)
             self.logger.info(f"[{self.config.tenant_name}] PHASE 3: CROSS-CHANNEL (CSV to transaction files)")

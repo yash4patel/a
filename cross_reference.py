@@ -294,6 +294,76 @@ class CrossChannelChecker:
             "total_party_rows": str(stats.get("total_party_rows", 0)),
         }
 
+    def cross_check_achodfi_reference(
+        self,
+        achodfi_file: str,
+        account_set: Optional[Set[str]],
+        party_set: Optional[Set[str]],
+        run_id: str,
+    ) -> Dict[str, str]:
+        ach_df = self._read_pipe_csv(achodfi_file, self.logger)
+        required_cols = {"ACHCompanyID", "PartyID", "RelatedSettlementAccount"}
+        missing_cols = [c for c in required_cols if c not in ach_df.columns]
+        if missing_cols:
+            raise ValueError(f"ACHODFI file missing columns: {', '.join(missing_cols)}")
+
+        rows: List[List[str]] = []
+        total_rows = len(ach_df)
+        missing_party = 0
+        party_not_found = 0
+        missing_settlement = 0
+        settlement_not_found = 0
+
+        for idx, row in ach_df.iterrows():
+            company_id = self._normalize_company_id(str(row["ACHCompanyID"]))
+            party_id = self._normalize_party(str(row["PartyID"]))
+            settlement = self._normalize_account(str(row["RelatedSettlementAccount"]))
+            issues: List[str] = []
+
+            if not party_id:
+                issues.append("PartyID missing in ACHODFI file")
+                missing_party += 1
+            elif party_set is not None and party_id not in party_set:
+                issues.append("PartyID missing in Party file")
+                party_not_found += 1
+
+            if not settlement:
+                issues.append("RelatedSettlementAccount missing in ACHODFI file")
+                missing_settlement += 1
+            elif account_set is not None and settlement not in account_set:
+                issues.append("RelatedSettlementAccount missing in Account file")
+                settlement_not_found += 1
+
+            if issues:
+                rows.append(
+                    [
+                        str(idx + 2),
+                        company_id,
+                        party_id,
+                        settlement,
+                        " | ".join(issues),
+                    ]
+                )
+
+        path = os.path.join(
+            self.output_dir, f"achodfi_cross_reference_issues_{self.tenant_name}_{run_id}.tsv"
+        )
+        self._write_tsv(
+            rows,
+            path,
+            ["row", "ACHCompanyID", "PartyID", "RelatedSettlementAccount", "issue"],
+        )
+
+        return {
+            "report_path": path,
+            "total_rows": str(total_rows),
+            "issues": str(len(rows)),
+            "missing_party": str(missing_party),
+            "party_not_found": str(party_not_found),
+            "missing_settlement": str(missing_settlement),
+            "settlement_not_found": str(settlement_not_found),
+        }
+
     def write_cross_reference_summary(self, summary: Dict[str, str], run_id: str) -> str:
         path = os.path.join(self.output_dir, f"cross_reference_summary_{self.tenant_name}_{run_id}.tsv")
         rows = [
