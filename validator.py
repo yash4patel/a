@@ -918,6 +918,10 @@ class ReferenceValidator:
             else:
                 self.logger.warning(f"[{self.config.tenant_name}] No path provided for Retail file - SKIPPING")
 
+            self.logger.info(
+                f"[{self.config.tenant_name}] FINISHED PHASE 1: DATA VALIDATION"
+            )
+
             # Phase 2: Cross-reference (CSV to CSV)
             self.logger.info("\n" + "=" * 80)
             self.logger.info(f"[{self.config.tenant_name}] PHASE 2: CROSS-REFERENCE (CSV to CSV)")
@@ -986,6 +990,10 @@ class ReferenceValidator:
                     f"[{self.config.tenant_name}] ACHODFI file NOT FOUND: {self.config.achodfi_file}"
                 )
 
+            self.logger.info(
+                f"[{self.config.tenant_name}] FINISHED PHASE 2: CROSS-REFERENCE"
+            )
+
             # Phase 3: Cross-channel (CSV to transaction files)
             self.logger.info("\n" + "=" * 80)
             self.logger.info(f"[{self.config.tenant_name}] PHASE 3: CROSS-CHANNEL (CSV to transaction files)")
@@ -1041,6 +1049,10 @@ class ReferenceValidator:
                     self.logger.info(f"[{self.config.tenant_name}] Cross-channel summary: {summary_path}")
                 else:
                     self.logger.warning(f"[{self.config.tenant_name}] No cross-channel results generated")
+
+            self.logger.info(
+                f"[{self.config.tenant_name}] FINISHED PHASE 3: CROSS-CHANNEL"
+            )
 
             # Final summary
             end_time = datetime.now()
