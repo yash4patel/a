@@ -549,6 +549,12 @@ class CrossChannelChecker:
         party_match_pct = (party_match / total_records * 100.0) if total_records else 0.0
         unmatched_company_records = sum(unmatched_companies.values())
         unmatched_party_records = sum(unmatched_parties.values())
+        missing_partyid_records = sum(missing_party_company_counts.values())
+        missing_party_ref_records = sum(
+            count
+            for (party_id, issue), count in unmatched_party_issues.items()
+            if issue == "PartyID missing from Party reference"
+        )
         unmatched_company_pct = (
             unmatched_company_records / total_records * 100.0 if total_records else 0.0
         )
@@ -709,6 +715,24 @@ class CrossChannelChecker:
             f"company matches {company_match:,} ({company_match_pct:.2f}%) | "
             f"party matches {party_match:,} ({party_match_pct:.2f}%)"
         )
+        if total_records:
+            if (
+                company_match_pct == 100.0
+                and party_match_pct == 100.0
+                and missing_partyid_records == 0
+                and missing_party_ref_records == 0
+                and unmatched_company_records == 0
+            ):
+                self.logger.info(
+                    f"[{self.tenant_name}] ACH summary: 100% match for ACHCompanyID and PartyID"
+                )
+            else:
+                self.logger.info(
+                    f"[{self.tenant_name}] ACH summary: "
+                    f"{unmatched_company_records} records missing ACHCompanyID in ACHODFI | "
+                    f"{missing_partyid_records} records missing PartyID in ACHODFI | "
+                    f"{missing_party_ref_records} records missing PartyID in Party file"
+                )
         self.logger.info(
             f"[{self.tenant_name}] ACH missing PartyID report: {missing_party_path}"
         )
