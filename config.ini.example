@@ -1,0 +1,38 @@
+[CSV FILE INPUT]
+account = /path/to/account_reference.csv
+party = /path/to/party_reference.csv
+achodfi = /path/to/achodfi_reference.csv
+retail = /path/to/retail_reference.csv
+business = /path/to/business_reference.csv
+
+[CROSS-CHANNEL]
+# Directory to search for ACH files
+ach_dir = /path/to/ach/files
+# Directory to search for Check files
+check_dir = /path/to/check/xml
+# Directory to search for Wire log files
+wire_dir = /path/to/wire/logs
+# Optional: bank ABA number used to flag ACH Company IDs that match ABA
+aba_number = 123456789
+# Filename patterns (comma-separated) used within ach_dir
+ach_glob = *ACH,*ach
+# Filename patterns (comma-separated) used within check_dir
+check_glob = *.xml,*.XML
+# Filename patterns (comma-separated) used within wire_dir (recursive)
+wire_glob = **/*.log,**/*.LOG
+
+[SCHEMA]
+json_schema_file = /path/to/jsonFileConfig.json
+
+[OUTPUT]
+output_dir = /path/to/output
+
+[GENERAL]
+tenant_name = ExampleTenant
+
+[OPTIONS]
+cross_check_party = true
+cross_check_ach = true
+cross_check_check = true
+cross_check_wire = true
+strip_leading_zeros = true
