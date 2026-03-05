@@ -522,6 +522,7 @@ class CrossChannelChecker:
         unmatched_companies = Counter()
         unmatched_parties = Counter()
         unmatched_party_issues = Counter()
+        missing_party_company_counts = Counter()
 
         for company_id in normalized:
             reference = reference_map.get(company_id)
