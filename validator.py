@@ -382,24 +382,9 @@ class SchemaManager:
     def extract_expected_columns(self, block: Dict[str, Any]) -> List[str]:
         """Extract expected column names from JSON header string."""
         header_str = block.get("header", "")
-        header_cols = [c.strip() for c in header_str.split(",") if c.strip()] if header_str else []
-
-        mapping_cols: List[str] = []
-        for parsing in block.get("parsing_config", []):
-            for field_map in parsing.get("field_mapping", []):
-                field_name = str(field_map.get("file_field", "")).strip()
-                if field_name:
-                    mapping_cols.append(field_name)
-
-        # Combine header + field_mapping columns (case-sensitive)
-        combined: List[str] = []
-        seen = set()
-        for col in header_cols + mapping_cols:
-            if col not in seen:
-                combined.append(col)
-                seen.add(col)
-
-        return combined
+        if not header_str:
+            return []
+        return [c.strip() for c in header_str.split(",") if c.strip()]
 
 
 class FileValidator:
