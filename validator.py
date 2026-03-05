@@ -382,9 +382,25 @@ class SchemaManager:
     def extract_expected_columns(self, block: Dict[str, Any]) -> List[str]:
         """Extract expected column names from JSON header string."""
         header_str = block.get("header", "")
-        if not header_str:
-            return []
-        return [c.strip() for c in header_str.split(",") if c.strip()]
+        header_cols = [c.strip() for c in header_str.split(",") if c.strip()] if header_str else []
+
+        mapping_cols: List[str] = []
+        for parsing in block.get("parsing_config", []):
+            for field_map in parsing.get("field_mapping", []):
+                field_name = str(field_map.get("file_field", "")).strip()
+                if field_name:
+                    mapping_cols.append(field_name)
+
+        # Combine header + field_mapping columns (case-insensitive dedupe)
+        combined: List[str] = []
+        seen = set()
+        for col in header_cols + mapping_cols:
+            key = col.lower()
+            if key not in seen:
+                combined.append(col)
+                seen.add(key)
+
+        return combined
 
 
 class FileValidator:
@@ -435,14 +451,16 @@ class FileValidator:
         # Get JSON configuration
         json_block = self.schema_manager.find_json_block_for_file(filepath)
         expected_cols = self.schema_manager.extract_expected_columns(json_block)
+        expected_map = {c.lower(): c for c in expected_cols}
+        df_col_map = {c.lower(): c for c in df.columns}
 
         errors_rows: List[List[str]] = []
         total_errors = 0
 
         # Check for missing columns - DETAILED REPORTING
         if expected_cols:
-            missing_cols = [c for c in expected_cols if c not in df.columns]
-            present_cols = [c for c in expected_cols if c in df.columns]
+            missing_cols = [expected_map[key] for key in expected_map if key not in df_col_map]
+            present_cols = [df_col_map[key] for key in expected_map if key in df_col_map]
 
             if missing_cols:
                 self.logger.error("=" * 80)
@@ -460,7 +478,7 @@ class FileValidator:
             self.logger.info("=" * 80)
 
             # Show columns in CSV but NOT in JSON schema (will be ignored)
-            extra_cols = [c for c in df.columns if c not in expected_cols]
+            extra_cols = [c for c in df.columns if c.lower() not in expected_map]
             if extra_cols:
                 self.logger.warning("=" * 80)
                 self.logger.warning(
@@ -472,10 +490,20 @@ class FileValidator:
                 self.logger.warning("=" * 80)
 
         # Determine columns to validate
+        cols_to_validate: List[str] = []
+        column_map: Dict[str, str] = {}
         if expected_cols:
-            cols_to_validate = [c for c in schema.keys() if c in expected_cols and c in df.columns]
+            for col in schema.keys():
+                key = col.lower()
+                if key in expected_map and key in df_col_map:
+                    cols_to_validate.append(col)
+                    column_map[col] = df_col_map[key]
         else:
-            cols_to_validate = [c for c in schema.keys() if c in df.columns]
+            for col in schema.keys():
+                key = col.lower()
+                if key in df_col_map:
+                    cols_to_validate.append(col)
+                    column_map[col] = df_col_map[key]
 
         self.logger.info("=" * 80)
         self.logger.info(f"[{self.tenant_name}] COLUMNS TO VALIDATE ({len(cols_to_validate)} total):")
@@ -499,7 +527,15 @@ class FileValidator:
                 )
 
             row_errors = self._validate_row(
-                row, idx, filetype, cols_to_validate, schema, df, primary_col, seen_primary
+                row,
+                idx,
+                filetype,
+                cols_to_validate,
+                column_map,
+                schema,
+                df,
+                primary_col,
+                seen_primary,
             )
 
             if row_errors:
@@ -517,6 +553,7 @@ class FileValidator:
         idx: int,
         filetype: str,
         cols_to_validate: List[str],
+        column_map: Dict[str, str],
         schema: Dict[str, Tuple],
         df: pd.DataFrame,
         primary_col: str,
@@ -528,13 +565,14 @@ class FileValidator:
         # Validate each column
         for col in cols_to_validate:
             required, validator, max_len, fixer = schema[col]
-            val = str(row[col]).strip()
+            actual_col = column_map[col]
+            val = str(row[actual_col]).strip()
 
             # Apply fixer if available
             if fixer is not None:
                 new_val = fixer(val)
                 if new_val != val:
-                    df.at[idx, col] = new_val
+                    df.at[idx, actual_col] = new_val
                     val = new_val
 
             # Check required fields
@@ -580,7 +618,11 @@ class FileValidator:
         # Account-specific: check at least one balance field
         if filetype == "Account":
             bal_cols = ["BalanceAvailable", "BalanceLedger", "BalanceCollected"]
-            bal_vals = [str(df.at[idx, bc]).strip() for bc in bal_cols if bc in df.columns]
+            bal_vals = [
+                str(df.at[idx, column_map[bc]]).strip()
+                for bc in bal_cols
+                if bc in column_map
+            ]
             if bal_vals and all(v == "" for v in bal_vals):
                 error_msg = "Balance: at least one balance field required"
                 row_errors.append(error_msg)
@@ -592,7 +634,11 @@ class FileValidator:
             # Composite primary key (tuple of columns)
             if isinstance(primary_col, tuple):
                 # Build composite key value
-                prim_val = tuple(str(df.at[idx, col]).strip() for col in primary_col if col in df.columns)
+                prim_val = tuple(
+                    str(df.at[idx, column_map[col]]).strip()
+                    for col in primary_col
+                    if col in column_map
+                )
 
                 # Proceed only if all parts of composite key are present
                 if len(prim_val) == len(primary_col) and all(prim_val):
@@ -607,8 +653,8 @@ class FileValidator:
 
             # Single-column primary key
             else:
-                if primary_col in df.columns:
-                    prim_val = str(df.at[idx, primary_col]).strip()
+                if primary_col in column_map:
+                    prim_val = str(df.at[idx, column_map[primary_col]]).strip()
                     if prim_val:
                         if prim_val in seen_primary:
                             first_row = seen_primary[prim_val]
