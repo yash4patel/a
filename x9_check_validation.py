@@ -235,6 +235,26 @@ def _infer_image_format(meta_50_line: str, data_52_line: str) -> str:
     return "UNKNOWN"
 
 
+def _extract_check_context_from_25(line: str) -> Dict[str, str]:
+    """Extract check-identifying fields from record 25 for pinpoint reporting."""
+    aux_on_us = _slice(line, 3, 18)
+    on_us = _slice(line, 28, 48)
+    item_seq = _slice(line, 58, 73)
+
+    on_us_clean = on_us.strip("/")
+    on_us_parts = [p for p in on_us_clean.split("/") if p]
+    payer_account = on_us_parts[0] if on_us_parts else ""
+    check_number = aux_on_us if aux_on_us else (on_us_parts[-1] if on_us_parts else "")
+
+    return {
+        "payer_account": payer_account,
+        "check_number": check_number,
+        "on_us": on_us,
+        "aux_on_us": aux_on_us,
+        "item_sequence_number": item_seq,
+    }
+
+
 def validate_critical_fields_for_record(line: str, record_type: str, line_number: int):
     """Validate critical fields (RT/account/MICR/image presence) by record type."""
     issues = []
@@ -352,6 +372,13 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
     return_items_non_tiff = 0
 
     current_item = None
+    current_cash_letter_id = ""
+    current_cash_letter_business_date = ""
+    current_bundle_id = ""
+    current_bundle_business_date = ""
+    current_bundle_sequence_number = ""
+    open_25_context = None
+    missing_26_details = []
 
     def add_issue(message: str):
         nonlocal dropped_issue_count
@@ -359,6 +386,30 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             issues.append(message)
         else:
             dropped_issue_count += 1
+
+    def add_missing_26_detail(boundary_record_type: str, boundary_line: int, reason: str):
+        """Capture pinpoint context for a 25 that did not receive a 26."""
+        if not open_25_context:
+            return
+        missing_26_details.append(
+            {
+                "filename": file_name,
+                "line_25": open_25_context["line_25"],
+                "bundle_business_date": open_25_context["bundle_business_date"],
+                "bundle_id": open_25_context["bundle_id"],
+                "bundle_sequence_number": open_25_context["bundle_sequence_number"],
+                "cash_letter_business_date": open_25_context["cash_letter_business_date"],
+                "cash_letter_id": open_25_context["cash_letter_id"],
+                "check_number": open_25_context["check_number"],
+                "payer_account": open_25_context["payer_account"],
+                "on_us": open_25_context["on_us"],
+                "aux_on_us": open_25_context["aux_on_us"],
+                "item_sequence_number": open_25_context["item_sequence_number"],
+                "boundary_record_type": boundary_record_type,
+                "boundary_line": boundary_line,
+                "reason": reason,
+            }
+        )
 
     def finalize_current_item(reason: str):
         nonlocal current_item
@@ -445,6 +496,12 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             cti = _slice(line, 3, 5)
             if cti:
                 collection_type_values.add(cti)
+            current_cash_letter_business_date = _slice(line, 23, 31)
+            current_cash_letter_id = _slice(line, 45, 53)
+        elif rt == "20":
+            current_bundle_business_date = _slice(line, 23, 31)
+            current_bundle_id = _slice(line, 39, 49)
+            current_bundle_sequence_number = _slice(line, 49, 53)
 
         if rt in record_type_counts:
             record_type_counts[rt] += 1
@@ -472,11 +529,22 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             rec25_total += 1
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
+                add_missing_26_detail("25", idx, "missing_26_before_next_25")
                 add_issue(
                     f"Record 25 at line {open_25_line} has no corresponding 26 before next 25"
                 )
             open_25_line = idx
             open_25_has_26 = False
+            check_ctx = _extract_check_context_from_25(line)
+            open_25_context = {
+                "line_25": idx,
+                "bundle_business_date": current_bundle_business_date,
+                "bundle_id": current_bundle_id,
+                "bundle_sequence_number": current_bundle_sequence_number,
+                "cash_letter_business_date": current_cash_letter_business_date,
+                "cash_letter_id": current_cash_letter_id,
+                **check_ctx,
+            }
         elif rt == "26":
             rec26_total += 1
             if open_25_line is None:
@@ -497,19 +565,23 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             }
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
+                add_missing_26_detail("31", idx, "missing_26_before_record_31")
                 add_issue(
                     f"Record 25 at line {open_25_line} has no corresponding 26 before record 31 at line {idx}"
                 )
             open_25_line = None
             open_25_has_26 = False
+            open_25_context = None
         elif rt in close_25_context:
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
+                add_missing_26_detail(rt, idx, f"missing_26_before_record_{rt}")
                 add_issue(
                     f"Record 25 at line {open_25_line} has no corresponding 26 before record {rt} at line {idx}"
                 )
             open_25_line = None
             open_25_has_26 = False
+            open_25_context = None
 
         if rt in {"10", "20", "61", "62", "70", "90", "99", "01"}:
             finalize_current_item(f"record {rt} at line {idx}")
@@ -544,7 +616,9 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
 
     if open_25_line is not None and not open_25_has_26:
         missing_26_after_25_count += 1
+        add_missing_26_detail("EOF", len(records), "missing_26_before_end_of_file")
         add_issue(f"Record 25 at line {open_25_line} has no corresponding 26 before end of file")
+    open_25_context = None
     finalize_current_item("end of file")
 
     presentment_mode = ("01" in collection_type_values) or record_type_counts["25"] > 0 or record_type_counts["26"] > 0
@@ -601,6 +675,8 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         "record_type_counts": record_type_counts,
         "record_25_count": rec25_total,
         "record_26_count": rec26_total,
+        "missing_26_detail_count": len(missing_26_details),
+        "missing_26_details": missing_26_details,
         "presentment_item_count": presentment_item_count,
         "presentment_items_without_image_pair": presentment_items_without_image_pair,
         "presentment_items_without_front_image": presentment_items_without_front_image,
@@ -905,6 +981,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "header_ok": False,
                     "orphan_26_count": 0,
                     "missing_26_after_25_count": 0,
+                    "missing_26_detail_count": 0,
                     "collection_type_values": "",
                     "missing_presentment_types": ",".join(PRESENTMENT_REQUIRED_TYPES),
                     "missing_return_types": ",".join(RETURN_REQUIRED_TYPES),
@@ -937,6 +1014,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "header_ok": structure["header_ok"],
                     "orphan_26_count": structure["orphan_26_count"],
                     "missing_26_after_25_count": structure["missing_26_after_25_count"],
+                    "missing_26_detail_count": structure["missing_26_detail_count"],
                     "collection_type_values": ",".join(structure["collection_type_values"]),
                     "missing_presentment_types": ",".join(structure["missing_presentment_types"]),
                     "missing_return_types": ",".join(structure["missing_return_types"]),
@@ -955,6 +1033,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             )
 
     invalid_structure_report = None
+    missing_26_detail_report = None
     if invalid_file_rows:
         invalid_structure_report = f"invalid_x937_structure_{current_time}.tsv"
         report_columns = [
@@ -967,6 +1046,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             "missing_required_record_types",
             "orphan_26_count",
             "missing_26_after_25_count",
+            "missing_26_detail_count",
             "critical_field_error_count",
             "presentment_items_without_image_pair",
             "presentment_items_without_front_image",
@@ -980,6 +1060,17 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         ]
         pd.DataFrame(invalid_file_rows)[report_columns].to_csv(
             invalid_structure_report,
+            sep="\t",
+            index=False,
+        )
+
+    missing_26_rows = []
+    for result in structure_results:
+        missing_26_rows.extend(result.get("missing_26_details", []))
+    if missing_26_rows:
+        missing_26_detail_report = f"missing_26_detail_{current_time}.tsv"
+        pd.DataFrame(missing_26_rows).to_csv(
+            missing_26_detail_report,
             sep="\t",
             index=False,
         )
@@ -1091,6 +1182,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     header_fail_files = sum(1 for r in structure_results if not r["header_ok"])
     orphan_26_total = sum(r["orphan_26_count"] for r in structure_results)
     missing_26_total = sum(r["missing_26_after_25_count"] for r in structure_results)
+    missing_26_detail_total = sum(r.get("missing_26_detail_count", 0) for r in structure_results)
     files_missing_presentment_required = sum(1 for r in structure_results if r["missing_presentment_types"])
     files_missing_return_required = sum(
         1 for r in structure_results if r["return_mode"] and r["missing_return_types"]
@@ -1143,11 +1235,14 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         f"Files failing 01->10->20 header sequence: {header_fail_files:,}",
         f"Orphan 26 records (26 without preceding 25): {orphan_26_total:,}",
         f"25 records missing corresponding 26: {missing_26_total:,}",
+        f"Missing-26 pinpoint records captured: {missing_26_detail_total:,}",
         f"Collection type 01 files: {files_with_collection_01:,}",
         f"Collection type 03 files: {files_with_collection_03:,}",
     ]
     if invalid_structure_report:
         detail_lines.append(f"Invalid file report: {invalid_structure_report}")
+    if missing_26_detail_report:
+        detail_lines.append(f"Missing-26 detail report: {missing_26_detail_report}")
     if invalid_file_rows:
         preview = "\n".join(
             [f" - {r['filename']}: {r.get('issues_preview', 'No details')}" for r in invalid_file_rows[:5]]
@@ -1159,6 +1254,33 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         structure_status,
         "\n".join(detail_lines),
         "X9 file must start with 01->10->20, each 26 must follow 25, and each 25 must include at least one 26.",
+    )
+
+    missing_26_detail_status = "PASS" if missing_26_detail_total == 0 else "WARN"
+    missing_26_examples = []
+    for result in structure_results:
+        for item in result.get("missing_26_details", []):
+            missing_26_examples.append(
+                (
+                    f"{item['filename']}: line25={item['line_25']}, bundle={item['bundle_id']}, "
+                    f"bundle_date={item['bundle_business_date']}, check_number={item['check_number']}, "
+                    f"reason={item['reason']}"
+                )
+            )
+            if len(missing_26_examples) >= 10:
+                break
+        if len(missing_26_examples) >= 10:
+            break
+    missing_26_lines = [f"Total missing 25->26 cases: {missing_26_detail_total:,}"]
+    if missing_26_detail_report:
+        missing_26_lines.append(f"Detail report: {missing_26_detail_report}")
+    if missing_26_examples:
+        missing_26_lines.append("Examples:\n - " + "\n - ".join(missing_26_examples))
+    log_check(
+        "Missing 26 Pinpoint Report (Batch/Bundle/Check Number)",
+        missing_26_detail_status,
+        "\n".join(missing_26_lines),
+        "Use detail report to pinpoint each 25 missing 26 by bundle and check number.",
     )
 
     required_record_status = (
