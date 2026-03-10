@@ -813,6 +813,20 @@ def load_jsonl_df(jsonl_path):
     return pd.read_json(jsonl_path, encoding="latin-1", lines=True)
 
 
+def compact_issue_text(issues: List[str], max_items: int = 12, max_chars: int = 2400) -> str:
+    """Build compact issue preview text for TSV output."""
+    if not issues:
+        return "No detailed issues."
+    shown = issues[:max_items]
+    preview = " | ".join(shown)
+    remaining = len(issues) - len(shown)
+    if remaining > 0:
+        preview += f" | ... ({remaining} more issues)"
+    if len(preview) > max_chars:
+        preview = preview[: max_chars - 3] + "..."
+    return preview
+
+
 def process_x9_files(x937_dir, sample_days, our_aba, config):
     """Main processing function for X9 files."""
     current_time = datetime.now().strftime("%Y%m%d")
@@ -888,7 +902,6 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                 {
                     "filename": os.path.basename(path),
                     "status": "INVALID",
-                    "syntax_errors": 0,
                     "header_ok": False,
                     "orphan_26_count": 0,
                     "missing_26_after_25_count": 0,
@@ -903,7 +916,9 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "return_items_without_image_pair": 0,
                     "return_items_without_front_image": 0,
                     "return_items_non_tiff": 0,
-                    "issues": f"Unable to read file: {e}",
+                    "syntax_errors": 0,
+                    "issue_count": 1,
+                    "issues_preview": f"Unable to read file: {e}",
                 }
             )
             continue
@@ -915,13 +930,10 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             valid_x9_files.append(path)
         else:
             issues = list(structure["issues"])
-            if syntax_errors > 0:
-                issues.insert(0, f"Syntax errors: {syntax_errors}")
             invalid_file_rows.append(
                 {
                     "filename": os.path.basename(path),
                     "status": "INVALID",
-                    "syntax_errors": syntax_errors,
                     "header_ok": structure["header_ok"],
                     "orphan_26_count": structure["orphan_26_count"],
                     "missing_26_after_25_count": structure["missing_26_after_25_count"],
@@ -936,14 +948,41 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "return_items_without_image_pair": structure["return_items_without_image_pair"],
                     "return_items_without_front_image": structure["return_items_without_front_image"],
                     "return_items_non_tiff": structure["return_items_non_tiff"],
-                    "issues": " | ".join(issues) if issues else "Unknown validation issue",
+                    "syntax_errors": syntax_errors,
+                    "issue_count": len(issues) + (1 if syntax_errors > 0 else 0),
+                    "issues_preview": compact_issue_text(issues),
                 }
             )
 
     invalid_structure_report = None
     if invalid_file_rows:
         invalid_structure_report = f"invalid_x937_structure_{current_time}.tsv"
-        pd.DataFrame(invalid_file_rows).to_csv(invalid_structure_report, sep="\t", index=False)
+        report_columns = [
+            "filename",
+            "status",
+            "header_ok",
+            "collection_type_values",
+            "missing_presentment_types",
+            "missing_return_types",
+            "missing_required_record_types",
+            "orphan_26_count",
+            "missing_26_after_25_count",
+            "critical_field_error_count",
+            "presentment_items_without_image_pair",
+            "presentment_items_without_front_image",
+            "presentment_items_non_tiff",
+            "return_items_without_image_pair",
+            "return_items_without_front_image",
+            "return_items_non_tiff",
+            "syntax_errors",
+            "issue_count",
+            "issues_preview",
+        ]
+        pd.DataFrame(invalid_file_rows)[report_columns].to_csv(
+            invalid_structure_report,
+            sep="\t",
+            index=False,
+        )
 
     # Convert only valid files
     forward_json_file = f"fw_check_validation_{current_time}.jsonl"
@@ -996,6 +1035,19 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     # ============================================================
     log_header("X9 Check Validation Report", file_count)
 
+    header_fail_files_pre = sum(1 for r in structure_results if not r["header_ok"])
+    header_status = "PASS" if header_fail_files_pre == 0 else "FAIL"
+    log_check(
+        "Header Hierarchy Check (01 -> 10 -> 20)",
+        header_status,
+        (
+            f"Files scanned: {file_count:,}\n"
+            f"Files with valid header sequence: {file_count - header_fail_files_pre:,}\n"
+            f"Files failing header sequence: {header_fail_files_pre:,}"
+        ),
+        "Each X9 file should begin with File Header 01, Cash Letter Header 10, and Bundle Header 20.",
+    )
+
     # 1.1 Data Continuity
     if enable_date_continuity:
         file_names = [os.path.basename(f) for f in x9_files]
@@ -1035,22 +1087,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             "Enable date continuity if date-gap monitoring is required.",
         )
 
-    # 1.2 Bad Record Check (unified threshold rule)
-    bad_record_perc = round((bad_record_cnt / total_record_cnt) * 100, 2) if total_record_cnt else 0
-    status = "FAIL" if bad_record_perc > bad_record_threshold else "PASS"
-    log_check(
-        "Bad Record Check",
-        status,
-        (
-            f"Total records scanned: {total_record_cnt:,}\n"
-            f"Bad records found: {bad_record_cnt:,}\n"
-            f"Bad record percentage: {bad_record_perc}%\n"
-            f"Configured threshold: {bad_record_threshold}%"
-        ),
-        "FAIL if bad record percentage exceeds threshold.",
-    )
-
-    # 1.3 Structural and Phase-1 Basic Validation Summary
+    # 1.2 Structural and Phase-1 Basic Validation Summary
     header_fail_files = sum(1 for r in structure_results if not r["header_ok"])
     orphan_26_total = sum(r["orphan_26_count"] for r in structure_results)
     missing_26_total = sum(r["missing_26_after_25_count"] for r in structure_results)
@@ -1112,7 +1149,9 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     if invalid_structure_report:
         detail_lines.append(f"Invalid file report: {invalid_structure_report}")
     if invalid_file_rows:
-        preview = "\n".join([f" - {r['filename']}: {r['issues']}" for r in invalid_file_rows[:5]])
+        preview = "\n".join(
+            [f" - {r['filename']}: {r.get('issues_preview', 'No details')}" for r in invalid_file_rows[:5]]
+        )
         detail_lines.append(f"Sample issues:\n{preview}")
 
     log_check(
@@ -1236,6 +1275,22 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         image_status,
         "\n".join(image_details),
         "Each check item requires at least one 50/52 pair with front image; explicit non-TIFF indicators fail.",
+    )
+
+    # 1.3 Bad Record Check (moved after structural checks to reduce front-of-report noise)
+    bad_record_perc = round((bad_record_cnt / total_record_cnt) * 100, 2) if total_record_cnt else 0
+    status = "FAIL" if bad_record_perc > bad_record_threshold else "PASS"
+    log_check(
+        "Bad Record Check (Syntax/Internal Count)",
+        status,
+        (
+            f"Total records scanned: {total_record_cnt:,}\n"
+            f"Bad records found: {bad_record_cnt:,}\n"
+            f"Bad record percentage: {bad_record_perc}%\n"
+            f"Configured threshold: {bad_record_threshold}%\n"
+            "Note: syntax count is tracked for diagnostics and appears after header/structure checks."
+        ),
+        "FAIL if bad record percentage exceeds threshold.",
     )
 
     # 1.4 Record Type Summary
