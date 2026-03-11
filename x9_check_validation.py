@@ -4,7 +4,7 @@ import json
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import chardet
 import pandas as pd
@@ -903,6 +903,253 @@ def compact_issue_text(issues: List[str], max_items: int = 12, max_chars: int = 
     return preview
 
 
+def _extract_check_context_from_31(line: str) -> Dict[str, str]:
+    """Extract check-identifying fields from record 31 for pinpoint/reporting."""
+    on_us_return = _slice(line, 12, 32)
+    seq = _slice(line, 54, 69)
+    on_us_clean = on_us_return.strip("/")
+    on_us_parts = [p for p in on_us_clean.split("/") if p]
+    payer_account = on_us_parts[0] if on_us_parts else ""
+    check_number = on_us_parts[-1] if on_us_parts else ""
+    return {
+        "payer_account": payer_account,
+        "check_number": check_number,
+        "on_us": on_us_return,
+        "aux_on_us": "",
+        "item_sequence_number": seq,
+    }
+
+
+def _record_fields_for_ui(line: str) -> Dict[str, Any]:
+    """Convert one X9 line into compact, UI-friendly field payload."""
+    rt = get_record_type(line)
+    if rt in {"50", "52", "54"}:
+        if rt == "50":
+            return {
+                "line_length": len(line),
+                "metadata_preview": _slice(line, 3, 83),
+            }
+        if rt == "52":
+            payload = _slice(line, 3)
+            return {
+                "line_length": len(line),
+                "image_data_length": len(payload),
+                "image_data_preview": payload[:48],
+            }
+        return {
+            "line_length": len(line),
+            "analysis_preview": _slice(line, 3, 83),
+        }
+
+    if rt in X9_FIELDS:
+        values = get_record_type_values(line)
+        prefix = f"{rt}_"
+        compact = {}
+        for key, value in values.items():
+            short_key = key[len(prefix) :] if key.startswith(prefix) else key
+            compact[short_key] = value.strip()
+        return compact
+
+    return {
+        "line_length": len(line),
+        "raw_preview": line[:120].strip(),
+    }
+
+
+def _record_node_for_ui(line: str, line_number: int) -> Dict[str, Any]:
+    """Build a compact record node with line number, type, and normalized fields."""
+    return {
+        "line": line_number,
+        "record_type": get_record_type(line),
+        "fields": _record_fields_for_ui(line),
+    }
+
+
+def build_hierarchical_file_report(
+    file_name: str, records: List[str], structure: Dict[str, Any], syntax_errors: int
+) -> Dict[str, Any]:
+    """
+    Build hierarchical JSON for UI:
+    file -> cash_letters -> bundles -> items (25/31) -> addenda/images.
+    """
+    report: Dict[str, Any] = {
+        "filename": file_name,
+        "is_valid": structure.get("is_valid", False) and syntax_errors == 0,
+        "syntax_errors": syntax_errors,
+        "structure_summary": {
+            "header_ok": structure.get("header_ok", False),
+            "orphan_26_count": structure.get("orphan_26_count", 0),
+            "missing_26_after_25_count": structure.get("missing_26_after_25_count", 0),
+            "critical_field_error_count": structure.get("critical_field_error_count", 0),
+            "missing_required_record_types": structure.get("missing_required_record_types", []),
+        },
+        "collection_type_values": structure.get("collection_type_values", []),
+        "issues": structure.get("issues", []),
+        "missing_26_details": structure.get("missing_26_details", []),
+        "file_header_01": None,
+        "cash_letters": [],
+        "orphan_records": [],
+    }
+
+    current_cash_letter = None
+    current_bundle = None
+    current_item = None
+    pending_50_nodes: List[Dict[str, Any]] = []
+
+    def ensure_cash_letter():
+        nonlocal current_cash_letter
+        if current_cash_letter is None:
+            current_cash_letter = {
+                "header_10": None,
+                "bundles": [],
+                "orphan_records": [],
+            }
+            report["cash_letters"].append(current_cash_letter)
+        return current_cash_letter
+
+    def ensure_bundle():
+        nonlocal current_bundle
+        cl = ensure_cash_letter()
+        if current_bundle is None:
+            current_bundle = {
+                "header_20": None,
+                "presentment_items": [],
+                "return_items": [],
+                "trailer_records": [],
+                "orphan_records": [],
+            }
+            cl["bundles"].append(current_bundle)
+        return current_bundle
+
+    def finalize_item():
+        nonlocal current_item
+        nonlocal pending_50_nodes
+        if current_item is None:
+            return
+        for meta_node in pending_50_nodes:
+            current_item["images"]["unpaired_50"].append(meta_node)
+        pending_50_nodes = []
+
+        bundle = ensure_bundle()
+        if current_item["item_record_type"] == "25":
+            bundle["presentment_items"].append(current_item)
+        else:
+            bundle["return_items"].append(current_item)
+        current_item = None
+
+    for idx, line in enumerate(records, start=1):
+        rt = get_record_type(line)
+        node = _record_node_for_ui(line, idx)
+
+        if rt == "01":
+            report["file_header_01"] = node
+            continue
+
+        if rt == "10":
+            finalize_item()
+            current_bundle = None
+            current_cash_letter = {
+                "header_10": node,
+                "bundles": [],
+                "orphan_records": [],
+            }
+            report["cash_letters"].append(current_cash_letter)
+            continue
+
+        if rt == "20":
+            finalize_item()
+            cl = ensure_cash_letter()
+            current_bundle = {
+                "header_20": node,
+                "presentment_items": [],
+                "return_items": [],
+                "trailer_records": [],
+                "orphan_records": [],
+            }
+            cl["bundles"].append(current_bundle)
+            continue
+
+        if rt == "25":
+            finalize_item()
+            current_item = {
+                "item_record_type": "25",
+                "record_25": node,
+                "check_context": _extract_check_context_from_25(line),
+                "addenda": [],
+                "images": {
+                    "pairs_50_52": [],
+                    "analysis_54": [],
+                    "unpaired_50": [],
+                    "orphan_52": [],
+                },
+            }
+            pending_50_nodes = []
+            ensure_bundle()
+            continue
+
+        if rt == "31":
+            finalize_item()
+            current_item = {
+                "item_record_type": "31",
+                "record_31": node,
+                "check_context": _extract_check_context_from_31(line),
+                "addenda": [],
+                "images": {
+                    "pairs_50_52": [],
+                    "analysis_54": [],
+                    "unpaired_50": [],
+                    "orphan_52": [],
+                },
+            }
+            pending_50_nodes = []
+            ensure_bundle()
+            continue
+
+        # Item-level addenda/images
+        if current_item is not None:
+            if current_item["item_record_type"] == "25" and rt in {"26", "28"}:
+                current_item["addenda"].append(node)
+                continue
+            if current_item["item_record_type"] == "31" and rt in {"32", "33", "35"}:
+                current_item["addenda"].append(node)
+                continue
+            if rt == "50":
+                pending_50_nodes.append(node)
+                continue
+            if rt == "52":
+                if pending_50_nodes:
+                    meta = pending_50_nodes.pop(0)
+                    side = _infer_image_side_from_50(line if meta is None else records[meta["line"] - 1])
+                    fmt = _infer_image_format(records[meta["line"] - 1], line)
+                    current_item["images"]["pairs_50_52"].append(
+                        {
+                            "record_50": meta,
+                            "record_52": node,
+                            "image_side": side,
+                            "image_format": fmt,
+                        }
+                    )
+                else:
+                    current_item["images"]["orphan_52"].append(node)
+                continue
+            if rt == "54":
+                current_item["images"]["analysis_54"].append(node)
+                continue
+
+        # Bundle-level trailers / unscoped records.
+        if rt in {"50", "52", "54"}:
+            ensure_bundle()["orphan_records"].append(node)
+        elif rt in {"61", "62", "70", "90", "99"}:
+            ensure_bundle()["trailer_records"].append(node)
+        elif rt in {"26", "28", "32", "33", "35"}:
+            ensure_bundle()["orphan_records"].append(node)
+        else:
+            report["orphan_records"].append(node)
+
+    finalize_item()
+    return report
+
+
 def process_x9_files(x937_dir, sample_days, our_aba, config):
     """Main processing function for X9 files."""
     current_time = datetime.now().strftime("%Y%m%d")
@@ -958,6 +1205,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     valid_x9_files = []
     invalid_file_rows = []
     structure_results = []
+    hierarchical_reports = []
     total_record_cnt = 0
     bad_record_cnt = 0
 
@@ -974,6 +1222,26 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     syntax_errors += 1
                     bad_record_cnt += 1
         except Exception as e:
+            unreadable_structure = {
+                "file": os.path.basename(path),
+                "is_valid": False,
+                "header_ok": False,
+                "orphan_26_count": 0,
+                "missing_26_after_25_count": 0,
+                "critical_field_error_count": 0,
+                "missing_required_record_types": list(PRESENTMENT_REQUIRED_TYPES),
+                "collection_type_values": [],
+                "issues": [f"Unable to read file: {e}"],
+                "missing_26_details": [],
+            }
+            hierarchical_reports.append(
+                build_hierarchical_file_report(
+                    file_name=os.path.basename(path),
+                    records=[],
+                    structure=unreadable_structure,
+                    syntax_errors=0,
+                )
+            )
             invalid_file_rows.append(
                 {
                     "filename": os.path.basename(path),
@@ -1002,6 +1270,14 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
 
         structure = validate_x937_file_structure(records, os.path.basename(path))
         structure_results.append(structure)
+        hierarchical_reports.append(
+            build_hierarchical_file_report(
+                file_name=os.path.basename(path),
+                records=records,
+                structure=structure,
+                syntax_errors=syntax_errors,
+            )
+        )
         has_structure_errors = not structure["is_valid"]
         if syntax_errors == 0 and not has_structure_errors:
             valid_x9_files.append(path)
@@ -1075,6 +1351,20 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             index=False,
         )
 
+    hierarchical_report_path = f"x937_hierarchical_report_{current_time}.json"
+    with open(hierarchical_report_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "files_scanned": file_count,
+                "files_valid_for_processing": len(valid_x9_files),
+                "files_invalid": len(invalid_file_rows),
+                "files": hierarchical_reports,
+            },
+            f,
+            indent=2,
+        )
+
     # Convert only valid files
     forward_json_file = f"fw_check_validation_{current_time}.jsonl"
     return_json_file = f"ret_check_validation_{current_time}.jsonl"
@@ -1137,6 +1427,16 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             f"Files failing header sequence: {header_fail_files_pre:,}"
         ),
         "Each X9 file should begin with File Header 01, Cash Letter Header 10, and Bundle Header 20.",
+    )
+
+    log_check(
+        "Hierarchical UI Report Export",
+        "INFO",
+        (
+            f"Hierarchical JSON generated for {len(hierarchical_reports):,} files.\n"
+            f"Path: {hierarchical_report_path}"
+        ),
+        "Use this artifact for UI drill-down: file -> cash letter -> bundle -> item -> record details.",
     )
 
     # 1.1 Data Continuity
