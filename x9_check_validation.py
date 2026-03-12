@@ -431,12 +431,19 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         front_pair_count = current_item["front_pair_count"]
         unknown_side_pair_count = current_item["unknown_side_pair_count"]
         non_tiff_pair_count = current_item["non_tiff_pair_count"]
-
-        for pending in current_item["pending_50"]:
-            add_issue(
-                f"Record 50 at line {pending['line']} has no matching 52 before {reason} "
-                f"(item {item_type} started at line {start_line})"
-            )
+        unmatched_50_count = len(current_item["pending_50"])
+        orphan_52_count = current_item["orphan_52_count"]
+        total_50_count = current_item["total_50_count"]
+        total_52_count = current_item["total_52_count"]
+        check_ref = current_item.get("check_ref", {})
+        check_number = check_ref.get("check_number", "")
+        item_seq = check_ref.get("item_sequence_number", "")
+        ref_label = []
+        if check_number:
+            ref_label.append(f"check_number={check_number}")
+        if item_seq:
+            ref_label.append(f"seq={item_seq}")
+        ref_text = f" ({', '.join(ref_label)})" if ref_label else ""
 
         is_presentment_item = item_type == "25"
         if is_presentment_item:
@@ -445,7 +452,16 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             return_item_count += 1
 
         if pair_count == 0:
-            add_issue(f"Record {item_type} at line {start_line} has no corresponding 50/52 image pair")
+            reasons = ["no corresponding 50/52 image pair"]
+            if unmatched_50_count > 0:
+                reasons.append(f"{unmatched_50_count} RT50 record(s) without RT52")
+            if orphan_52_count > 0:
+                reasons.append(f"{orphan_52_count} RT52 record(s) without RT50")
+            add_issue(
+                f"Image validation failed for item {item_type} at line {start_line}{ref_text}: "
+                + "; ".join(reasons)
+                + f" (RT50={total_50_count}, RT52={total_52_count}, pairs={pair_count})"
+            )
             if is_presentment_item:
                 presentment_items_without_image_pair += 1
             else:
@@ -455,7 +471,8 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             has_front_or_unknown = (front_pair_count + unknown_side_pair_count) > 0
             if not has_front_or_unknown:
                 add_issue(
-                    f"Record {item_type} at line {start_line} has image pairs but no front image indicator"
+                    f"Image validation failed for item {item_type} at line {start_line}{ref_text}: "
+                    f"no front image indicator (RT50={total_50_count}, RT52={total_52_count}, pairs={pair_count})"
                 )
                 if is_presentment_item:
                     presentment_items_without_front_image += 1
@@ -464,7 +481,9 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
 
             if non_tiff_pair_count > 0:
                 add_issue(
-                    f"Record {item_type} at line {start_line} has {non_tiff_pair_count} non-TIFF image pair(s)"
+                    f"Image validation failed for item {item_type} at line {start_line}{ref_text}: "
+                    f"{non_tiff_pair_count} non-TIFF image pair(s)"
+                    + f" (RT50={total_50_count}, RT52={total_52_count}, pairs={pair_count})"
                 )
                 if is_presentment_item:
                     presentment_items_non_tiff += 1
@@ -517,6 +536,7 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         # Start/end item contexts (for image pairing checks).
         if rt == "25":
             finalize_current_item(f"record 25 at line {idx}")
+            check_ctx = _extract_check_context_from_25(line)
             current_item = {
                 "item_type": "25",
                 "start_line": idx,
@@ -525,6 +545,10 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
                 "front_pair_count": 0,
                 "unknown_side_pair_count": 0,
                 "non_tiff_pair_count": 0,
+                "orphan_52_count": 0,
+                "total_50_count": 0,
+                "total_52_count": 0,
+                "check_ref": check_ctx,
             }
             rec25_total += 1
             if open_25_line is not None and not open_25_has_26:
@@ -535,7 +559,6 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
                 )
             open_25_line = idx
             open_25_has_26 = False
-            check_ctx = _extract_check_context_from_25(line)
             open_25_context = {
                 "line_25": idx,
                 "bundle_business_date": current_bundle_business_date,
@@ -554,6 +577,7 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
                 open_25_has_26 = True
         elif rt == "31":
             finalize_current_item(f"record 31 at line {idx}")
+            check_ctx_31 = _extract_check_context_from_31(line)
             current_item = {
                 "item_type": "31",
                 "start_line": idx,
@@ -562,6 +586,10 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
                 "front_pair_count": 0,
                 "unknown_side_pair_count": 0,
                 "non_tiff_pair_count": 0,
+                "orphan_52_count": 0,
+                "total_50_count": 0,
+                "total_52_count": 0,
+                "check_ref": check_ctx_31,
             }
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
@@ -591,18 +619,18 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             if current_item is None:
                 add_issue(f"Record 50 at line {idx} is not associated with a check item (25/31)")
             else:
+                current_item["total_50_count"] += 1
                 current_item["pending_50"].append(
                     {"line": idx, "side": _infer_image_side_from_50(line), "meta_line": line}
                 )
         elif rt == "52":
             if current_item is None:
                 add_issue(f"Record 52 at line {idx} is not associated with a check item (25/31)")
-            elif not current_item["pending_50"]:
-                add_issue(
-                    f"Record 52 at line {idx} has no preceding 50 in item "
-                    f"{current_item['item_type']} started at line {current_item['start_line']}"
-                )
             else:
+                current_item["total_52_count"] += 1
+                if not current_item["pending_50"]:
+                    current_item["orphan_52_count"] += 1
+                    continue
                 meta = current_item["pending_50"].pop(0)
                 current_item["pair_count"] += 1
                 if meta["side"] == "FRONT":
