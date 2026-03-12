@@ -1,5 +1,6 @@
 import configparser
 
+import re
 import folder_tools
 
 
@@ -57,8 +58,28 @@ class Config:
         self.ach_type = conf.get("ach_type", "")
         self.is_folded = conf.getboolean("is_folded", True)
 
-        # Bank ABA for Retail ODFI indicator:
-        # If `grep '^5' *.ACH | cut -c41-50` matches this ABA (9 digits; or first 8 digits),
+        # Bank ABA(s) for Retail ODFI indicator:
+        # If `grep '^5' *.ACH | cut -c41-50` matches any configured ABA (9 digits; or first 8 digits),
         # we classify the dataset as "Retail ODFI".
+        #
+        # Backwards compatible:
+        # - `aba_number = 123456789`
+        # Also supports multiple (comma/space separated):
+        # - `aba_number = 123456789, 021000021`
         self.aba_number = conf.get("aba_number", "").strip()
+        aba_raw = self.aba_number
+        # split on commas/whitespace; keep digits only per token
+        tokens = [t for t in re.split(r"[,\s]+", aba_raw) if t]
+        aba_numbers = []
+        for t in tokens:
+            digits = re.sub(r"\D", "", t)
+            if digits:
+                aba_numbers.append(digits)
+        # de-duplicate preserving order
+        seen = set()
+        self.aba_numbers = []
+        for aba in aba_numbers:
+            if aba not in seen:
+                seen.add(aba)
+                self.aba_numbers.append(aba)
 

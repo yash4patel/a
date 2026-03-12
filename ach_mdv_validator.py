@@ -40,6 +40,10 @@ class ACHMDVValidator:
         self.type5_pos41_50_match_files = set()
         self.type5_pos41_50_match_values = {}
         self.type5_pos41_50_match_samples = []
+        # Per-ABA breakdown (supports multiple ABAs)
+        self.type5_pos41_50_match_records_by_aba = {}
+        self.type5_pos41_50_match_files_by_aba = {}
+        self.type5_pos41_50_match_values_by_aba = {}
 
         self.problem_line_counter = 0
         self.badlines = []
@@ -66,17 +70,34 @@ class ACHMDVValidator:
             self.logger.warning(f"Error checking if file is binary {filepath}: {e}")
             return True
 
-    def _matches_bank_aba(self, field_41_50: str) -> bool:
+    def _bank_abas(self):
         """
-        True if the numeric content of Type-5 positions 41-50 matches the configured ABA.
+        Return configured bank ABA(s) as digit strings.
+        Backwards compatible with `config.aba_number` and supports `config.aba_numbers` list.
+        """
+        abas = getattr(self.config, "aba_numbers", None)
+        if isinstance(abas, list) and abas:
+            return abas
+        single = re.sub(r"\D", "", getattr(self.config, "aba_number", "") or "")
+        return [single] if single else []
+
+    def _matching_bank_abas(self, field_41_50: str):
+        """
+        Return list of bank ABA(s) that match the numeric content of Type-5 positions 41-50.
         We treat an 8-digit match (ABA without check digit) as a match too.
         """
-        aba_digits = re.sub(r"\D", "", getattr(self.config, "aba_number", "") or "")
         field_digits = re.sub(r"\D", "", field_41_50 or "")
-        if not aba_digits or not field_digits:
-            return False
-        aba_8 = aba_digits[:8] if len(aba_digits) >= 8 else aba_digits
-        return field_digits == aba_digits or field_digits == aba_8
+        if not field_digits:
+            return []
+
+        matches = []
+        for aba in self._bank_abas():
+            if not aba:
+                continue
+            aba_8 = aba[:8] if len(aba) >= 8 else aba
+            if field_digits == aba or field_digits == aba_8:
+                matches.append(aba)
+        return matches
 
     def test_seven_record_test(self, sec_code, seven_record_list):
         if sec_code == "IAT":
@@ -132,10 +153,11 @@ class ACHMDVValidator:
                 f"Starting validation of {total_files} files from {self.config.data_path}"
             )
 
-            if getattr(self.config, "aba_number", ""):
+            bank_abas = self._bank_abas()
+            if bank_abas:
                 self.logger.info(
                     "Retail ODFI indicator enabled "
-                    f"(bank ABA={self.config.aba_number}); scanning Type-5 records using "
+                    f"(bank ABA(s)={', '.join(bank_abas)}); scanning Type-5 records using "
                     "`grep '^5' | cut -c41-50` (positions 41-50)."
                 )
 
@@ -260,10 +282,13 @@ class ACHMDVValidator:
                                 f"[Bad SEC] File={fname} Line={file_line} SEC={sec_code}"
                             )
 
-                        # Retail ODFI indicator (classification): Type-5 pos 41-50 matches bank ABA.
-                        if getattr(self.config, "aba_number", "") and len(line) >= 50:
+                        # Retail ODFI indicator (classification): Type-5 pos 41-50 matches any configured bank ABA.
+                        if self._bank_abas() and len(line) >= 50:
                             field_41_50 = line[40:50]  # cut -c41-50
-                            if self._matches_bank_aba(field_41_50):
+                            matching_abas = self._matching_bank_abas(field_41_50)
+
+                            if matching_abas:
+                                # Overall (count each record once even if multiple ABAs match)
                                 self.type5_pos41_50_match_records += 1
                                 self.type5_pos41_50_match_files.add(fname)
                                 self.type5_pos41_50_match_values[field_41_50] = (
@@ -273,6 +298,19 @@ class ACHMDVValidator:
                                 if len(self.type5_pos41_50_match_samples) < 50:
                                     self.type5_pos41_50_match_samples.append(
                                         (fname, file_line, field_41_50)
+                                    )
+
+                                # Per-ABA breakdown
+                                for aba in matching_abas:
+                                    self.type5_pos41_50_match_records_by_aba[aba] = (
+                                        self.type5_pos41_50_match_records_by_aba.get(aba, 0)
+                                        + 1
+                                    )
+                                    self.type5_pos41_50_match_files_by_aba.setdefault(aba, set()).add(fname)
+                                    self.type5_pos41_50_match_values_by_aba.setdefault(aba, {})
+                                    self.type5_pos41_50_match_values_by_aba[aba][field_41_50] = (
+                                        self.type5_pos41_50_match_values_by_aba[aba].get(field_41_50, 0)
+                                        + 1
                                     )
 
                         seven_record_list = []
@@ -383,21 +421,29 @@ class ACHMDVValidator:
             self.logger.info("")
 
         # Retail ODFI indicator summary (classification)
-        if getattr(self.config, "aba_number", ""):
+        bank_abas = self._bank_abas()
+        if bank_abas:
             total_type5 = self.type5_total_records
             match_type5 = self.type5_pos41_50_match_records
             pct = (100.0 * match_type5 / total_type5) if total_type5 else 0.0
             files_with_match = len(self.type5_pos41_50_match_files)
 
             self.logger.info("")
-            self.logger.info("Retail ODFI Indicator Summary (Type-5 pos 41-50 vs bank ABA)")
+            self.logger.info("Retail ODFI Indicator Summary (Type-5 pos 41-50 vs bank ABA(s))")
             self.logger.info("-" * 70)
-            self.logger.info(f"Bank ABA parameter: {self.config.aba_number}")
+            self.logger.info(f"Bank ABA parameter(s): {', '.join(bank_abas)}")
             self.logger.info(f"Type-5 records scanned: {total_type5}")
             self.logger.info(
                 f"Type-5 pos 41-50 matches: {match_type5} ({pct:.2f}%)"
             )
             self.logger.info(f"Files with ≥1 matching Type-5: {files_with_match}")
+            if self.type5_pos41_50_match_records_by_aba:
+                self.logger.info("Per-ABA match breakdown:")
+                for aba in bank_abas:
+                    c = self.type5_pos41_50_match_records_by_aba.get(aba, 0)
+                    p = (100.0 * c / total_type5) if total_type5 else 0.0
+                    fcnt = len(self.type5_pos41_50_match_files_by_aba.get(aba, set()))
+                    self.logger.info(f"  - ABA={aba}: {c} matches ({p:.2f}%), files={fcnt}")
             if self.type5_pos41_50_match_values:
                 top = sorted(
                     self.type5_pos41_50_match_values.items(),
@@ -504,7 +550,7 @@ class ACHMDVValidator:
         self.logger.info(
             f"  Skipped binary/encrypted files: {len(self.skipped_binary_files)}"
         )
-        if getattr(self.config, "aba_number", ""):
+        if bank_abas:
             total_type5 = self.type5_total_records
             match_type5 = self.type5_pos41_50_match_records
             pct = (100.0 * match_type5 / total_type5) if total_type5 else 0.0
