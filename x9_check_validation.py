@@ -400,6 +400,7 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
                 "bundle_sequence_number": open_25_context["bundle_sequence_number"],
                 "cash_letter_business_date": open_25_context["cash_letter_business_date"],
                 "cash_letter_id": open_25_context["cash_letter_id"],
+                "unique_check_id": open_25_context["unique_check_id"],
                 "check_number": open_25_context["check_number"],
                 "payer_account": open_25_context["payer_account"],
                 "on_us": open_25_context["on_us"],
@@ -436,9 +437,12 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         total_50_count = current_item["total_50_count"]
         total_52_count = current_item["total_52_count"]
         check_ref = current_item.get("check_ref", {})
+        unique_check_id = check_ref.get("unique_check_id", "")
         check_number = check_ref.get("check_number", "")
         item_seq = check_ref.get("item_sequence_number", "")
         ref_label = []
+        if unique_check_id:
+            ref_label.append(f"id={unique_check_id}")
         if check_number:
             ref_label.append(f"check_number={check_number}")
         if item_seq:
@@ -537,6 +541,16 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         if rt == "25":
             finalize_current_item(f"record 25 at line {idx}")
             check_ctx = _extract_check_context_from_25(line)
+            check_ctx["unique_check_id"] = build_unique_check_id(
+                file_name=file_name,
+                item_type="25",
+                line_number=idx,
+                bundle_business_date=current_bundle_business_date,
+                bundle_id=current_bundle_id,
+                bundle_sequence_number=current_bundle_sequence_number,
+                item_sequence_number=check_ctx.get("item_sequence_number", ""),
+                check_number=check_ctx.get("check_number", ""),
+            )
             current_item = {
                 "item_type": "25",
                 "start_line": idx,
@@ -578,6 +592,16 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         elif rt == "31":
             finalize_current_item(f"record 31 at line {idx}")
             check_ctx_31 = _extract_check_context_from_31(line)
+            check_ctx_31["unique_check_id"] = build_unique_check_id(
+                file_name=file_name,
+                item_type="31",
+                line_number=idx,
+                bundle_business_date=current_bundle_business_date,
+                bundle_id=current_bundle_id,
+                bundle_sequence_number=current_bundle_sequence_number,
+                item_sequence_number=check_ctx_31.get("item_sequence_number", ""),
+                check_number=check_ctx_31.get("check_number", ""),
+            )
             current_item = {
                 "item_type": "31",
                 "start_line": idx,
@@ -948,6 +972,30 @@ def _extract_check_context_from_31(line: str) -> Dict[str, str]:
     }
 
 
+def build_unique_check_id(
+    file_name: str,
+    item_type: str,
+    line_number: int,
+    bundle_business_date: str = "",
+    bundle_id: str = "",
+    bundle_sequence_number: str = "",
+    item_sequence_number: str = "",
+    check_number: str = "",
+) -> str:
+    """Build stable per-item unique identifier for customer-facing reports."""
+    parts = [
+        os.path.basename(file_name or ""),
+        item_type or "",
+        bundle_business_date or "",
+        bundle_id or "",
+        bundle_sequence_number or "",
+        item_sequence_number or "",
+        check_number or "",
+        str(line_number),
+    ]
+    return "|".join(parts)
+
+
 def _record_fields_for_ui(line: str) -> Dict[str, Any]:
     """Convert one X9 line into compact, UI-friendly field payload."""
     rt = get_record_type(line)
@@ -1099,10 +1147,29 @@ def build_hierarchical_file_report(
 
         if rt == "25":
             finalize_item()
+            check_ctx = _extract_check_context_from_25(line)
+            bundle_business_date = ""
+            bundle_id = ""
+            bundle_sequence_number = ""
+            if current_bundle and current_bundle.get("header_20"):
+                h20 = current_bundle["header_20"]["fields"]
+                bundle_business_date = str(h20.get("bundle_business_date", ""))
+                bundle_id = str(h20.get("bundle_id", ""))
+                bundle_sequence_number = str(h20.get("bundle_sequence_number", ""))
+            check_ctx["unique_check_id"] = build_unique_check_id(
+                file_name=file_name,
+                item_type="25",
+                line_number=idx,
+                bundle_business_date=bundle_business_date,
+                bundle_id=bundle_id,
+                bundle_sequence_number=bundle_sequence_number,
+                item_sequence_number=check_ctx.get("item_sequence_number", ""),
+                check_number=check_ctx.get("check_number", ""),
+            )
             current_item = {
                 "item_record_type": "25",
                 "record_25": node,
-                "check_context": _extract_check_context_from_25(line),
+                "check_context": check_ctx,
                 "addenda": [],
                 "images": {
                     "pairs_50_52": [],
@@ -1117,10 +1184,29 @@ def build_hierarchical_file_report(
 
         if rt == "31":
             finalize_item()
+            check_ctx_31 = _extract_check_context_from_31(line)
+            bundle_business_date = ""
+            bundle_id = ""
+            bundle_sequence_number = ""
+            if current_bundle and current_bundle.get("header_20"):
+                h20 = current_bundle["header_20"]["fields"]
+                bundle_business_date = str(h20.get("bundle_business_date", ""))
+                bundle_id = str(h20.get("bundle_id", ""))
+                bundle_sequence_number = str(h20.get("bundle_sequence_number", ""))
+            check_ctx_31["unique_check_id"] = build_unique_check_id(
+                file_name=file_name,
+                item_type="31",
+                line_number=idx,
+                bundle_business_date=bundle_business_date,
+                bundle_id=bundle_id,
+                bundle_sequence_number=bundle_sequence_number,
+                item_sequence_number=check_ctx_31.get("item_sequence_number", ""),
+                check_number=check_ctx_31.get("check_number", ""),
+            )
             current_item = {
                 "item_record_type": "31",
                 "record_31": node,
-                "check_context": _extract_check_context_from_31(line),
+                "check_context": check_ctx_31,
                 "addenda": [],
                 "images": {
                     "pairs_50_52": [],
@@ -1373,7 +1459,25 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         missing_26_rows.extend(result.get("missing_26_details", []))
     if missing_26_rows:
         missing_26_detail_report = f"missing_26_detail_{current_time}.tsv"
-        pd.DataFrame(missing_26_rows).to_csv(
+        missing_26_columns = [
+            "filename",
+            "unique_check_id",
+            "line_25",
+            "bundle_business_date",
+            "bundle_id",
+            "bundle_sequence_number",
+            "cash_letter_business_date",
+            "cash_letter_id",
+            "check_number",
+            "payer_account",
+            "on_us",
+            "aux_on_us",
+            "item_sequence_number",
+            "boundary_record_type",
+            "boundary_line",
+            "reason",
+        ]
+        pd.DataFrame(missing_26_rows)[missing_26_columns].to_csv(
             missing_26_detail_report,
             sep="\t",
             index=False,
@@ -1590,7 +1694,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         for item in result.get("missing_26_details", []):
             missing_26_examples.append(
                 (
-                    f"{item['filename']}: line25={item['line_25']}, bundle={item['bundle_id']}, "
+                    f"{item['filename']}: id={item.get('unique_check_id', '')}, line25={item['line_25']}, bundle={item['bundle_id']}, "
                     f"bundle_date={item['bundle_business_date']}, check_number={item['check_number']}, "
                     f"reason={item['reason']}"
                 )
