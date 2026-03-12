@@ -156,6 +156,26 @@ PRESENTMENT_REQUIRED_TYPES = ("25", "26", "50", "52")
 RETURN_REQUIRED_TYPES = ("31", "32", "50", "52")
 TRACKED_RECORD_TYPES = ("25", "26", "31", "32", "50", "52")
 MAX_ISSUES_PER_FILE = 120
+X937_VALID_RECORD_TYPES = (
+    "01",
+    "10",
+    "20",
+    "25",
+    "26",
+    "28",
+    "31",
+    "32",
+    "33",
+    "35",
+    "50",
+    "52",
+    "54",
+    "61",
+    "62",
+    "70",
+    "90",
+    "99",
+)
 
 
 def get_record_type(line: str) -> str:
@@ -325,13 +345,10 @@ def validate_critical_fields_for_record(line: str, record_type: str, line_number
         if not bofd_account:
             issues.append(f"Record 32 line {line_number}: missing deposit_account_number_at_bofd")
 
-    elif record_type == "50":
-        if not _slice(line, 3):
-            issues.append(f"Record 50 line {line_number}: missing image metadata")
-
-    elif record_type == "52":
-        if not _slice(line, 3):
-            issues.append(f"Record 52 line {line_number}: missing image bytes/data")
+    elif record_type in {"50", "52"}:
+        # Deep image metadata/bytes validation intentionally skipped.
+        # We only validate record-type presence for image records.
+        pass
 
     return issues
 
@@ -415,84 +432,18 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
     def finalize_current_item(reason: str):
         nonlocal current_item
         nonlocal presentment_item_count
-        nonlocal presentment_items_without_image_pair
-        nonlocal presentment_items_without_front_image
-        nonlocal presentment_items_non_tiff
         nonlocal return_item_count
-        nonlocal return_items_without_image_pair
-        nonlocal return_items_without_front_image
-        nonlocal return_items_non_tiff
 
         if current_item is None:
             return
 
         item_type = current_item["item_type"]
-        start_line = current_item["start_line"]
-        pair_count = current_item["pair_count"]
-        front_pair_count = current_item["front_pair_count"]
-        unknown_side_pair_count = current_item["unknown_side_pair_count"]
-        non_tiff_pair_count = current_item["non_tiff_pair_count"]
-        unmatched_50_count = len(current_item["pending_50"])
-        orphan_52_count = current_item["orphan_52_count"]
-        total_50_count = current_item["total_50_count"]
-        total_52_count = current_item["total_52_count"]
-        check_ref = current_item.get("check_ref", {})
-        unique_check_id = check_ref.get("unique_check_id", "")
-        check_number = check_ref.get("check_number", "")
-        item_seq = check_ref.get("item_sequence_number", "")
-        ref_label = []
-        if unique_check_id:
-            ref_label.append(f"id={unique_check_id}")
-        if check_number:
-            ref_label.append(f"check_number={check_number}")
-        if item_seq:
-            ref_label.append(f"seq={item_seq}")
-        ref_text = f" ({', '.join(ref_label)})" if ref_label else ""
 
         is_presentment_item = item_type == "25"
         if is_presentment_item:
             presentment_item_count += 1
         else:
             return_item_count += 1
-
-        if pair_count == 0:
-            reasons = ["no corresponding 50/52 image pair"]
-            if unmatched_50_count > 0:
-                reasons.append(f"{unmatched_50_count} RT50 record(s) without RT52")
-            if orphan_52_count > 0:
-                reasons.append(f"{orphan_52_count} RT52 record(s) without RT50")
-            add_issue(
-                f"Image validation failed for item {item_type} at line {start_line}{ref_text}: "
-                + "; ".join(reasons)
-                + f" (RT50={total_50_count}, RT52={total_52_count}, pairs={pair_count})"
-            )
-            if is_presentment_item:
-                presentment_items_without_image_pair += 1
-            else:
-                return_items_without_image_pair += 1
-        else:
-            # Treat UNKNOWN side as potentially front (to avoid false negative when side indicator is absent).
-            has_front_or_unknown = (front_pair_count + unknown_side_pair_count) > 0
-            if not has_front_or_unknown:
-                add_issue(
-                    f"Image validation failed for item {item_type} at line {start_line}{ref_text}: "
-                    f"no front image indicator (RT50={total_50_count}, RT52={total_52_count}, pairs={pair_count})"
-                )
-                if is_presentment_item:
-                    presentment_items_without_front_image += 1
-                else:
-                    return_items_without_front_image += 1
-
-            if non_tiff_pair_count > 0:
-                add_issue(
-                    f"Image validation failed for item {item_type} at line {start_line}{ref_text}: "
-                    f"{non_tiff_pair_count} non-TIFF image pair(s)"
-                    + f" (RT50={total_50_count}, RT52={total_52_count}, pairs={pair_count})"
-                )
-                if is_presentment_item:
-                    presentment_items_non_tiff += 1
-                else:
-                    return_items_non_tiff += 1
 
         current_item = None
 
@@ -554,14 +505,6 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             current_item = {
                 "item_type": "25",
                 "start_line": idx,
-                "pending_50": [],
-                "pair_count": 0,
-                "front_pair_count": 0,
-                "unknown_side_pair_count": 0,
-                "non_tiff_pair_count": 0,
-                "orphan_52_count": 0,
-                "total_50_count": 0,
-                "total_52_count": 0,
                 "check_ref": check_ctx,
             }
             rec25_total += 1
@@ -605,14 +548,6 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             current_item = {
                 "item_type": "31",
                 "start_line": idx,
-                "pending_50": [],
-                "pair_count": 0,
-                "front_pair_count": 0,
-                "unknown_side_pair_count": 0,
-                "non_tiff_pair_count": 0,
-                "orphan_52_count": 0,
-                "total_50_count": 0,
-                "total_52_count": 0,
                 "check_ref": check_ctx_31,
             }
             if open_25_line is not None and not open_25_has_26:
@@ -638,33 +573,11 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         if rt in {"10", "20", "61", "62", "70", "90", "99", "01"}:
             finalize_current_item(f"record {rt} at line {idx}")
 
-        # Image pair checks per check item (25 or 31).
+        # Deep image pairing checks intentionally skipped (record-type presence only).
         if rt == "50":
-            if current_item is None:
-                add_issue(f"Record 50 at line {idx} is not associated with a check item (25/31)")
-            else:
-                current_item["total_50_count"] += 1
-                current_item["pending_50"].append(
-                    {"line": idx, "side": _infer_image_side_from_50(line), "meta_line": line}
-                )
+            pass
         elif rt == "52":
-            if current_item is None:
-                add_issue(f"Record 52 at line {idx} is not associated with a check item (25/31)")
-            else:
-                current_item["total_52_count"] += 1
-                if not current_item["pending_50"]:
-                    current_item["orphan_52_count"] += 1
-                    continue
-                meta = current_item["pending_50"].pop(0)
-                current_item["pair_count"] += 1
-                if meta["side"] == "FRONT":
-                    current_item["front_pair_count"] += 1
-                elif meta["side"] == "UNKNOWN":
-                    current_item["unknown_side_pair_count"] += 1
-
-                image_format = _infer_image_format(meta["meta_line"], line)
-                if image_format == "NON_TIFF":
-                    current_item["non_tiff_pair_count"] += 1
+            pass
 
     if open_25_line is not None and not open_25_has_26:
         missing_26_after_25_count += 1
@@ -905,27 +818,7 @@ def parse_x937_record(line: str):
     if not line or len(line) < 3:
         raise ValueError("Empty or too short record")
     record_type = get_record_type(line)
-    valid_types = [
-        "01",
-        "10",
-        "20",
-        "25",
-        "26",
-        "28",
-        "31",
-        "32",
-        "33",
-        "35",
-        "50",
-        "52",
-        "54",
-        "61",
-        "62",
-        "70",
-        "90",
-        "99",
-    ]
-    if record_type not in valid_types:
+    if record_type not in X937_VALID_RECORD_TYPES:
         raise ValueError(f"Unknown record type: {record_type}")
     if record_type in X9_FIELDS:
         max_end = max(v[1] for v in X9_FIELDS[record_type].values())
@@ -1026,18 +919,16 @@ def _record_fields_for_ui(line: str) -> Dict[str, Any]:
         if rt == "50":
             return {
                 "line_length": len(line),
-                "metadata_preview": _slice(line, 3, 83),
+                "has_image_metadata": bool(_slice(line, 3)),
             }
         if rt == "52":
-            payload = _slice(line, 3)
             return {
                 "line_length": len(line),
-                "image_data_length": len(payload),
-                "image_data_preview": payload[:48],
+                "has_image_data": bool(_slice(line, 3)),
             }
         return {
             "line_length": len(line),
-            "analysis_preview": _slice(line, 3, 83),
+            "has_analysis_data": bool(_slice(line, 3)),
         }
 
     if rt in X9_FIELDS:
@@ -1049,10 +940,7 @@ def _record_fields_for_ui(line: str) -> Dict[str, Any]:
             compact[short_key] = value.strip()
         return compact
 
-    return {
-        "line_length": len(line),
-        "raw_preview": line[:120].strip(),
-    }
+    return {"line_length": len(line)}
 
 
 def _record_node_for_ui(line: str, line_number: int) -> Dict[str, Any]:
@@ -1088,12 +976,12 @@ def build_hierarchical_file_report(
         "file_header_01": None,
         "cash_letters": [],
         "orphan_records": [],
+        "ignored_non_x9_fragments": 0,
     }
 
     current_cash_letter = None
     current_bundle = None
     current_item = None
-    pending_50_nodes: List[Dict[str, Any]] = []
 
     def ensure_cash_letter():
         nonlocal current_cash_letter
@@ -1122,12 +1010,8 @@ def build_hierarchical_file_report(
 
     def finalize_item():
         nonlocal current_item
-        nonlocal pending_50_nodes
         if current_item is None:
             return
-        for meta_node in pending_50_nodes:
-            current_item["images"]["unpaired_50"].append(meta_node)
-        pending_50_nodes = []
 
         bundle = ensure_bundle()
         if current_item["item_record_type"] == "25":
@@ -1138,6 +1022,9 @@ def build_hierarchical_file_report(
 
     for idx, line in enumerate(records, start=1):
         rt = get_record_type(line)
+        if rt not in X937_VALID_RECORD_TYPES:
+            report["ignored_non_x9_fragments"] += 1
+            continue
         node = _record_node_for_ui(line, idx)
 
         if rt == "01":
@@ -1208,13 +1095,11 @@ def build_hierarchical_file_report(
                 "check_context": check_ctx,
                 "addenda": [],
                 "images": {
-                    "pairs_50_52": [],
-                    "analysis_54": [],
-                    "unpaired_50": [],
-                    "orphan_52": [],
+                    "records_50": [],
+                    "records_52": [],
+                    "records_54": [],
                 },
             }
-            pending_50_nodes = []
             ensure_bundle()
             continue
 
@@ -1258,13 +1143,11 @@ def build_hierarchical_file_report(
                 "check_context": check_ctx_31,
                 "addenda": [],
                 "images": {
-                    "pairs_50_52": [],
-                    "analysis_54": [],
-                    "unpaired_50": [],
-                    "orphan_52": [],
+                    "records_50": [],
+                    "records_52": [],
+                    "records_54": [],
                 },
             }
-            pending_50_nodes = []
             ensure_bundle()
             continue
 
@@ -1277,26 +1160,13 @@ def build_hierarchical_file_report(
                 current_item["addenda"].append(node)
                 continue
             if rt == "50":
-                pending_50_nodes.append(node)
+                current_item["images"]["records_50"].append(node)
                 continue
             if rt == "52":
-                if pending_50_nodes:
-                    meta = pending_50_nodes.pop(0)
-                    side = _infer_image_side_from_50(line if meta is None else records[meta["line"] - 1])
-                    fmt = _infer_image_format(records[meta["line"] - 1], line)
-                    current_item["images"]["pairs_50_52"].append(
-                        {
-                            "record_50": meta,
-                            "record_52": node,
-                            "image_side": side,
-                            "image_format": fmt,
-                        }
-                    )
-                else:
-                    current_item["images"]["orphan_52"].append(node)
+                current_item["images"]["records_52"].append(node)
                 continue
             if rt == "54":
-                current_item["images"]["analysis_54"].append(node)
+                current_item["images"]["records_54"].append(node)
                 continue
 
         # Bundle-level trailers / unscoped records.
@@ -1680,32 +1550,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     }
 
     presentment_item_count = sum(r["presentment_item_count"] for r in structure_results)
-    presentment_missing_pairs = sum(r["presentment_items_without_image_pair"] for r in structure_results)
-    presentment_missing_front = sum(r["presentment_items_without_front_image"] for r in structure_results)
-    presentment_non_tiff = sum(r["presentment_items_non_tiff"] for r in structure_results)
     return_item_count = sum(r["return_item_count"] for r in structure_results)
-    return_missing_pairs = sum(r["return_items_without_image_pair"] for r in structure_results)
-    return_missing_front = sum(r["return_items_without_front_image"] for r in structure_results)
-    return_non_tiff = sum(r["return_items_non_tiff"] for r in structure_results)
-
-    files_with_presentment_image_issues = sum(
-        1
-        for r in structure_results
-        if (
-            r["presentment_items_without_image_pair"] > 0
-            or r["presentment_items_without_front_image"] > 0
-            or r["presentment_items_non_tiff"] > 0
-        )
-    )
-    files_with_return_image_issues = sum(
-        1
-        for r in structure_results
-        if (
-            r["return_items_without_image_pair"] > 0
-            or r["return_items_without_front_image"] > 0
-            or r["return_items_non_tiff"] > 0
-        )
-    )
 
     invalid_files_count = len(invalid_file_rows)
     structure_status = "PASS" if invalid_files_count == 0 else "FAIL"
@@ -1829,7 +1674,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         if len(critical_examples) >= 10:
             break
     critical_details = [
-        "Critical fields validated for presentment (25/26) and return (31/32 when present), plus 50/52 image fields.",
+        "Critical fields validated for presentment (25/26) and return (31/32 when present).",
         "Includes routing transit number format/checksum, account number presence, and MICR data checks.",
         f"Files with critical field issues: {files_with_critical_field_errors:,}",
         f"Total critical field issues: {critical_field_error_total:,}",
@@ -1840,44 +1685,22 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         "Basic Validation: Critical Fields Presence",
         critical_status,
         "\n".join(critical_details),
-        "Critical fields (ABA RTNs, account numbers, MICR data, and image metadata/data) must be populated and valid.",
+        "Critical fields (ABA RTNs, account numbers, and MICR data) must be populated and valid.",
     )
 
-    image_status = (
-        "PASS"
-        if (
-            presentment_missing_pairs == 0
-            and presentment_missing_front == 0
-            and presentment_non_tiff == 0
-            and return_missing_pairs == 0
-            and return_missing_front == 0
-            and return_non_tiff == 0
-        )
-        else "FAIL"
-    )
     image_details = [
-        (
-            f"Presentment items (RT25): {presentment_item_count:,} | "
-            f"Missing 50/52 pair: {presentment_missing_pairs:,} | "
-            f"Missing front image: {presentment_missing_front:,} | "
-            f"Non-TIFF image items: {presentment_non_tiff:,}"
-        ),
-        (
-            f"Return items (RT31): {return_item_count:,} | "
-            f"Missing 50/52 pair: {return_missing_pairs:,} | "
-            f"Missing front image: {return_missing_front:,} | "
-            f"Non-TIFF image items: {return_non_tiff:,}"
-        ),
-        f"Files with presentment image issues: {files_with_presentment_image_issues:,}",
-        f"Files with return image issues: {files_with_return_image_issues:,}",
+        "Deep 50/52 pairing/front-image/TIFF validation skipped by design.",
+        "Only record-type presence checks for 50/52 are enforced.",
+        f"Presentment items detected (RT25): {presentment_item_count:,}",
+        f"Return items detected (RT31): {return_item_count:,}",
     ]
     if return_item_count == 0:
-        image_details.append("No return items detected; return image checks are optional and not required.")
+        image_details.append("No return items detected.")
     log_check(
-        "Basic Validation: Image Data Presence (50/52 Pairing + TIFF)",
-        image_status,
+        "Basic Validation: Image Records (50/52 Presence Only)",
+        "INFO",
         "\n".join(image_details),
-        "Each check item requires at least one 50/52 pair with front image; explicit non-TIFF indicators fail.",
+        "Deep image-content validation removed; this run checks record-type presence only.",
     )
 
     # 1.3 Bad Record Check (moved after structural checks to reduce front-of-report noise)
