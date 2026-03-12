@@ -996,6 +996,29 @@ def build_unique_check_id(
     return "|".join(parts)
 
 
+def build_unique_check_components(
+    file_name: str,
+    item_type: str,
+    bundle_business_date: str = "",
+    bundle_id: str = "",
+    bundle_sequence_number: str = "",
+    item_sequence_number: str = "",
+    check_number: str = "",
+    line_number: int = 0,
+) -> Dict[str, Any]:
+    """Return explicit unique-check key fields for UI/JSON consumption."""
+    return {
+        "filename": os.path.basename(file_name or ""),
+        "item_type": item_type or "",
+        "bundle_business_date": bundle_business_date or "",
+        "bundle_id": bundle_id or "",
+        "bundle_sequence_number": bundle_sequence_number or "",
+        "item_sequence_number": item_sequence_number or "",
+        "check_number": check_number or "",
+        "line_number": int(line_number or 0),
+    }
+
+
 def _record_fields_for_ui(line: str) -> Dict[str, Any]:
     """Convert one X9 line into compact, UI-friendly field payload."""
     rt = get_record_type(line)
@@ -1156,6 +1179,16 @@ def build_hierarchical_file_report(
                 bundle_business_date = str(h20.get("bundle_business_date", ""))
                 bundle_id = str(h20.get("bundle_id", ""))
                 bundle_sequence_number = str(h20.get("bundle_sequence_number", ""))
+            unique_components = build_unique_check_components(
+                file_name=file_name,
+                item_type="25",
+                bundle_business_date=bundle_business_date,
+                bundle_id=bundle_id,
+                bundle_sequence_number=bundle_sequence_number,
+                item_sequence_number=check_ctx.get("item_sequence_number", ""),
+                check_number=check_ctx.get("check_number", ""),
+                line_number=idx,
+            )
             check_ctx["unique_check_id"] = build_unique_check_id(
                 file_name=file_name,
                 item_type="25",
@@ -1166,8 +1199,11 @@ def build_hierarchical_file_report(
                 item_sequence_number=check_ctx.get("item_sequence_number", ""),
                 check_number=check_ctx.get("check_number", ""),
             )
+            check_ctx["unique_check_components"] = unique_components
             current_item = {
                 "item_record_type": "25",
+                "unique_check_id": check_ctx["unique_check_id"],
+                "unique_check_components": unique_components,
                 "record_25": node,
                 "check_context": check_ctx,
                 "addenda": [],
@@ -1193,6 +1229,16 @@ def build_hierarchical_file_report(
                 bundle_business_date = str(h20.get("bundle_business_date", ""))
                 bundle_id = str(h20.get("bundle_id", ""))
                 bundle_sequence_number = str(h20.get("bundle_sequence_number", ""))
+            unique_components = build_unique_check_components(
+                file_name=file_name,
+                item_type="31",
+                bundle_business_date=bundle_business_date,
+                bundle_id=bundle_id,
+                bundle_sequence_number=bundle_sequence_number,
+                item_sequence_number=check_ctx_31.get("item_sequence_number", ""),
+                check_number=check_ctx_31.get("check_number", ""),
+                line_number=idx,
+            )
             check_ctx_31["unique_check_id"] = build_unique_check_id(
                 file_name=file_name,
                 item_type="31",
@@ -1203,8 +1249,11 @@ def build_hierarchical_file_report(
                 item_sequence_number=check_ctx_31.get("item_sequence_number", ""),
                 check_number=check_ctx_31.get("check_number", ""),
             )
+            check_ctx_31["unique_check_components"] = unique_components
             current_item = {
                 "item_record_type": "31",
+                "unique_check_id": check_ctx_31["unique_check_id"],
+                "unique_check_components": unique_components,
                 "record_31": node,
                 "check_context": check_ctx_31,
                 "addenda": [],
