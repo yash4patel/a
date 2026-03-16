@@ -33,6 +33,13 @@ class ACHMDVValidator:
         self.iat_bad_addendum_files = 0
         self.pos_bad_addendum_files = 0
 
+        # Global totals (dataset-level)
+        # - "Batches" corresponds to total Type-5 (Batch Header) records
+        # - "Transactions" corresponds to total Type-6 (Entry Detail) records
+        self.total_batches = 0
+        self.total_transactions = 0
+        self._binary_cache = {}
+
         # Retail ODFI indicator (classification, NOT a validation failure):
         # grep '^5' *.ACH | cut -c41-50  (1-indexed) => line[40:50] (0-indexed)
         self.type5_total_records = 0
@@ -54,21 +61,54 @@ class ACHMDVValidator:
     def _is_binary_file(self, filepath):
         """Check if file appears to be binary or encrypted."""
         try:
+            if filepath in self._binary_cache:
+                return self._binary_cache[filepath]
             with open(filepath, "rb") as f:
                 chunk = f.read(1024)
                 if len(chunk) == 0:
+                    self._binary_cache[filepath] = False
                     return False
 
                 if b"\x00" in chunk:
+                    self._binary_cache[filepath] = True
                     return True
 
                 text_chars = sum(
                     1 for b in chunk if 32 <= b <= 126 or b in (9, 10, 13)
                 )
-                return text_chars / len(chunk) < 0.85
+                is_binary = (text_chars / len(chunk) < 0.85)
+                self._binary_cache[filepath] = is_binary
+                return is_binary
         except Exception as e:
             self.logger.warning(f"Error checking if file is binary {filepath}: {e}")
+            self._binary_cache[filepath] = True
             return True
+
+    def _count_batches_and_transactions(self, fileNames):
+        """
+        Count totals equivalent to:
+          find . -name '*.ACH' -exec grep '^5' {} + | wc -l
+          find . -name '*.ACH' -exec grep '^6' {} + | wc -l
+
+        Uses a lightweight byte-scan and skips binary/encrypted files (same policy as validation).
+        """
+        batches = 0
+        transactions = 0
+        for fname in fileNames:
+            filepath = os.path.join(self.config.data_path, fname)
+            if self._is_binary_file(filepath):
+                continue
+            try:
+                with open(filepath, "rb") as f:
+                    for line_bytes in f:
+                        b0 = line_bytes[:1]
+                        if b0 == b"5":
+                            batches += 1
+                        elif b0 == b"6":
+                            transactions += 1
+            except Exception:
+                continue
+        return batches, transactions
 
     def _bank_abas(self):
         """
@@ -152,6 +192,12 @@ class ACHMDVValidator:
             self.logger.info(
                 f"Starting validation of {total_files} files from {self.config.data_path}"
             )
+
+            # Dataset-level stats requested by customers
+            self.logger.info("Computing total batches (Type-5) and transactions (Type-6)...")
+            self.total_batches, self.total_transactions = self._count_batches_and_transactions(fileNames)
+            self.logger.info(f"Total Number of Batches (Type-5): {self.total_batches}")
+            self.logger.info(f"Total Number of Transactions (Type-6): {self.total_transactions}")
 
             bank_abas = self._bank_abas()
             if bank_abas:
@@ -407,6 +453,11 @@ class ACHMDVValidator:
         self.logger.info("")
         self.logger.info("=== ACH RDV VALIDATION RESULTS ===")
 
+        if self.total_batches or self.total_transactions:
+            self.logger.info("")
+            self.logger.info(f"Total Number of Batches (Type-5): {self.total_batches}")
+            self.logger.info(f"Total Number of Transactions (Type-6): {self.total_transactions}")
+
         if len(self.skipped_binary_files) > 0:
             self.logger.info("")
             self.logger.info(
@@ -550,6 +601,8 @@ class ACHMDVValidator:
         self.logger.info(
             f"  Skipped binary/encrypted files: {len(self.skipped_binary_files)}"
         )
+        self.logger.info(f"  Total Number of Batches (Type-5): {self.total_batches}")
+        self.logger.info(f"  Total Number of Transactions (Type-6): {self.total_transactions}")
         if bank_abas:
             total_type5 = self.type5_total_records
             match_type5 = self.type5_pos41_50_match_records
