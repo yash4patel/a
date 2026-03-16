@@ -43,6 +43,9 @@ class ACHMDVValidator:
         # Retail ODFI indicator (classification, NOT a validation failure):
         # grep '^5' *.ACH | cut -c41-50  (1-indexed) => line[40:50] (0-indexed)
         self.type5_total_records = 0
+        # Type-5 positions 41-50 distribution (equivalent to: cut -c41-50 | sort | uniq -c)
+        self.type5_pos41_50_all_counts_raw = {}
+        self.type5_pos41_50_all_counts_digits = {}
         self.type5_pos41_50_match_records = 0
         self.type5_pos41_50_match_files = set()
         self.type5_pos41_50_match_values = {}
@@ -138,6 +141,20 @@ class ACHMDVValidator:
             if field_digits == aba or field_digits == aba_8:
                 matches.append(aba)
         return matches
+
+    def _is_close_prefix_match(self, aba_digits: str, observed_digits: str, min_prefix_len: int = 5) -> bool:
+        """
+        Heuristic: treat as "close enough" if either value is a prefix of the other,
+        using at least `min_prefix_len` digits.
+        Example: observed=1234567 and config=12345 => match (prefix length 5).
+        """
+        if not aba_digits or not observed_digits:
+            return False
+        if len(aba_digits) >= min_prefix_len and observed_digits.startswith(aba_digits):
+            return True
+        if len(observed_digits) >= min_prefix_len and aba_digits.startswith(observed_digits):
+            return True
+        return False
 
     def test_seven_record_test(self, sec_code, seven_record_list):
         if sec_code == "IAT":
@@ -304,6 +321,17 @@ class ACHMDVValidator:
 
                     if key == 5:
                         self.type5_total_records += 1
+                        if len(line) >= 50:
+                            field_41_50 = line[40:50]  # cut -c41-50
+                            self.type5_pos41_50_all_counts_raw[field_41_50] = (
+                                self.type5_pos41_50_all_counts_raw.get(field_41_50, 0) + 1
+                            )
+                            digits_41_50 = re.sub(r"\D", "", field_41_50)
+                            if digits_41_50:
+                                self.type5_pos41_50_all_counts_digits[digits_41_50] = (
+                                    self.type5_pos41_50_all_counts_digits.get(digits_41_50, 0)
+                                    + 1
+                                )
 
                         if self.last_key_seen not in [1, 8]:
                             self.problems[key] += 1
@@ -328,9 +356,8 @@ class ACHMDVValidator:
                                 f"[Bad SEC] File={fname} Line={file_line} SEC={sec_code}"
                             )
 
-                        # Retail ODFI indicator (classification): Type-5 pos 41-50 matches any configured bank ABA.
+                        # Retail ODFI indicator (config-based): Type-5 pos 41-50 matches any configured bank ABA.
                         if self._bank_abas() and len(line) >= 50:
-                            field_41_50 = line[40:50]  # cut -c41-50
                             matching_abas = self._matching_bank_abas(field_41_50)
 
                             if matching_abas:
@@ -471,45 +498,113 @@ class ACHMDVValidator:
                 )
             self.logger.info("")
 
-        # Retail ODFI indicator summary (classification)
+        # Type-5 company id distribution + Retail ODFI inference
         bank_abas = self._bank_abas()
-        if bank_abas:
-            total_type5 = self.type5_total_records
-            match_type5 = self.type5_pos41_50_match_records
-            pct = (100.0 * match_type5 / total_type5) if total_type5 else 0.0
-            files_with_match = len(self.type5_pos41_50_match_files)
+        total_type5 = self.type5_total_records
 
+        if total_type5 > 0:
             self.logger.info("")
-            self.logger.info("Retail ODFI Indicator Summary (Type-5 pos 41-50 vs bank ABA(s))")
+            self.logger.info("Type-5 Positions 41-50 Distribution (ACH Company ID)")
             self.logger.info("-" * 70)
-            self.logger.info(f"Bank ABA parameter(s): {', '.join(bank_abas)}")
-            self.logger.info(f"Type-5 records scanned: {total_type5}")
-            self.logger.info(
-                f"Type-5 pos 41-50 matches: {match_type5} ({pct:.2f}%)"
+            top_all = sorted(
+                self.type5_pos41_50_all_counts_raw.items(),
+                key=lambda kv: kv[1],
+                reverse=True,
             )
-            self.logger.info(f"Files with ≥1 matching Type-5: {files_with_match}")
-            if self.type5_pos41_50_match_records_by_aba:
-                self.logger.info("Per-ABA match breakdown:")
-                for aba in bank_abas:
-                    c = self.type5_pos41_50_match_records_by_aba.get(aba, 0)
-                    p = (100.0 * c / total_type5) if total_type5 else 0.0
-                    fcnt = len(self.type5_pos41_50_match_files_by_aba.get(aba, set()))
-                    self.logger.info(f"  - ABA={aba}: {c} matches ({p:.2f}%), files={fcnt}")
-            if self.type5_pos41_50_match_values:
-                top = sorted(
-                    self.type5_pos41_50_match_values.items(),
+            top5 = top_all[:5]
+            next5 = top_all[5:10]
+
+            self.logger.info("Top 5 (equivalent to: cut -c41-50 | sort | uniq -c | sort -nr | head -5):")
+            for idx, (val, cnt) in enumerate(top5, 1):
+                self.logger.info(f"  {idx}. '{val}' -> {cnt}")
+            if next5:
+                self.logger.info("Next 5 (to show Top 10):")
+                for idx, (val, cnt) in enumerate(next5, 6):
+                    self.logger.info(f"  {idx}. '{val}' -> {cnt}")
+
+            unique_digits = len(self.type5_pos41_50_all_counts_digits)
+            unique_raw = len(self.type5_pos41_50_all_counts_raw)
+            self.logger.info(f"Distinct values (digits-only): {unique_digits}")
+            if unique_digits == 0:
+                self.logger.info(f"Distinct values (raw 10-char): {unique_raw}")
+
+            # Retail inference rules
+            # Use digits-only uniqueness when available; otherwise fall back to raw uniqueness.
+            uniq_for_inference = unique_digits if unique_digits > 0 else unique_raw
+            retail_by_low_unique = uniq_for_inference in (1, 2)
+            retail_by_config_match = self.type5_pos41_50_match_records > 0
+
+            close_matches = []
+            if bank_abas and self.type5_pos41_50_all_counts_digits:
+                # Find close/prefix matches for top observed values
+                top_observed_digits = sorted(
+                    self.type5_pos41_50_all_counts_digits.items(),
                     key=lambda kv: kv[1],
                     reverse=True,
-                )[:10]
-                self.logger.info("Top matching values (raw `cut -c41-50`) (up to 10):")
-                for idx, (val, cnt) in enumerate(top, 1):
-                    self.logger.info(f"  {idx}. '{val}' -> {cnt}")
-            if self.type5_pos41_50_match_samples:
-                self.logger.info("Sample matches (up to 10):")
-                for idx, (fname, line_no, val) in enumerate(
-                    self.type5_pos41_50_match_samples[:10], 1
-                ):
-                    self.logger.info(f"  {idx}. File={fname} Line={line_no} Value='{val}'")
+                )[:50]
+                for observed, cnt in top_observed_digits:
+                    for aba in bank_abas:
+                        if self._is_close_prefix_match(aba, observed, min_prefix_len=5):
+                            close_matches.append((aba, observed, cnt))
+                # de-dup (aba, observed)
+                seen = set()
+                close_matches_dedup = []
+                for aba, observed, cnt in close_matches:
+                    k = (aba, observed)
+                    if k not in seen:
+                        seen.add(k)
+                        close_matches_dedup.append((aba, observed, cnt))
+                close_matches = close_matches_dedup[:10]
+
+            retail_by_close_match = len(close_matches) > 0
+            inferred_retail = retail_by_config_match or retail_by_low_unique or retail_by_close_match
+
+            self.logger.info("")
+            self.logger.info("Retail ODFI Inference:")
+            self.logger.info("-" * 70)
+            reasons = []
+            if retail_by_config_match:
+                reasons.append("configured ABA match found")
+            if retail_by_low_unique:
+                reasons.append(f"low cardinality (only {uniq_for_inference} unique Company ID values)")
+            if retail_by_close_match:
+                reasons.append("close/prefix match to configured ABA")
+
+            self.logger.info(f"Inferred Retail ODFI: {'YES' if inferred_retail else 'NO'}")
+            if reasons:
+                self.logger.info(f"Reason(s): {', '.join(reasons)}")
+
+            if bank_abas:
+                self.logger.info(f"Configured bank ABA(s): {', '.join(bank_abas)}")
+
+            if close_matches and not retail_by_config_match:
+                self.logger.info("Close/prefix matches (observed vs configured) (up to 10):")
+                for idx, (aba, observed, cnt) in enumerate(close_matches, 1):
+                    self.logger.info(
+                        f"  {idx}. Observed='{observed}' Count={cnt} ~ Configured='{aba}'"
+                    )
+
+            # Config-based match stats (when configured)
+            if bank_abas:
+                match_type5 = self.type5_pos41_50_match_records
+                pct = (100.0 * match_type5 / total_type5) if total_type5 else 0.0
+                files_with_match = len(self.type5_pos41_50_match_files)
+
+                self.logger.info("")
+                self.logger.info("Retail ODFI Indicator (Config-Based Exact/8-digit Match)")
+                self.logger.info("-" * 70)
+                self.logger.info(f"Type-5 records scanned: {total_type5}")
+                self.logger.info(
+                    f"Type-5 pos 41-50 matches: {match_type5} ({pct:.2f}%)"
+                )
+                self.logger.info(f"Files with ≥1 matching Type-5: {files_with_match}")
+                if self.type5_pos41_50_match_records_by_aba:
+                    self.logger.info("Per-ABA match breakdown:")
+                    for aba in bank_abas:
+                        c = self.type5_pos41_50_match_records_by_aba.get(aba, 0)
+                        p = (100.0 * c / total_type5) if total_type5 else 0.0
+                        fcnt = len(self.type5_pos41_50_match_files_by_aba.get(aba, set()))
+                        self.logger.info(f"  - ABA={aba}: {c} matches ({p:.2f}%), files={fcnt}")
 
         checks = [
             ("Bad Keys", len(self.bad_keys), self.bad_keys),
