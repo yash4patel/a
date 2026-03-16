@@ -801,6 +801,19 @@ def weekdays_between_dates(start_date, end_date):
     return weekdays
 
 
+def extract_valid_yyyymmdd_tokens(text: str) -> List[str]:
+    """Return valid standalone YYYYMMDD tokens found in text."""
+    tokens = re.findall(r"(?<!\d)\d{8}(?!\d)", text or "")
+    valid_tokens = []
+    for token in tokens:
+        try:
+            datetime.strptime(token, "%Y%m%d")
+            valid_tokens.append(token)
+        except ValueError:
+            continue
+    return valid_tokens
+
+
 def read_x937_file(file_path):
     """Read X937 file with encoding detection and split by NUL record separator."""
     encoding = "ascii"
@@ -1212,16 +1225,16 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         return
 
     if sample_days > 0:
-        file_names = [os.path.basename(f) for f in x9_files]
-        dates = sorted({re.findall(r"\d{8}", f)[0] for f in file_names if re.findall(r"\d{8}", f)})
+        file_date_map = {}
+        for path in x9_files:
+            base = os.path.basename(path)
+            tokens = extract_valid_yyyymmdd_tokens(base)
+            if tokens:
+                file_date_map[path] = tokens[0]
+        dates = sorted(set(file_date_map.values()))
         if dates:
             sample_dates = dates[:sample_days]
-            x9_files = [
-                f
-                for f in x9_files
-                if re.findall(r"\d{8}", os.path.basename(f))
-                and re.findall(r"\d{8}", os.path.basename(f))[0] in sample_dates
-            ]
+            x9_files = [f for f in x9_files if file_date_map.get(f) in sample_dates]
             print(f"Sampling: {sample_days} days\n")
 
     file_count = len(x9_files)
@@ -1493,10 +1506,16 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     # 1.1 Data Continuity
     if enable_date_continuity:
         file_names = [os.path.basename(f) for f in x9_files]
-        dates = sorted({re.findall(r"\d{8}", f)[0] for f in file_names if re.findall(r"\d{8}", f)})
+        dates = sorted(
+            {
+                token
+                for f in file_names
+                for token in extract_valid_yyyymmdd_tokens(f)
+            }
+        )
         if dates and len(dates) > 1:
-            start_date = datetime.strptime(dates[0], "%Y%m%d")
-            end_date = datetime.strptime(dates[-1], "%Y%m%d")
+            start_date = datetime.strptime(str(dates[0]), "%Y%m%d")
+            end_date = datetime.strptime(str(dates[-1]), "%Y%m%d")
             weekdays_list = weekdays_between_dates(start_date, end_date)
             required_dates = [d.strftime("%Y%m%d") for d in weekdays_list]
             missing_dates = set(required_dates) - set(dates)
