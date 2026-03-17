@@ -480,6 +480,18 @@ class ACHMDVValidator:
         self.logger.info("")
         self.logger.info("=== ACH RDV VALIDATION RESULTS ===")
 
+        json_report = {
+            "section": "ACH RDV Validation",
+            "data_path": getattr(self.config, "data_path", ""),
+            "files_processed": int(total_files),
+            "totals": {
+                "batches_type5": int(self.total_batches),
+                "transactions_type6": int(self.total_transactions),
+            },
+            "skipped_binary_files_count": int(len(self.skipped_binary_files)),
+            "skipped_binary_files_sample": list(self.skipped_binary_files[:10]),
+        }
+
         if self.total_batches or self.total_transactions:
             self.logger.info("")
             self.logger.info(f"Total Number of Batches (Type-5): {self.total_batches}")
@@ -503,14 +515,18 @@ class ACHMDVValidator:
         total_type5 = self.type5_total_records
 
         if total_type5 > 0:
-            self.logger.info("")
-            self.logger.info("Type-5 Positions 41-50 Distribution (ACH Company ID)")
-            self.logger.info("-" * 70)
             top_all = sorted(
                 self.type5_pos41_50_all_counts_raw.items(),
                 key=lambda kv: kv[1],
                 reverse=True,
             )
+            top10_company_ids = [
+                {"value": val, "count": int(cnt)} for val, cnt in top_all[:10]
+            ]
+
+            self.logger.info("")
+            self.logger.info("Type-5 Positions 41-50 Distribution (ACH Company ID)")
+            self.logger.info("-" * 70)
             top5 = top_all[:5]
             next5 = top_all[5:10]
 
@@ -559,6 +575,13 @@ class ACHMDVValidator:
             retail_by_close_match = len(close_matches) > 0
             inferred_retail = retail_by_config_match or retail_by_low_unique or retail_by_close_match
 
+            json_report["type5_company_id"] = {
+                "positions": "41-50",
+                "top10": top10_company_ids,
+                "unique_digits_only": int(unique_digits),
+                "unique_raw": int(unique_raw),
+            }
+
             self.logger.info("")
             self.logger.info("Retail ODFI Inference:")
             self.logger.info("-" * 70)
@@ -584,6 +607,16 @@ class ACHMDVValidator:
                         f"  {idx}. Observed='{observed}' Count={cnt} ~ Configured='{aba}'"
                     )
 
+            json_report["retail_odfi_inference"] = {
+                "inferred_retail": bool(inferred_retail),
+                "reasons": reasons,
+                "configured_abas": list(bank_abas),
+                "close_prefix_matches": [
+                    {"configured_aba": aba, "observed": observed, "count": int(cnt)}
+                    for (aba, observed, cnt) in close_matches
+                ],
+            }
+
             # Config-based match stats (when configured)
             if bank_abas:
                 match_type5 = self.type5_pos41_50_match_records
@@ -605,6 +638,20 @@ class ACHMDVValidator:
                         p = (100.0 * c / total_type5) if total_type5 else 0.0
                         fcnt = len(self.type5_pos41_50_match_files_by_aba.get(aba, set()))
                         self.logger.info(f"  - ABA={aba}: {c} matches ({p:.2f}%), files={fcnt}")
+
+                json_report["retail_odfi_config_indicator"] = {
+                    "matches": int(match_type5),
+                    "match_pct": float(pct),
+                    "files_with_match": int(files_with_match),
+                    "per_aba": [
+                        {
+                            "aba": aba,
+                            "matches": int(self.type5_pos41_50_match_records_by_aba.get(aba, 0)),
+                            "files_with_match": int(len(self.type5_pos41_50_match_files_by_aba.get(aba, set()))),
+                        }
+                        for aba in bank_abas
+                    ],
+                }
 
         checks = [
             ("Bad Keys", len(self.bad_keys), self.bad_keys),
@@ -672,9 +719,14 @@ class ACHMDVValidator:
         self.logger.info("")
         self.logger.info("Individual Check Results:")
         self.logger.info("-" * 40)
+
+        json_checks = []
         for check_name, count, error_data in checks:
             status = "PASSED" if count == 0 else "FAILED"
             self.logger.info(f"{check_name:.<50} {status} ({count} issues)")
+            json_checks.append(
+                {"name": check_name, "status": status, "issues": int(count)}
+            )
 
             if count > 0 and error_data is not None:
                 self.logger.info("")
@@ -684,6 +736,15 @@ class ACHMDVValidator:
         total_checks = len(checks)
         failed = sum(1 for _, count, _ in checks if count > 0)
         passed = total_checks - failed
+
+        json_report["checks"] = json_checks
+        json_report["summary"] = {
+            "total_checks": int(total_checks),
+            "passed": int(passed),
+            "failed": int(failed),
+            "files_with_issues": int(len(self.problematic_files)),
+            "total_issues_found": int(self.problem_counter),
+        }
 
         self.logger.info("")
         self.logger.info("=" * 40)
@@ -725,6 +786,16 @@ class ACHMDVValidator:
             self.logger.info("*** TEST FAILED ***")
         else:
             self.logger.info("*** TEST PASSED ***")
+
+        json_report["overall_status"] = "FAILED" if error_percent > self.config.max_error_percent else "PASSED"
+        json_report["error_percent_files_with_issues"] = float(error_percent)
+        json_report["max_error_percent_allowed"] = float(self.config.max_error_percent)
+
+        # Write JSON report sidecar
+        try:
+            self.log.write_json_report(json_report)
+        except Exception:
+            pass
 
         self.logger.info("")
         self.logger.info("=== FINISHED SECTION 1 ACH RDV VALIDATION TEST ===")

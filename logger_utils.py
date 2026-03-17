@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 from datetime import datetime
 
 
@@ -87,4 +88,25 @@ class LogManager:
         if not critical_issues and not warnings:
             self.logger.info("No issues detected. Data looks clean.")
         self.logger.info("\n\n")
+
+    def write_json_report(self, payload: dict):
+        """
+        Write a JSON sidecar report next to the log file.
+        Example: /path/foo.ACH.log -> /path/foo.ACH.json
+        """
+        try:
+            json_path = self.logfile
+            if json_path.endswith(".log"):
+                json_path = json_path[:-4] + ".json"
+            else:
+                json_path = json_path + ".json"
+
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, sort_keys=False, default=str)
+
+            self.logger.info(f"JSON report saved to: {json_path}")
+            return json_path
+        except Exception as e:
+            self.logger.error(f"Failed writing JSON report: {e}")
+            return ""
 
