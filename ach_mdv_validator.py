@@ -492,11 +492,6 @@ class ACHMDVValidator:
             "skipped_binary_files_sample": list(self.skipped_binary_files[:10]),
         }
 
-        if self.total_batches or self.total_transactions:
-            self.logger.info("")
-            self.logger.info(f"Total Number of Batches (Type-5): {self.total_batches}")
-            self.logger.info(f"Total Number of Transactions (Type-6): {self.total_transactions}")
-
         if len(self.skipped_binary_files) > 0:
             self.logger.info("")
             self.logger.info(
@@ -524,25 +519,10 @@ class ACHMDVValidator:
                 {"value": val, "count": int(cnt)} for val, cnt in top_all[:10]
             ]
 
-            self.logger.info("")
-            self.logger.info("Type-5 Positions 41-50 Distribution (ACH Company ID)")
-            self.logger.info("-" * 70)
             top5 = top_all[:5]
-            next5 = top_all[5:10]
-
-            self.logger.info("Top 5 (equivalent to: cut -c41-50 | sort | uniq -c | sort -nr | head -5):")
-            for idx, (val, cnt) in enumerate(top5, 1):
-                self.logger.info(f"  {idx}. '{val}' -> {cnt}")
-            if next5:
-                self.logger.info("Next 5 (to show Top 10):")
-                for idx, (val, cnt) in enumerate(next5, 6):
-                    self.logger.info(f"  {idx}. '{val}' -> {cnt}")
 
             unique_digits = len(self.type5_pos41_50_all_counts_digits)
             unique_raw = len(self.type5_pos41_50_all_counts_raw)
-            self.logger.info(f"Distinct values (digits-only): {unique_digits}")
-            if unique_digits == 0:
-                self.logger.info(f"Distinct values (raw 10-char): {unique_raw}")
 
             # Retail inference rules
             # Use digits-only uniqueness when available; otherwise fall back to raw uniqueness.
@@ -582,23 +562,44 @@ class ACHMDVValidator:
                 "unique_raw": int(unique_raw),
             }
 
-            self.logger.info("")
-            self.logger.info("Retail ODFI Inference:")
-            self.logger.info("-" * 70)
+            # Retail ODFI Evaluation (single block to avoid clutter)
             reasons = []
-            if retail_by_config_match:
-                reasons.append("configured ABA match found")
             if retail_by_low_unique:
-                reasons.append(f"low cardinality (only {uniq_for_inference} unique Company ID values)")
-            if retail_by_close_match:
-                reasons.append("close/prefix match to configured ABA")
+                if uniq_for_inference == 1:
+                    reasons.append("Only one distinct Company ID value observed")
+                elif uniq_for_inference == 2:
+                    reasons.append("Only two distinct Company ID values observed")
+                else:
+                    reasons.append(f"Low cardinality ({uniq_for_inference} distinct Company ID values)")
+            if retail_by_config_match:
+                reasons.append("Company ID matches configured bank ABA")
+            if retail_by_close_match and not retail_by_config_match:
+                reasons.append("Company ID is a close/prefix match to configured bank ABA")
 
-            self.logger.info(f"Inferred Retail ODFI: {'YES' if inferred_retail else 'NO'}")
-            if reasons:
-                self.logger.info(f"Reason(s): {', '.join(reasons)}")
+            if inferred_retail:
+                reason_line = reasons[0] if reasons else "Retail ODFI heuristic triggered"
+            else:
+                reason_line = "Multiple Company ID values detected"
+
+            self.logger.info("")
+            self.logger.info("Retail ODFI Evaluation:")
+            self.logger.info("-" * 70)
+            self.logger.info(f"Evaluation result: Retail ODFI = {'YES' if inferred_retail else 'NO'}")
+            self.logger.info(f"Reason: {reason_line}")
+
+            # Show the exact command-equivalent results (top 5) plus optional next values.
+            self.logger.info("Top ACH Company ID (Type-5 pos 41-50) values:")
+            for idx, (val, cnt) in enumerate(top_all[:10], 1):
+                self.logger.info(f"  {idx}. '{val}' -> {cnt}")
+                if idx == 5 and len(top_all) > 5:
+                    # visually separate the required top-5 from the rest without adding extra headers
+                    self.logger.info("  ...")
 
             if bank_abas:
                 self.logger.info(f"Configured bank ABA(s): {', '.join(bank_abas)}")
+                match_type5 = self.type5_pos41_50_match_records
+                pct = (100.0 * match_type5 / total_type5) if total_type5 else 0.0
+                self.logger.info(f"Configured ABA match (exact/8-digit): {match_type5}/{total_type5} ({pct:.2f}%)")
 
             if close_matches and not retail_by_config_match:
                 self.logger.info("Close/prefix matches (observed vs configured) (up to 10):")
@@ -607,42 +608,18 @@ class ACHMDVValidator:
                         f"  {idx}. Observed='{observed}' Count={cnt} ~ Configured='{aba}'"
                     )
 
-            json_report["retail_odfi_inference"] = {
-                "inferred_retail": bool(inferred_retail),
-                "reasons": reasons,
+            json_report["retail_odfi_evaluation"] = {
+                "result": "YES" if inferred_retail else "NO",
+                "reason": reason_line,
+                "reasons_all": reasons,
+                "top10_company_id": top10_company_ids,
+                "unique_digits_only": int(unique_digits),
+                "unique_raw": int(unique_raw),
                 "configured_abas": list(bank_abas),
-                "close_prefix_matches": [
-                    {"configured_aba": aba, "observed": observed, "count": int(cnt)}
-                    for (aba, observed, cnt) in close_matches
-                ],
-            }
-
-            # Config-based match stats (when configured)
-            if bank_abas:
-                match_type5 = self.type5_pos41_50_match_records
-                pct = (100.0 * match_type5 / total_type5) if total_type5 else 0.0
-                files_with_match = len(self.type5_pos41_50_match_files)
-
-                self.logger.info("")
-                self.logger.info("Retail ODFI Indicator (Config-Based Exact/8-digit Match)")
-                self.logger.info("-" * 70)
-                self.logger.info(f"Type-5 records scanned: {total_type5}")
-                self.logger.info(
-                    f"Type-5 pos 41-50 matches: {match_type5} ({pct:.2f}%)"
-                )
-                self.logger.info(f"Files with ≥1 matching Type-5: {files_with_match}")
-                if self.type5_pos41_50_match_records_by_aba:
-                    self.logger.info("Per-ABA match breakdown:")
-                    for aba in bank_abas:
-                        c = self.type5_pos41_50_match_records_by_aba.get(aba, 0)
-                        p = (100.0 * c / total_type5) if total_type5 else 0.0
-                        fcnt = len(self.type5_pos41_50_match_files_by_aba.get(aba, set()))
-                        self.logger.info(f"  - ABA={aba}: {c} matches ({p:.2f}%), files={fcnt}")
-
-                json_report["retail_odfi_config_indicator"] = {
-                    "matches": int(match_type5),
-                    "match_pct": float(pct),
-                    "files_with_match": int(files_with_match),
+                "configured_match": {
+                    "matches": int(self.type5_pos41_50_match_records),
+                    "match_pct": float((100.0 * self.type5_pos41_50_match_records / total_type5) if total_type5 else 0.0),
+                    "files_with_match": int(len(self.type5_pos41_50_match_files)),
                     "per_aba": [
                         {
                             "aba": aba,
@@ -651,7 +628,12 @@ class ACHMDVValidator:
                         }
                         for aba in bank_abas
                     ],
-                }
+                },
+                "close_prefix_matches": [
+                    {"configured_aba": aba, "observed": observed, "count": int(cnt)}
+                    for (aba, observed, cnt) in close_matches
+                ],
+            }
 
         checks = [
             ("Bad Keys", len(self.bad_keys), self.bad_keys),
@@ -757,15 +739,6 @@ class ACHMDVValidator:
         self.logger.info(
             f"  Skipped binary/encrypted files: {len(self.skipped_binary_files)}"
         )
-        self.logger.info(f"  Total Number of Batches (Type-5): {self.total_batches}")
-        self.logger.info(f"  Total Number of Transactions (Type-6): {self.total_transactions}")
-        if bank_abas:
-            total_type5 = self.type5_total_records
-            match_type5 = self.type5_pos41_50_match_records
-            pct = (100.0 * match_type5 / total_type5) if total_type5 else 0.0
-            self.logger.info(
-                f"  Retail ODFI indicator (Type-5 pos 41-50 match): {match_type5}/{total_type5} ({pct:.2f}%)"
-            )
         self.logger.info("=" * 40)
 
         error_percent = round(100 * len(self.problematic_files) / max(1, total_files), 2)
