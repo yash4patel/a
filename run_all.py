@@ -155,6 +155,7 @@ def main():
 
     logger.info("=== WORKFLOW COMPLETED ===")
     print(f"\nDetails and logs have been saved to: {full_log_path}")
+    print(f"JSON summary saved to: {log_manager.jsonfile}")
 
 
 if __name__ == "__main__":

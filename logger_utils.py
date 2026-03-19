@@ -13,8 +13,15 @@ class LogManager:
     def __init__(self, logger: logging.Logger, full_log_path: str, level: str = "INFO"):
         self.logger = logger
         self.logfile = full_log_path
+        self.jsonfile = self._json_path_from_log(full_log_path)
         self.level = level.upper()
         self.check_results = {"PASS": 0, "WARN": 0, "INFO": 0, "FAIL": 0, "TOTAL": 0}
+
+    @staticmethod
+    def _json_path_from_log(log_path: str) -> str:
+        if log_path.endswith(".log"):
+            return log_path[:-4] + ".json"
+        return log_path + ".json"
 
     @staticmethod
     def setup(log_dir: str, logfile: str, loglevel: str = "INFO"):
@@ -33,7 +40,9 @@ class LogManager:
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
+        json_path = LogManager._json_path_from_log(full_log_path)
         print(f"For more detail, please review the log file at: {full_log_path}")
+        print(f"JSON summary will be saved to: {json_path}")
 
         return LogManager(logger, full_log_path, loglevel), full_log_path
 
@@ -95,11 +104,7 @@ class LogManager:
         Example: /path/foo.ACH.log -> /path/foo.ACH.json
         """
         try:
-            json_path = self.logfile
-            if json_path.endswith(".log"):
-                json_path = json_path[:-4] + ".json"
-            else:
-                json_path = json_path + ".json"
+            json_path = self.jsonfile
 
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, sort_keys=False, default=str)
