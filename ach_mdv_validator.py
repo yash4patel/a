@@ -764,12 +764,6 @@ class ACHMDVValidator:
         json_report["error_percent_files_with_issues"] = float(error_percent)
         json_report["max_error_percent_allowed"] = float(self.config.max_error_percent)
 
-        # Write JSON report sidecar
-        try:
-            self.log.write_json_report(json_report)
-        except Exception:
-            pass
-
         self.logger.info("")
         self.logger.info("=== FINISHED SECTION 1 ACH RDV VALIDATION TEST ===")
         self.logger.info("")
@@ -778,6 +772,8 @@ class ACHMDVValidator:
             critical_issues=self.problem_counter,
             warnings=len(self.problematic_files),
         )
+
+        return json_report
 
     def _print_error_details(self, check_name, error_data):
         """Print sample error details for failed checks (up to 10 samples)."""

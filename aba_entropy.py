@@ -16,6 +16,7 @@ class ABAEntropyAnalyzer:
         self.logger = log_manager.logger
         self.aba_5_counts = {}
         self.aba_6_counts = {}
+        self.last_report = None
 
     def analyze(self):
         try:
@@ -70,7 +71,8 @@ class ABAEntropyAnalyzer:
                     self.logger.debug(traceback.format_exc())
                     continue
 
-            ach_type = self._report_results()
+            ach_type, report = self._report_results()
+            self.last_report = report
 
             self.logger.info("")
             self.logger.info("=" * 70)
@@ -78,7 +80,7 @@ class ABAEntropyAnalyzer:
             self.logger.info("=" * 70)
             self.logger.info("")
 
-            return ach_type
+            return ach_type, report
 
         except Exception as e:
             self.logger.critical(f"ABAEntropyAnalyzer failed: {e}")
@@ -88,7 +90,13 @@ class ABAEntropyAnalyzer:
             self.logger.info("=== FINISHED ABA ENTROPY ANALYSIS ===")
             self.logger.info("=" * 70)
             self.logger.info("")
-            return ""
+            report = {
+                "section": "ABA Entropy",
+                "status": "FAILED",
+                "error": str(e),
+            }
+            self.last_report = report
+            return "", report
 
     def _report_results(self):
         try:
@@ -117,6 +125,22 @@ class ABAEntropyAnalyzer:
                 msg = "This appears to be RDFI data."
                 ach_type = "RDFI"
 
+            report = {
+                "section": "ABA Entropy",
+                "status": "OK",
+                "detected_ach_type": ach_type,
+                "entropy": {
+                    "type5_odfi": float(ent_aba_5),
+                    "type6_rdfi": float(ent_aba_6),
+                },
+                "counts": {
+                    "type5_distinct": int(len(self.aba_5_counts)),
+                    "type5_total": int(aba_5_sum),
+                    "type6_distinct": int(len(self.aba_6_counts)),
+                    "type6_total": int(aba_6_sum),
+                },
+            }
+
             self.logger.info("")
             self.logger.info("ABA Entropy Analysis Results:")
             self.logger.info("-" * 70)
@@ -131,10 +155,10 @@ class ABAEntropyAnalyzer:
             self.logger.info("")
             self.logger.info(f"*** DETECTED: {msg} ***")
 
-            return ach_type
+            return ach_type, report
 
         except Exception as e:
             self.logger.error(f"Error reporting ABA entropy results: {e}")
             self.logger.debug(traceback.format_exc())
-            return ""
+            return "", {"section": "ABA Entropy", "status": "FAILED", "error": str(e)}
 

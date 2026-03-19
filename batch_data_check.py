@@ -3,9 +3,6 @@ import re
 import traceback
 from datetime import date, timedelta
 
-import pandas as pd
-from pandas.tseries.holiday import USFederalHolidayCalendar
-
 import folder_tools
 
 
@@ -265,6 +262,14 @@ class BatchDateCompletenessAnalyzer:
         - extension: File extension to filter (default "ACH")
         - record_type_to_count: Which record type to count (default 5)
         """
+        report = {
+            "section": "Batch Date Completeness",
+            "status": "UNKNOWN",
+            "ach_type": ach_type,
+            "extension": extension,
+            "record_type_to_count": int(record_type_to_count),
+        }
+
         try:
             self.logger.info("")
             self.logger.info("=" * 70)
@@ -281,12 +286,14 @@ class BatchDateCompletenessAnalyzer:
             if len(fileNames) == 0:
                 self.logger.error("No files found to analyze")
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = "No files found"
                 self.logger.info("")
                 self.logger.info("=" * 70)
                 self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
                 self.logger.info("=" * 70)
                 self.logger.info("")
-                return
+                return report
 
             if ach_type == "RDFI":
                 needed_days = 180
@@ -296,12 +303,14 @@ class BatchDateCompletenessAnalyzer:
                 msg = f"[CRITICAL] Invalid ach_type: {ach_type}"
                 self.logger.critical(msg)
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = f"Invalid ach_type: {ach_type}"
                 self.logger.info("")
                 self.logger.info("=" * 70)
                 self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
                 self.logger.info("=" * 70)
                 self.logger.info("")
-                return
+                return report
 
             print("Will try and figure out the file date format...\n")
 
@@ -323,12 +332,14 @@ class BatchDateCompletenessAnalyzer:
                     if get_date is None:
                         self.logger.error("User cancelled or invalid input")
                         print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                        report["status"] = "FAILED"
+                        report["reason"] = "Date format not detected / user cancelled"
                         self.logger.info("")
                         self.logger.info("=" * 70)
                         self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
                         self.logger.info("=" * 70)
                         self.logger.info("")
-                        return
+                        return report
 
                 print("\nValidating date parser on sample files...")
                 test_success = 0
@@ -344,12 +355,14 @@ class BatchDateCompletenessAnalyzer:
                 if test_success == 0:
                     self.logger.error("Date parser validation failed on all samples")
                     print("\n*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                    report["status"] = "FAILED"
+                    report["reason"] = "Date parser validation failed on samples"
                     self.logger.info("")
                     self.logger.info("=" * 70)
                     self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
                     self.logger.info("=" * 70)
                     self.logger.info("")
-                    return
+                    return report
 
                 print(
                     f"\nDate parser validated ({test_success}/{min(3, len(sample_files))} successful)\n"
@@ -359,12 +372,14 @@ class BatchDateCompletenessAnalyzer:
                 self.logger.critical(f"Date detection failed: {e}")
                 self.logger.debug(traceback.format_exc())
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = f"Date detection failed: {e}"
                 self.logger.info("")
                 self.logger.info("=" * 70)
                 self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
                 self.logger.info("=" * 70)
                 self.logger.info("")
-                return
+                return report
 
             if len(fileNames) > 0:
                 first_file_path = os.path.join(mypath, fileNames[0])
@@ -474,12 +489,14 @@ class BatchDateCompletenessAnalyzer:
                     "Suggestion: Check a sample file manually to verify record types present"
                 )
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = "No valid date entries found from ACH files"
                 self.logger.info("")
                 self.logger.info("=" * 70)
                 self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
                 self.logger.info("=" * 70)
                 self.logger.info("")
-                return
+                return report
 
             theMin = min(date_counts.keys())
             theMax = max(date_counts.keys())
@@ -487,6 +504,18 @@ class BatchDateCompletenessAnalyzer:
             self.logger.info(
                 f"Date range detected: {theMin} -> {theMax} ({date_range_days} days)"
             )
+            report["date_range"] = {
+                "min": str(theMin),
+                "max": str(theMax),
+                "days": int(date_range_days),
+            }
+            report["parsing"] = {
+                "successfully_parsed": int(successfully_parsed),
+                "failed_to_parse": int(failed_to_parse),
+                "files_with_records": int(files_with_records),
+                "files_without_records": int(files_without_records),
+                "record_type_counted": int(record_type_to_count),
+            }
 
             if ach_type == "RDFI" and date_range_days < needed_days:
                 self.logger.error("")
@@ -511,7 +540,9 @@ class BatchDateCompletenessAnalyzer:
                 self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
                 self.logger.info("=" * 70)
                 self.logger.info("")
-                return
+                report["status"] = "FAILED"
+                report["reason"] = f"Data range {date_range_days} < required {needed_days} days for {ach_type}"
+                return report
             elif ach_type == "ODFI" and date_range_days < needed_days:
                 self.logger.error("")
                 self.logger.error("=" * 70)
@@ -535,12 +566,24 @@ class BatchDateCompletenessAnalyzer:
                 self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
                 self.logger.info("=" * 70)
                 self.logger.info("")
-                return
+                report["status"] = "FAILED"
+                report["reason"] = f"Data range {date_range_days} < required {needed_days} days for {ach_type}"
+                return report
 
             cur = theMin
             while cur <= theMax:
                 date_counts.setdefault(cur, 0)
                 cur += timedelta(days=1)
+
+            try:
+                import pandas as pd  # type: ignore
+                from pandas.tseries.holiday import USFederalHolidayCalendar  # type: ignore
+            except Exception as e:
+                self.logger.critical(f"Missing dependency for batch analysis: {e}")
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = f"Missing dependency: {e}"
+                return report
 
             df_batches = pd.DataFrame(list(date_counts.items()), columns=["Date", "DateValue"])
             df_batches["Date"] = pd.to_datetime(df_batches["Date"], errors="coerce")
@@ -555,12 +598,14 @@ class BatchDateCompletenessAnalyzer:
             if len(df_batches) == 0:
                 self.logger.error("No business days found after filtering weekends/holidays")
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = "No business days found after filtering weekends/holidays"
                 self.logger.info("")
                 self.logger.info("=" * 70)
                 self.logger.info("=== FINISHED SECTION 3 BATCH DATE COMPLETENESS ANALYSIS ===")
                 self.logger.info("=" * 70)
                 self.logger.info("")
-                return
+                return report
 
             median = df_batches["DateValue"].median()
             self.logger.info(f"Median batch count per business day: {median}")
@@ -587,25 +632,35 @@ class BatchDateCompletenessAnalyzer:
             if (missing_days == 0) and (overloaded_days == 0):
                 print("*** BATCH DATE COMPLETENESS: TEST PASSED ***")
                 self.logger.info("*** TEST PASSED ***")
+                report["status"] = "PASSED"
             else:
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
                 self.logger.info("*** TEST FAILED ***")
+                report["status"] = "FAILED"
+
+            report["volume_anomalies"] = {
+                "median": float(median) if median is not None else None,
+                "missing_days_low_volume": int(missing_days),
+                "overloaded_days_high_volume": int(overloaded_days),
+            }
 
             self.logger.info("")
             self.logger.info("=" * 70)
             self.logger.info("=== FINISHED SECTION 3 BATCH DATE COMPLETENESS ANALYSIS ===")
             self.logger.info("=" * 70)
             self.logger.info("")
-            return
+            return report
 
         except Exception as e:
             self.logger.critical(f"BatchDateCompletenessAnalyzer crashed: {e}")
             self.logger.debug(traceback.format_exc())
             print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+            report["status"] = "FAILED"
+            report["reason"] = f"Crash: {e}"
             self.logger.info("")
             self.logger.info("=" * 70)
             self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
             self.logger.info("=" * 70)
             self.logger.info("")
-            return
+            return report
 

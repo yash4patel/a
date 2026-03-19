@@ -97,8 +97,30 @@ def main():
 
     logger.info("=== STARTING ACH VALIDATION WORKFLOW ===")
 
+    workflow_report = {
+        "tenant_name": tenant_name,
+        "sid": config.sid,
+        "data_path": config.data_path,
+        "log_file": full_log_path,
+        "json_file": log_manager.jsonfile,
+        "run_started_at": datetime.now().isoformat(timespec="seconds"),
+        "config": {
+            "extension": getattr(config, "extension", ""),
+            "aba_number": getattr(config, "aba_number", ""),
+            "aba_numbers": getattr(config, "aba_numbers", []),
+            "max_error_percent": getattr(config, "max_error_percent", None),
+        },
+        "sections": {},
+    }
+
     logger.info("Validating file extensions...")
     is_valid, error_msg, invalid_files = validate_file_extensions(config.data_path, logger)
+    workflow_report["sections"]["file_extension_validation"] = {
+        "status": "PASSED" if is_valid else "FAILED",
+        "invalid_files_count": int(len(invalid_files)),
+        "invalid_files_sample": invalid_files[:20],
+        "error": error_msg,
+    }
 
     if not is_valid:
         logger.error("=" * 40)
@@ -128,14 +150,21 @@ def main():
     try:
         validator = ACHMDVValidator(config, log_manager)
         file_names = validator.validate_files()
-        validator.summarize_results(len(file_names))
+        section1 = validator.summarize_results(len(file_names))
+        workflow_report["sections"]["ach_mdv_validator"] = section1
     except Exception as e:
         logger.critical(f"ACH RDV Validator crashed: {e}")
         logger.debug(str(e))
+        workflow_report["sections"]["ach_mdv_validator"] = {
+            "section": "ACH RDV Validation",
+            "status": "FAILED",
+            "error": str(e),
+        }
 
     try:
         aba_analyzer = ABAEntropyAnalyzer(config, log_manager)
-        ach_type = aba_analyzer.analyze()
+        ach_type, section2 = aba_analyzer.analyze()
+        workflow_report["sections"]["aba_entropy"] = section2
         if not ach_type:
             ach_type = config.ach_type or "ODFI"
             logger.warning(
@@ -145,15 +174,31 @@ def main():
         logger.critical(f"ABAEntropyAnalyzer crashed: {e}")
         logger.debug(str(e))
         ach_type = config.ach_type or "ODFI"
+        workflow_report["sections"]["aba_entropy"] = {
+            "section": "ABA Entropy",
+            "status": "FAILED",
+            "error": str(e),
+        }
 
     try:
         batch_date_analyzer = BatchDateCompletenessAnalyzer(config, log_manager)
-        batch_date_analyzer.analyze(ach_type, config.extension)
+        section3 = batch_date_analyzer.analyze(ach_type, config.extension)
+        workflow_report["sections"]["batch_data_check"] = section3
     except Exception as e:
         logger.critical(f"BatchDateCompletenessAnalyzer crashed: {e}")
         logger.debug(str(e))
+        workflow_report["sections"]["batch_data_check"] = {
+            "section": "Batch Date Completeness",
+            "status": "FAILED",
+            "error": str(e),
+        }
 
     logger.info("=== WORKFLOW COMPLETED ===")
+    workflow_report["run_finished_at"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        log_manager.write_json_report(workflow_report)
+    except Exception:
+        pass
     print(f"\nDetails and logs have been saved to: {full_log_path}")
     print(f"JSON summary saved to: {log_manager.jsonfile}")
 
