@@ -778,16 +778,28 @@ def credit_debit_flag(row, our_aba_list):
 
 
 def top_10(df):
-    """Get top 10 transactions by on_us, payor routing, and bofd routing."""
+    """Get top 10 transactions including check number and amount."""
     if df.empty:
         return pd.DataFrame()
-    return (
-        df.groupby(["25_on_us", "PAYOR_ROUTING", "BOFD_ROUTING"])
+
+    cols = ["payer_account", "check_number", "PAYOR_ROUTING", "BOFD_ROUTING", "ITEM_AMOUNT_FLOAT"]
+    missing_cols = [c for c in cols if c not in df.columns]
+    if missing_cols:
+        return pd.DataFrame()
+
+    top_df = (
+        df.groupby(cols, dropna=False)
         .size()
         .reset_index(name="COUNT")
         .sort_values("COUNT", ascending=False)
         .head(10)
     )
+    top_df["ITEM_AMOUNT_FLOAT"] = pd.to_numeric(top_df["ITEM_AMOUNT_FLOAT"], errors="coerce")
+    top_df["ITEM_AMOUNT"] = top_df["ITEM_AMOUNT_FLOAT"].apply(
+        lambda x: f"${x:.2f}" if pd.notna(x) else ""
+    )
+    top_df.drop(columns=["ITEM_AMOUNT_FLOAT"], inplace=True)
+    return top_df
 
 
 def weekdays_between_dates(start_date, end_date):
@@ -1802,6 +1814,12 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     df_forward["onus_elements"] = (
         df_forward["25_on_us"].astype(str).str.strip().str.strip("/").str.split("/").apply(len)
     )
+    df_forward["25_on_us"] = df_forward["25_on_us"].astype(str).str.strip().str.strip("/")
+    df_forward["25_auxiliary_on_us"] = df_forward["25_auxiliary_on_us"].astype(str).str.strip()
+    df_forward["payer_account"] = df_forward["25_on_us"].str.split("/").str[0]
+    aux_on_us = df_forward["25_auxiliary_on_us"].replace("", None)
+    on_us_last = df_forward["25_on_us"].str.split("/").str[-1]
+    df_forward["check_number"] = aux_on_us.fillna(on_us_last)
 
     withdrawals = df_forward[df_forward["TRANSACTION_TYPE"] == "WITHDRAWAL"]
     deposits = df_forward[df_forward["TRANSACTION_TYPE"] == "DEPOSIT"]
