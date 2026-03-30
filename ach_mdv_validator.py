@@ -40,12 +40,17 @@ class ACHMDVValidator:
         self.total_transactions = 0
         self.total_records = 0
 
-        # Return / Change detection (records starting with "799")
+        # Return / Change detection (records starting with "798" or "799")
+        # Common patterns observed:
+        # - 799R = return
+        # - 798C = change (NOC-style)
+        self.total_798_records = 0
         self.total_799_records = 0
+        self.files_with_798 = set()
         self.files_with_799 = set()
-        self._799_type_counts = {"R": 0, "C": 0, "OTHER": 0}
-        # Distribution keyed by full code e.g. "R01", "C02"
-        self._799_code_counts = {}
+        self._79x_type_counts = {"R": 0, "C": 0, "OTHER": 0}
+        self._79x_txn_code_counts = {}  # e.g. "799R", "798C"
+        self._79x_reason_code_counts = {}  # e.g. "799R01", "798C29"
         self._binary_cache = {}
 
         # Retail ODFI indicator (classification, NOT a validation failure):
@@ -101,19 +106,23 @@ class ACHMDVValidator:
         - Type-5 batches (grep '^5' | wc -l)
         - Type-6 transactions (grep '^6' | wc -l)
         - Total records (line count)
-        - Return/Change records starting with '799' (grep '^799' | wc -l)
-          - 'R' vs 'C' type is 1 character after 799 (position 4)
-          - Code distribution uses the next 2 chars (positions 5-6), reported as e.g. R01
+        - Return/Change records starting with '798' or '799' (grep '^(798|799)' | wc -l)
+          - Return vs Change is 1 character after 798/799 (position 4): 'R' or 'C'
+          - Transaction-code distribution is the 4-char token: 799R / 798C (positions 1-4)
+        - Reason-code distribution uses the next 2 digits (positions 5-6), e.g. R01, C29
 
         Uses a lightweight byte-scan and skips binary/encrypted files (same policy as validation).
         """
         batches = 0
         transactions = 0
         total_records = 0
+        total_798 = 0
         total_799 = 0
-        type_counts = {"R": 0, "C": 0, "OTHER": 0}
-        code_counts = {}
+        files_with_798 = set()
         files_with_799 = set()
+        type_counts = {"R": 0, "C": 0, "OTHER": 0}  # aggregated across 798/799
+        txn_code_counts = {}  # 4-char: 798C / 799R
+        reason_code_counts = {}  # 3-char-ish: R01 / C29
 
         for fname in fileNames:
             filepath = os.path.join(self.config.data_path, fname)
@@ -132,34 +141,45 @@ class ACHMDVValidator:
                             transactions += 1
                         else:
                             # Return / change record signature
-                            if line_bytes[:3] == b"799":
-                                total_799 += 1
-                                files_with_799.add(fname)
+                            prefix = line_bytes[:3]
+                            if prefix in (b"798", b"799"):
+                                if prefix == b"798":
+                                    total_798 += 1
+                                    files_with_798.add(fname)
+                                else:
+                                    total_799 += 1
+                                    files_with_799.add(fname)
+
                                 type_b = line_bytes[3:4]
-                                type_chr = (
-                                    type_b.decode("ascii", "ignore") if type_b else ""
-                                )
+                                type_chr = type_b.decode("ascii", "ignore") if type_b else ""
+                                txn_code = f"{prefix.decode('ascii', 'ignore')}{type_chr}" if type_chr else prefix.decode("ascii", "ignore")
+                                txn_code_counts[txn_code] = txn_code_counts.get(txn_code, 0) + 1
+
                                 if type_chr not in ("R", "C"):
                                     type_counts["OTHER"] += 1
                                     continue
                                 type_counts[type_chr] += 1
+
                                 digits = line_bytes[4:6].decode("ascii", "ignore")
                                 digits = "".join(ch for ch in digits if ch.isdigit())
                                 if len(digits) == 2:
-                                    code = f"{type_chr}{digits}"
+                                    reason = f"{type_chr}{digits}"
                                 else:
-                                    code = f"{type_chr}??"
-                                code_counts[code] = code_counts.get(code, 0) + 1
+                                    reason = f"{type_chr}??"
+                                reason_code_counts[reason] = reason_code_counts.get(reason, 0) + 1
             except Exception:
                 continue
         return (
             batches,
             transactions,
             total_records,
+            total_798,
             total_799,
+            files_with_798,
             files_with_799,
             type_counts,
-            code_counts,
+            txn_code_counts,
+            reason_code_counts,
         )
 
     def _bank_abas(self):
@@ -265,30 +285,46 @@ class ACHMDVValidator:
                 self.total_batches,
                 self.total_transactions,
                 self.total_records,
+                self.total_798_records,
                 self.total_799_records,
+                self.files_with_798,
                 self.files_with_799,
-                self._799_type_counts,
-                self._799_code_counts,
+                self._79x_type_counts,
+                self._79x_txn_code_counts,
+                self._79x_reason_code_counts,
             ) = self._count_dataset_stats(fileNames)
             self.logger.info(f"Total Number of Batches (Type-5): {self.total_batches}")
             self.logger.info(f"Total Number of Transactions (Type-6): {self.total_transactions}")
             self.logger.info(f"Total Number of Records (all lines): {self.total_records}")
-            self.logger.info(f"Total Number of Return/Change Records (starts with 799): {self.total_799_records}")
-            if self.total_799_records:
-                self.logger.info(f"Files containing 799 records: {len(self.files_with_799)}")
+            total_79x = self.total_798_records + self.total_799_records
+            self.logger.info(f"Total Number of Return/Change Records (starts with 798/799): {total_79x}")
+            if total_79x:
                 self.logger.info(
-                    f"799 Type counts (R vs C): R={self._799_type_counts.get('R', 0)} "
-                    f"C={self._799_type_counts.get('C', 0)} "
-                    f"OTHER={self._799_type_counts.get('OTHER', 0)}"
+                    f"Files containing 798 records: {len(self.files_with_798)}; "
+                    f"Files containing 799 records: {len(self.files_with_799)}"
+                )
+                self.logger.info(
+                    f"79x Type counts (R vs C): R={self._79x_type_counts.get('R', 0)} "
+                    f"C={self._79x_type_counts.get('C', 0)} "
+                    f"OTHER={self._79x_type_counts.get('OTHER', 0)}"
                 )
 
-                # Distribution of return/change codes (e.g., R01, C02) - show top 10
-                top_codes = sorted(
-                    self._799_code_counts.items(), key=lambda kv: kv[1], reverse=True
+                # 798C vs 799R summary (email-friendly)
+                cnt_798c = self._79x_txn_code_counts.get("798C", 0)
+                cnt_799r = self._79x_txn_code_counts.get("799R", 0)
+                pct_798c = (100.0 * cnt_798c / total_79x) if total_79x else 0.0
+                pct_799r = (100.0 * cnt_799r / total_79x) if total_79x else 0.0
+                self.logger.info(
+                    f"Transaction codes summary: 799R={cnt_799r} ({pct_799r:.2f}%), 798C={cnt_798c} ({pct_798c:.2f}%)"
+                )
+
+                # Distribution of reason codes (e.g., 799R01, 798C29) - show top 10
+                top_reasons = sorted(
+                    self._79x_reason_code_counts.items(), key=lambda kv: kv[1], reverse=True
                 )[:10]
-                if top_codes:
-                    self.logger.info("799 Code distribution (top 10):")
-                    for idx, (code, cnt) in enumerate(top_codes, 1):
+                if top_reasons:
+                    self.logger.info("79x Return/Change Code distribution (top 10):")
+                    for idx, (code, cnt) in enumerate(top_reasons, 1):
                         self.logger.info(f"  {idx}. {code} -> {cnt}")
 
             bank_abas = self._bank_abas()
@@ -563,20 +599,30 @@ class ACHMDVValidator:
                 "batches_type5": int(self.total_batches),
                 "transactions_type6": int(self.total_transactions),
                 "records_total": int(self.total_records),
+                "records_79x_total": int(self.total_798_records + self.total_799_records),
+                "records_798_total": int(self.total_798_records),
                 "records_799_total": int(self.total_799_records),
+                "files_with_798": int(len(self.files_with_798)),
                 "files_with_799": int(len(self.files_with_799)),
-                "799_type_counts": {
-                    "R": int(self._799_type_counts.get("R", 0)),
-                    "C": int(self._799_type_counts.get("C", 0)),
-                    "OTHER": int(self._799_type_counts.get("OTHER", 0)),
+                "79x_type_counts": {
+                    "R": int(self._79x_type_counts.get("R", 0)),
+                    "C": int(self._79x_type_counts.get("C", 0)),
+                    "OTHER": int(self._79x_type_counts.get("OTHER", 0)),
                 },
-                "799_code_distribution_top10": [
+                "79x_txn_code_distribution_top10": [
                     {"code": code, "count": int(cnt)}
                     for code, cnt in sorted(
-                        self._799_code_counts.items(), key=lambda kv: kv[1], reverse=True
+                        self._79x_txn_code_counts.items(), key=lambda kv: kv[1], reverse=True
                     )[:10]
                 ],
-                "799_code_distinct": int(len(self._799_code_counts)),
+                "79x_txn_code_distinct": int(len(self._79x_txn_code_counts)),
+                "79x_reason_code_distribution_top10": [
+                    {"code": code, "count": int(cnt)}
+                    for code, cnt in sorted(
+                        self._79x_reason_code_counts.items(), key=lambda kv: kv[1], reverse=True
+                    )[:10]
+                ],
+                "79x_reason_code_distinct": int(len(self._79x_reason_code_counts)),
             },
             "skipped_binary_files_count": int(len(self.skipped_binary_files)),
             "skipped_binary_files_sample": list(self.skipped_binary_files[:10]),
