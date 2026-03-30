@@ -38,6 +38,14 @@ class ACHMDVValidator:
         # - "Transactions" corresponds to total Type-6 (Entry Detail) records
         self.total_batches = 0
         self.total_transactions = 0
+        self.total_records = 0
+
+        # Return / Change detection (records starting with "799")
+        self.total_799_records = 0
+        self.files_with_799 = set()
+        self._799_type_counts = {"R": 0, "C": 0, "OTHER": 0}
+        # Distribution keyed by full code e.g. "R01", "C02"
+        self._799_code_counts = {}
         self._binary_cache = {}
 
         # Retail ODFI indicator (classification, NOT a validation failure):
@@ -87,16 +95,26 @@ class ACHMDVValidator:
             self._binary_cache[filepath] = True
             return True
 
-    def _count_batches_and_transactions(self, fileNames):
+    def _count_dataset_stats(self, fileNames):
         """
-        Count totals equivalent to:
-          find . -name '*.ACH' -exec grep '^5' {} + | wc -l
-          find . -name '*.ACH' -exec grep '^6' {} + | wc -l
+        Count dataset totals, including:
+        - Type-5 batches (grep '^5' | wc -l)
+        - Type-6 transactions (grep '^6' | wc -l)
+        - Total records (line count)
+        - Return/Change records starting with '799' (grep '^799' | wc -l)
+          - 'R' vs 'C' type is 1 character after 799 (position 4)
+          - Code distribution uses the next 2 chars (positions 5-6), reported as e.g. R01
 
         Uses a lightweight byte-scan and skips binary/encrypted files (same policy as validation).
         """
         batches = 0
         transactions = 0
+        total_records = 0
+        total_799 = 0
+        type_counts = {"R": 0, "C": 0, "OTHER": 0}
+        code_counts = {}
+        files_with_799 = set()
+
         for fname in fileNames:
             filepath = os.path.join(self.config.data_path, fname)
             if self._is_binary_file(filepath):
@@ -104,14 +122,45 @@ class ACHMDVValidator:
             try:
                 with open(filepath, "rb") as f:
                     for line_bytes in f:
+                        if not line_bytes:
+                            continue
+                        total_records += 1
                         b0 = line_bytes[:1]
                         if b0 == b"5":
                             batches += 1
                         elif b0 == b"6":
                             transactions += 1
+                        else:
+                            # Return / change record signature
+                            if line_bytes[:3] == b"799":
+                                total_799 += 1
+                                files_with_799.add(fname)
+                                type_b = line_bytes[3:4]
+                                type_chr = (
+                                    type_b.decode("ascii", "ignore") if type_b else ""
+                                )
+                                if type_chr not in ("R", "C"):
+                                    type_counts["OTHER"] += 1
+                                    continue
+                                type_counts[type_chr] += 1
+                                digits = line_bytes[4:6].decode("ascii", "ignore")
+                                digits = "".join(ch for ch in digits if ch.isdigit())
+                                if len(digits) == 2:
+                                    code = f"{type_chr}{digits}"
+                                else:
+                                    code = f"{type_chr}??"
+                                code_counts[code] = code_counts.get(code, 0) + 1
             except Exception:
                 continue
-        return batches, transactions
+        return (
+            batches,
+            transactions,
+            total_records,
+            total_799,
+            files_with_799,
+            type_counts,
+            code_counts,
+        )
 
     def _bank_abas(self):
         """
@@ -211,10 +260,36 @@ class ACHMDVValidator:
             )
 
             # Dataset-level stats requested by customers
-            self.logger.info("Computing total batches (Type-5) and transactions (Type-6)...")
-            self.total_batches, self.total_transactions = self._count_batches_and_transactions(fileNames)
+            self.logger.info("Computing dataset totals (records, batches, transactions, and returns)...")
+            (
+                self.total_batches,
+                self.total_transactions,
+                self.total_records,
+                self.total_799_records,
+                self.files_with_799,
+                self._799_type_counts,
+                self._799_code_counts,
+            ) = self._count_dataset_stats(fileNames)
             self.logger.info(f"Total Number of Batches (Type-5): {self.total_batches}")
             self.logger.info(f"Total Number of Transactions (Type-6): {self.total_transactions}")
+            self.logger.info(f"Total Number of Records (all lines): {self.total_records}")
+            self.logger.info(f"Total Number of Return/Change Records (starts with 799): {self.total_799_records}")
+            if self.total_799_records:
+                self.logger.info(f"Files containing 799 records: {len(self.files_with_799)}")
+                self.logger.info(
+                    f"799 Type counts (R vs C): R={self._799_type_counts.get('R', 0)} "
+                    f"C={self._799_type_counts.get('C', 0)} "
+                    f"OTHER={self._799_type_counts.get('OTHER', 0)}"
+                )
+
+                # Distribution of return/change codes (e.g., R01, C02) - show top 10
+                top_codes = sorted(
+                    self._799_code_counts.items(), key=lambda kv: kv[1], reverse=True
+                )[:10]
+                if top_codes:
+                    self.logger.info("799 Code distribution (top 10):")
+                    for idx, (code, cnt) in enumerate(top_codes, 1):
+                        self.logger.info(f"  {idx}. {code} -> {cnt}")
 
             bank_abas = self._bank_abas()
             if bank_abas:
@@ -487,6 +562,21 @@ class ACHMDVValidator:
             "totals": {
                 "batches_type5": int(self.total_batches),
                 "transactions_type6": int(self.total_transactions),
+                "records_total": int(self.total_records),
+                "records_799_total": int(self.total_799_records),
+                "files_with_799": int(len(self.files_with_799)),
+                "799_type_counts": {
+                    "R": int(self._799_type_counts.get("R", 0)),
+                    "C": int(self._799_type_counts.get("C", 0)),
+                    "OTHER": int(self._799_type_counts.get("OTHER", 0)),
+                },
+                "799_code_distribution_top10": [
+                    {"code": code, "count": int(cnt)}
+                    for code, cnt in sorted(
+                        self._799_code_counts.items(), key=lambda kv: kv[1], reverse=True
+                    )[:10]
+                ],
+                "799_code_distinct": int(len(self._799_code_counts)),
             },
             "skipped_binary_files_count": int(len(self.skipped_binary_files)),
             "skipped_binary_files_sample": list(self.skipped_binary_files[:10]),
