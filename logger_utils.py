@@ -2,6 +2,7 @@ import logging
 import os
 import json
 from datetime import datetime
+from typing import List, Optional
 
 
 class LogManager:
@@ -46,7 +47,9 @@ class LogManager:
 
         return LogManager(logger, full_log_path, loglevel), full_log_path
 
-    def log_header(self, dataset_name: str, file_count: int, extra_lines: list[str] | None = None):
+    def log_header(
+        self, dataset_name: str, file_count: int, extra_lines: Optional[List[str]] = None
+    ):
         self.logger.info("=" * 60)
         self.logger.info(" DATA VALIDATION REPORT")
         self.logger.info("=" * 60)
