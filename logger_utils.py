@@ -46,13 +46,22 @@ class LogManager:
 
         return LogManager(logger, full_log_path, loglevel), full_log_path
 
-    def log_header(self, dataset_name: str, file_count: int):
+    def log_header(self, dataset_name: str, file_count: int, extra_lines: list[str] | None = None):
         self.logger.info("=" * 60)
         self.logger.info(" DATA VALIDATION REPORT")
         self.logger.info("=" * 60)
         self.logger.info(f"Date: {datetime.now().strftime('%d-%b-%Y %H:%M')}")
         self.logger.info(f"Dataset: {dataset_name}")
-        self.logger.info(f"Files processed: {file_count}\n")
+        self.logger.info(f"Files processed: {file_count}")
+        if extra_lines:
+            for i, line in enumerate(extra_lines):
+                # Append a final newline to create a blank spacer line without a timestamped INFO record.
+                if i == len(extra_lines) - 1:
+                    self.logger.info(f"{line}\n")
+                else:
+                    self.logger.info(line)
+        else:
+            self.logger.info("")
 
     def log_check(self, check_name: str, status: str, details: str, guideline: str = ""):
         status = status.upper()

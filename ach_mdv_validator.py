@@ -274,11 +274,6 @@ class ACHMDVValidator:
 
             total_files = len(fileNames)
 
-            self.log.log_header("ACH RDV Validation", total_files)
-            self.logger.info(
-                f"Starting validation of {total_files} files from {self.config.data_path}"
-            )
-
             # Dataset-level stats requested by customers
             self.logger.info("Computing dataset totals (records, batches, transactions, and returns)...")
             (
@@ -293,8 +288,22 @@ class ACHMDVValidator:
                 self._79x_txn_code_counts,
                 self._79x_reason_code_counts,
             ) = self._count_dataset_stats(fileNames)
-            self.logger.info(f"Total Number of Batches (Type-5): {self.total_batches}")
-            self.logger.info(f"Total Number of Transactions (Type-6): {self.total_transactions}")
+
+            # Print totals directly under "Files processed" to reduce clutter
+            self.log.log_header(
+                "ACH RDV Validation",
+                total_files,
+                extra_lines=[
+                    f"Total Number of Batches (Type-5): {self.total_batches}",
+                    f"Total Number of Transactions (Type-6): {self.total_transactions}",
+                    "",
+                ],
+            )
+            self.logger.info(
+                f"Starting validation of {total_files} files from {self.config.data_path}"
+            )
+
+            # Additional dataset metrics (keep here; batches/transactions already printed in header)
             self.logger.info(f"Total Number of Records (all lines): {self.total_records}")
             total_79x = self.total_798_records + self.total_799_records
             self.logger.info(f"Total Number of Return/Change Records (starts with 798/799): {total_79x}")
