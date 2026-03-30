@@ -669,21 +669,27 @@ class ACHMDVValidator:
             if inferred_retail:
                 reason_line = reasons[0] if reasons else "Retail ODFI heuristic triggered"
             else:
-                reason_line = "Multiple Company ID values detected"
+                reason_line = f"Multiple Company ID values detected ({uniq_for_inference} distinct values)"
 
             self.logger.info("")
             self.logger.info("Retail ODFI Evaluation:")
             self.logger.info("-" * 70)
             self.logger.info(f"Evaluation result: Retail ODFI = {'YES' if inferred_retail else 'NO'}")
             self.logger.info(f"Reason: {reason_line}")
+            uniq_basis = "digits-only" if unique_digits > 0 else "raw 10-char"
+            self.logger.info(f"Distinct Company ID values observed: {uniq_for_inference} ({uniq_basis})")
 
-            # Show the exact command-equivalent results (top 5) plus optional next values.
-            self.logger.info("Top ACH Company ID (Type-5 pos 41-50) values:")
-            for idx, (val, cnt) in enumerate(top_all[:10], 1):
+            # Equivalent to:
+            #   grep -h ^5 *.ACH | cut -c41-50 | sort | uniq -c | sort -nr | head -5
+            self.logger.info("Top 5 ACH Company ID values (Type-5 pos 41-50):")
+            for idx, (val, cnt) in enumerate(top_all[:5], 1):
                 self.logger.info(f"  {idx}. '{val}' -> {cnt}")
-                if idx == 5 and len(top_all) > 5:
-                    # visually separate the required top-5 from the rest without adding extra headers
-                    self.logger.info("  ...")
+
+            # Also show Top 10 (requested)
+            if len(top_all) > 5:
+                self.logger.info("Top 10 ACH Company ID values (Type-5 pos 41-50):")
+                for idx, (val, cnt) in enumerate(top_all[:10], 1):
+                    self.logger.info(f"  {idx}. '{val}' -> {cnt}")
 
             if bank_abas:
                 self.logger.info(f"Configured bank ABA(s): {', '.join(bank_abas)}")
