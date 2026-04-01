@@ -51,6 +51,15 @@ class ACHMDVValidator:
         self._79x_type_counts = {"R": 0, "C": 0, "OTHER": 0}
         self._79x_txn_code_counts = {}  # e.g. "799R", "798C"
         self._79x_reason_code_counts = {}  # e.g. "799R01", "798C29"
+
+        # Special character / encoding integrity detection (byte-level)
+        # Any non-ASCII or unexpected control bytes can break fixed-position parsing when decoded.
+        self.special_char_files = set()
+        self.special_char_lines = 0
+        self.special_char_byte_counts = {}  # int byte -> count
+        self.special_char_control_counts = {}  # int byte -> count (0-31,127)
+        self.special_char_non_ascii_counts = {}  # int byte -> count (>=128)
+        self.special_char_samples = []  # list of dicts
         self._binary_cache = {}
 
         # Retail ODFI indicator (classification, NOT a validation failure):
@@ -111,6 +120,10 @@ class ACHMDVValidator:
           - Transaction-code distribution is the 4-char token: 799R / 798C (positions 1-4)
         - Reason-code distribution uses the next 2 digits (positions 5-6), e.g. R01, C29
 
+        Also detects non-ASCII / unexpected control bytes (byte-level) that may cause downstream
+        misalignment when other components decode as UTF-8 or otherwise treat multi-byte sequences
+        as single characters.
+
         Uses a lightweight byte-scan and skips binary/encrypted files (same policy as validation).
         """
         batches = 0
@@ -124,16 +137,72 @@ class ACHMDVValidator:
         txn_code_counts = {}  # 4-char: 798C / 799R
         reason_code_counts = {}  # 3-char-ish: R01 / C29
 
+        # Special character detection
+        special_files = set()
+        special_lines = 0
+        byte_counts = {}
+        control_counts = {}
+        non_ascii_counts = {}
+        samples = []
+        SAMPLE_LIMIT = 20
+
         for fname in fileNames:
             filepath = os.path.join(self.config.data_path, fname)
             if self._is_binary_file(filepath):
                 continue
             try:
                 with open(filepath, "rb") as f:
-                    for line_bytes in f:
+                    for file_line, line_bytes in enumerate(f, 1):
                         if not line_bytes:
                             continue
                         total_records += 1
+                        raw = line_bytes.rstrip(b"\r\n")
+
+                        # Byte-level special character detection.
+                        # Allowed bytes for NACHA fixed-width: printable ASCII 0x20-0x7E and space padding.
+                        # Flag anything outside that range.
+                        bad_positions = []
+                        bad_bytes = []
+                        for i, b in enumerate(raw):
+                            if 0x20 <= b <= 0x7E:
+                                continue
+                            bad_positions.append(i)
+                            bad_bytes.append(b)
+
+                        if bad_bytes:
+                            special_lines += 1
+                            special_files.add(fname)
+                            for b in bad_bytes:
+                                byte_counts[b] = byte_counts.get(b, 0) + 1
+                                if b >= 0x80:
+                                    non_ascii_counts[b] = non_ascii_counts.get(b, 0) + 1
+                                elif b < 0x20 or b == 0x7F:
+                                    control_counts[b] = control_counts.get(b, 0) + 1
+
+                            if len(samples) < SAMPLE_LIMIT:
+                                # Diagnostics for SEC code offset issues (bytes vs utf-8 char indexing)
+                                sec_bytes = raw[50:53]
+                                sec_bytes_ascii = sec_bytes.decode("ascii", "replace")
+                                try:
+                                    utf8_text = raw.decode("utf-8", "replace")
+                                    sec_utf8_chars = utf8_text[50:53] if len(utf8_text) >= 53 else ""
+                                except Exception:
+                                    sec_utf8_chars = ""
+
+                                preview = raw[:120].decode("ascii", "replace")
+                                samples.append(
+                                    {
+                                        "file": fname,
+                                        "line_number": int(file_line),
+                                        "bad_byte_count": int(len(bad_bytes)),
+                                        "bad_byte_positions_0_based": bad_positions[:50],
+                                        "bad_bytes_hex": [f"0x{b:02X}" for b in bad_bytes[:20]],
+                                        "sec_code_bytes_50_53_ascii": sec_bytes_ascii,
+                                        "sec_code_utf8_chars_50_53": sec_utf8_chars,
+                                        "preview_ascii_replace": preview,
+                                    }
+                                )
+
                         b0 = line_bytes[:1]
                         if b0 == b"5":
                             batches += 1
@@ -141,7 +210,7 @@ class ACHMDVValidator:
                             transactions += 1
                         else:
                             # Return / change record signature
-                            prefix = line_bytes[:3]
+                            prefix = raw[:3]
                             if prefix in (b"798", b"799"):
                                 if prefix == b"798":
                                     total_798 += 1
@@ -150,7 +219,7 @@ class ACHMDVValidator:
                                     total_799 += 1
                                     files_with_799.add(fname)
 
-                                type_b = line_bytes[3:4]
+                                type_b = raw[3:4]
                                 type_chr = type_b.decode("ascii", "ignore") if type_b else ""
                                 txn_code = f"{prefix.decode('ascii', 'ignore')}{type_chr}" if type_chr else prefix.decode("ascii", "ignore")
                                 txn_code_counts[txn_code] = txn_code_counts.get(txn_code, 0) + 1
@@ -160,7 +229,7 @@ class ACHMDVValidator:
                                     continue
                                 type_counts[type_chr] += 1
 
-                                digits = line_bytes[4:6].decode("ascii", "ignore")
+                                digits = raw[4:6].decode("ascii", "ignore")
                                 digits = "".join(ch for ch in digits if ch.isdigit())
                                 if len(digits) == 2:
                                     reason = f"{type_chr}{digits}"
@@ -180,6 +249,12 @@ class ACHMDVValidator:
             type_counts,
             txn_code_counts,
             reason_code_counts,
+            special_files,
+            special_lines,
+            byte_counts,
+            control_counts,
+            non_ascii_counts,
+            samples,
         )
 
     def _bank_abas(self):
@@ -287,7 +362,22 @@ class ACHMDVValidator:
                 self._79x_type_counts,
                 self._79x_txn_code_counts,
                 self._79x_reason_code_counts,
+                self.special_char_files,
+                self.special_char_lines,
+                self.special_char_byte_counts,
+                self.special_char_control_counts,
+                self.special_char_non_ascii_counts,
+                self.special_char_samples,
             ) = self._count_dataset_stats(fileNames)
+
+            special_file_count = len(self.special_char_files)
+            special_line_count = int(self.special_char_lines)
+
+            special_summary = (
+                "None detected"
+                if special_line_count == 0
+                else f"{special_line_count} line(s) in {special_file_count} file(s)"
+            )
 
             # Print totals directly under "Files processed" to reduce clutter
             self.log.log_header(
@@ -296,6 +386,7 @@ class ACHMDVValidator:
                 extra_lines=[
                     f"Total Number of Batches (Type-5): {self.total_batches}",
                     f"Total Number of Transactions (Type-6): {self.total_transactions}",
+                    f"Non-ASCII / Special character lines: {special_summary}",
                     "",
                 ],
             )
@@ -632,6 +723,29 @@ class ACHMDVValidator:
                     )[:10]
                 ],
                 "79x_reason_code_distinct": int(len(self._79x_reason_code_counts)),
+            },
+            "encoding_integrity": {
+                "files_with_special_bytes": int(len(self.special_char_files)),
+                "lines_with_special_bytes": int(self.special_char_lines),
+                "top_bytes_hex": [
+                    {"byte": f"0x{b:02X}", "count": int(cnt)}
+                    for b, cnt in sorted(
+                        self.special_char_byte_counts.items(), key=lambda kv: kv[1], reverse=True
+                    )[:10]
+                ],
+                "top_non_ascii_bytes_hex": [
+                    {"byte": f"0x{b:02X}", "count": int(cnt)}
+                    for b, cnt in sorted(
+                        self.special_char_non_ascii_counts.items(), key=lambda kv: kv[1], reverse=True
+                    )[:10]
+                ],
+                "top_control_bytes_hex": [
+                    {"byte": f"0x{b:02X}", "count": int(cnt)}
+                    for b, cnt in sorted(
+                        self.special_char_control_counts.items(), key=lambda kv: kv[1], reverse=True
+                    )[:10]
+                ],
+                "samples": list(self.special_char_samples),
             },
             "skipped_binary_files_count": int(len(self.skipped_binary_files)),
             "skipped_binary_files_sample": list(self.skipped_binary_files[:10]),
