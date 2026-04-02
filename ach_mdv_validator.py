@@ -40,17 +40,16 @@ class ACHMDVValidator:
         self.total_transactions = 0
         self.total_records = 0
 
-        # Return / Change detection (records starting with "798" or "799")
-        # Common patterns observed:
-        # - 799R = return
-        # - 798C = change (NOC-style)
-        self.total_798_records = 0
-        self.total_799_records = 0
-        self.files_with_798 = set()
-        self.files_with_799 = set()
-        self._79x_type_counts = {"R": 0, "C": 0, "OTHER": 0}
-        self._79x_txn_code_counts = {}  # e.g. "799R", "798C"
-        self._79x_reason_code_counts = {}  # e.g. "799R01", "798C29"
+        # Record Type 7 Addenda detection (Returns / NOCs)
+        # Common patterns:
+        # - Type-7, Addenda Type Code 99 => Standard Return (aka "799")
+        # - Type-7, Addenda Type Code 98 => Notification of Change (aka "798")
+        self.type7_addenda_records = 0
+        self.type7_addenda_type_counts = {}  # e.g. {"98": 467, "99": 1243}
+        self.type7_standard_returns_799 = 0
+        self.type7_nocs_798 = 0
+        self.type7_rc_flag_counts = {"R": 0, "C": 0, "OTHER": 0}  # cut -c4-4
+        self.type7_return_code_counts = {}  # cut -c5-6 with R/C prefix => R01, C29
 
         # Special character / encoding integrity detection (byte-level)
         # Any non-ASCII or unexpected control bytes can break fixed-position parsing when decoded.
@@ -115,10 +114,13 @@ class ACHMDVValidator:
         - Type-5 batches (grep '^5' | wc -l)
         - Type-6 transactions (grep '^6' | wc -l)
         - Total records (line count)
-        - Return/Change records starting with '798' or '799' (grep '^(798|799)' | wc -l)
-          - Return vs Change is 1 character after 798/799 (position 4): 'R' or 'C'
-          - Transaction-code distribution is the 4-char token: 799R / 798C (positions 1-4)
-        - Reason-code distribution uses the next 2 digits (positions 5-6), e.g. R01, C29
+        - Record Type 7 Addenda:
+          - Total Type-7 records (grep '^7' | wc -l)
+          - Addenda Type Code distribution (cut -c2-3)
+          - 799 (Standard Returns) = Addenda Type Code 99
+          - 798 (Notifications of Change) = Addenda Type Code 98
+          - Return/Change flag distribution (cut -c4-4) => R vs C
+          - Return code distribution (cut -c5-6) reported as R01/C29 (Top 10)
 
         Also detects non-ASCII / unexpected control bytes (byte-level) that may cause downstream
         misalignment when other components decode as UTF-8 or otherwise treat multi-byte sequences
@@ -129,13 +131,12 @@ class ACHMDVValidator:
         batches = 0
         transactions = 0
         total_records = 0
-        total_798 = 0
-        total_799 = 0
-        files_with_798 = set()
-        files_with_799 = set()
-        type_counts = {"R": 0, "C": 0, "OTHER": 0}  # aggregated across 798/799
-        txn_code_counts = {}  # 4-char: 798C / 799R
-        reason_code_counts = {}  # 3-char-ish: R01 / C29
+        type7_count = 0
+        addenda_type_counts = {}
+        standard_returns_799 = 0
+        nocs_798 = 0
+        rc_flag_counts = {"R": 0, "C": 0, "OTHER": 0}
+        return_code_counts = {}
 
         # Special character detection
         special_files = set()
@@ -209,46 +210,41 @@ class ACHMDVValidator:
                         elif b0 == b"6":
                             transactions += 1
                         else:
-                            # Return / change record signature
-                            prefix = raw[:3]
-                            if prefix in (b"798", b"799"):
-                                if prefix == b"798":
-                                    total_798 += 1
-                                    files_with_798.add(fname)
-                                else:
-                                    total_799 += 1
-                                    files_with_799.add(fname)
+                            # Type-7 addenda parsing (byte offsets, fixed width)
+                            if raw[:1] == b"7":
+                                type7_count += 1
+                                addenda_type = raw[1:3].decode("ascii", "ignore")
+                                if addenda_type:
+                                    addenda_type_counts[addenda_type] = (
+                                        addenda_type_counts.get(addenda_type, 0) + 1
+                                    )
+                                if addenda_type == "99":
+                                    standard_returns_799 += 1
+                                elif addenda_type == "98":
+                                    nocs_798 += 1
 
-                                type_b = raw[3:4]
-                                type_chr = type_b.decode("ascii", "ignore") if type_b else ""
-                                txn_code = f"{prefix.decode('ascii', 'ignore')}{type_chr}" if type_chr else prefix.decode("ascii", "ignore")
-                                txn_code_counts[txn_code] = txn_code_counts.get(txn_code, 0) + 1
-
-                                if type_chr not in ("R", "C"):
-                                    type_counts["OTHER"] += 1
+                                rc_flag = raw[3:4].decode("ascii", "ignore") if len(raw) >= 4 else ""
+                                if rc_flag not in ("R", "C"):
+                                    rc_flag_counts["OTHER"] += 1
                                     continue
-                                type_counts[type_chr] += 1
+                                rc_flag_counts[rc_flag] += 1
 
                                 digits = raw[4:6].decode("ascii", "ignore")
                                 digits = "".join(ch for ch in digits if ch.isdigit())
-                                if len(digits) == 2:
-                                    reason = f"{type_chr}{digits}"
-                                else:
-                                    reason = f"{type_chr}??"
-                                reason_code_counts[reason] = reason_code_counts.get(reason, 0) + 1
+                                code = f"{rc_flag}{digits}" if len(digits) == 2 else f"{rc_flag}??"
+                                return_code_counts[code] = return_code_counts.get(code, 0) + 1
             except Exception:
                 continue
         return (
             batches,
             transactions,
             total_records,
-            total_798,
-            total_799,
-            files_with_798,
-            files_with_799,
-            type_counts,
-            txn_code_counts,
-            reason_code_counts,
+            type7_count,
+            addenda_type_counts,
+            standard_returns_799,
+            nocs_798,
+            rc_flag_counts,
+            return_code_counts,
             special_files,
             special_lines,
             byte_counts,
@@ -360,13 +356,12 @@ class ACHMDVValidator:
                 self.total_batches,
                 self.total_transactions,
                 self.total_records,
-                self.total_798_records,
-                self.total_799_records,
-                self.files_with_798,
-                self.files_with_799,
-                self._79x_type_counts,
-                self._79x_txn_code_counts,
-                self._79x_reason_code_counts,
+                self.type7_addenda_records,
+                self.type7_addenda_type_counts,
+                self.type7_standard_returns_799,
+                self.type7_nocs_798,
+                self.type7_rc_flag_counts,
+                self.type7_return_code_counts,
                 self.special_char_files,
                 self.special_char_lines,
                 self.special_char_byte_counts,
@@ -418,35 +413,36 @@ class ACHMDVValidator:
 
             # Additional dataset metrics (keep here; batches/transactions already printed in header)
             self.logger.info(f"Total Number of Records (all lines): {self.total_records}")
-            total_79x = self.total_798_records + self.total_799_records
-            self.logger.info(f"Total Number of Return/Change Records (starts with 798/799): {total_79x}")
-            if total_79x:
-                self.logger.info(
-                    f"Files containing 798 records: {len(self.files_with_798)}; "
-                    f"Files containing 799 records: {len(self.files_with_799)}"
-                )
-                self.logger.info(
-                    f"79x Type counts (R vs C): R={self._79x_type_counts.get('R', 0)} "
-                    f"C={self._79x_type_counts.get('C', 0)} "
-                    f"OTHER={self._79x_type_counts.get('OTHER', 0)}"
-                )
-
-                # 798C vs 799R summary (email-friendly)
-                cnt_798c = self._79x_txn_code_counts.get("798C", 0)
-                cnt_799r = self._79x_txn_code_counts.get("799R", 0)
-                pct_798c = (100.0 * cnt_798c / total_79x) if total_79x else 0.0
-                pct_799r = (100.0 * cnt_799r / total_79x) if total_79x else 0.0
-                self.logger.info(
-                    f"Transaction codes summary: 799R={cnt_799r} ({pct_799r:.2f}%), 798C={cnt_798c} ({pct_798c:.2f}%)"
-                )
-
-                # Distribution of reason codes (e.g., 799R01, 798C29) - show top 10
-                top_reasons = sorted(
-                    self._79x_reason_code_counts.items(), key=lambda kv: kv[1], reverse=True
+            self.logger.info(
+                f"Entries Starting with Type 7 Addenda Record: {int(self.type7_addenda_records)}"
+            )
+            if self.type7_addenda_records:
+                self.logger.info("Addenda Type Code distribution (top 10):")
+                top_addenda = sorted(
+                    self.type7_addenda_type_counts.items(),
+                    key=lambda kv: kv[1],
+                    reverse=True,
                 )[:10]
-                if top_reasons:
-                    self.logger.info("79x Return/Change Code distribution (top 10):")
-                    for idx, (code, cnt) in enumerate(top_reasons, 1):
+                for idx, (code, cnt) in enumerate(top_addenda, 1):
+                    self.logger.info(f"  {idx}. {code} -> {cnt}")
+
+                self.logger.info(f"799 (Standard Returns): {int(self.type7_standard_returns_799)}")
+                self.logger.info(f"798 (Notifications of Change): {int(self.type7_nocs_798)}")
+
+                self.logger.info(
+                    f"Type 7 R/C counts: R={self.type7_rc_flag_counts.get('R', 0)} "
+                    f"C={self.type7_rc_flag_counts.get('C', 0)} "
+                    f"OTHER={self.type7_rc_flag_counts.get('OTHER', 0)}"
+                )
+
+                top_rc = sorted(
+                    self.type7_return_code_counts.items(), key=lambda kv: kv[1], reverse=True
+                )[:10]
+                if top_rc:
+                    self.logger.info(
+                        "Record Type 7 Return Code Distribution (Top 10):"
+                    )
+                    for idx, (code, cnt) in enumerate(top_rc, 1):
                         self.logger.info(f"  {idx}. {code} -> {cnt}")
 
             bank_abas = self._bank_abas()
@@ -724,30 +720,32 @@ class ACHMDVValidator:
                 "batches_type5": int(self.total_batches),
                 "transactions_type6": int(self.total_transactions),
                 "records_total": int(self.total_records),
-                "records_79x_total": int(self.total_798_records + self.total_799_records),
-                "records_798_total": int(self.total_798_records),
-                "records_799_total": int(self.total_799_records),
-                "files_with_798": int(len(self.files_with_798)),
-                "files_with_799": int(len(self.files_with_799)),
-                "79x_type_counts": {
-                    "R": int(self._79x_type_counts.get("R", 0)),
-                    "C": int(self._79x_type_counts.get("C", 0)),
-                    "OTHER": int(self._79x_type_counts.get("OTHER", 0)),
+                "type7_addenda_records": int(self.type7_addenda_records),
+                "type7_addenda_type_code_distinct": int(len(self.type7_addenda_type_counts)),
+                "type7_addenda_type_code_distribution_top10": [
+                    {"code": code, "count": int(cnt)}
+                    for code, cnt in sorted(
+                        self.type7_addenda_type_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )[:10]
+                ],
+                "799_standard_returns": int(self.type7_standard_returns_799),
+                "798_notifications_of_change": int(self.type7_nocs_798),
+                "type7_rc_flag_counts": {
+                    "R": int(self.type7_rc_flag_counts.get("R", 0)),
+                    "C": int(self.type7_rc_flag_counts.get("C", 0)),
+                    "OTHER": int(self.type7_rc_flag_counts.get("OTHER", 0)),
                 },
-                "79x_txn_code_distribution_top10": [
+                "record_type_7_return_code_distribution_top10": [
                     {"code": code, "count": int(cnt)}
                     for code, cnt in sorted(
-                        self._79x_txn_code_counts.items(), key=lambda kv: kv[1], reverse=True
+                        self.type7_return_code_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
                     )[:10]
                 ],
-                "79x_txn_code_distinct": int(len(self._79x_txn_code_counts)),
-                "79x_reason_code_distribution_top10": [
-                    {"code": code, "count": int(cnt)}
-                    for code, cnt in sorted(
-                        self._79x_reason_code_counts.items(), key=lambda kv: kv[1], reverse=True
-                    )[:10]
-                ],
-                "79x_reason_code_distinct": int(len(self._79x_reason_code_counts)),
+                "record_type_7_return_code_distinct": int(len(self.type7_return_code_counts)),
             },
             "encoding_integrity": {
                 "files_with_special_bytes": int(len(self.special_char_files)),
