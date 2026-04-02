@@ -42,6 +42,10 @@ class Config:
         self.max_error_percent = conf.getfloat("max_error_percent", 2.0)
         self.log_level = conf.get("log_level", "INFO")
         self.update_delta = conf.getint("update_delta", 5)
+        # Progress logging can be noisy on large datasets; allow disabling.
+        self.show_progress = conf.getboolean("show_progress", False)
+        # If False, suppress "Process is X% done" progress logs (reduces clutter for large folders).
+        self.show_progress = conf.getboolean("show_progress", True)
         self.match_risk_engine = conf.getboolean("match_risk_engine", False)
         self.full_file_path = conf.getboolean("full_file_path", False)
         self.show_problem_lines = conf.getboolean("show_problem_lines", True)

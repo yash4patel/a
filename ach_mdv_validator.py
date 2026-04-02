@@ -349,6 +349,11 @@ class ACHMDVValidator:
 
             total_files = len(fileNames)
 
+            # Keep this at the top to make the log easier to read.
+            self.logger.info(
+                f"Starting validation of {total_files} files from {self.config.data_path}"
+            )
+
             # Dataset-level stats requested by customers
             self.logger.info("Computing dataset totals (records, batches, transactions, and returns)...")
             (
@@ -379,6 +384,25 @@ class ACHMDVValidator:
                 else f"{special_line_count} line(s) in {special_file_count} file(s)"
             )
 
+            special_detected = special_line_count > 0
+            special_detected_str = "TRUE" if special_detected else "FALSE"
+
+            # optional: log a couple ticket-style examples for customer handoff
+            examples_lines = []
+            detected_special = special_line_count > 0
+            examples_lines.append(
+                f"Detected Non-ASCII/Special characters = {'TRUE' if detected_special else 'FALSE'}"
+            )
+            if detected_special:
+                # show up to 2 samples in log, JSON has more detail
+                for s in self.special_char_samples[:2]:
+                    examples_lines.append(
+                        f"Example: file={s.get('file')} line_number={s.get('line_number')} "
+                        f"sec_code(bytes@50-53)={s.get('sec_code_bytes_50_53_ascii')} "
+                        f"sec_code(utf8_chars@50-53)={s.get('sec_code_utf8_chars_50_53')} "
+                        f"(shift_detected={'YES' if s.get('sec_code_bytes_50_53_ascii') != s.get('sec_code_utf8_chars_50_53') else 'NO'})"
+                    )
+
             # Print totals directly under "Files processed" to reduce clutter
             self.log.log_header(
                 "ACH RDV Validation",
@@ -387,11 +411,9 @@ class ACHMDVValidator:
                     f"Total Number of Batches (Type-5): {self.total_batches}",
                     f"Total Number of Transactions (Type-6): {self.total_transactions}",
                     f"Non-ASCII / Special character lines: {special_summary}",
+                    *examples_lines,
                     "",
                 ],
-            )
-            self.logger.info(
-                f"Starting validation of {total_files} files from {self.config.data_path}"
             )
 
             # Additional dataset metrics (keep here; batches/transactions already printed in header)
@@ -435,7 +457,10 @@ class ACHMDVValidator:
                     "`grep '^5' | cut -c41-50` (positions 41-50)."
                 )
 
+            # Progress logging can get very noisy on large datasets; off by default.
             next_update = self.config.update_delta
+            if getattr(self.config, "show_progress", False) is False:
+                next_update = 101  # never logs progress
 
             for file_counter, fname in enumerate(fileNames, 1):
                 try:
