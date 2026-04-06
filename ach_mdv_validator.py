@@ -59,6 +59,8 @@ class ACHMDVValidator:
         self.special_char_control_counts = {}  # int byte -> count (0-31,127)
         self.special_char_non_ascii_counts = {}  # int byte -> count (>=128)
         self.special_char_samples = []  # list of dicts
+        self.special_char_file_first_bad_line = {}  # fname -> first bad line number
+        self.special_char_file_bad_line_counts = {}  # fname -> count of bad lines
         self._binary_cache = {}
 
         # Retail ODFI indicator (classification, NOT a validation failure):
@@ -146,6 +148,8 @@ class ACHMDVValidator:
         non_ascii_counts = {}
         samples = []
         SAMPLE_LIMIT = 20
+        file_first_bad_line = {}  # fname -> first line number with bad bytes
+        file_bad_line_counts = {}  # fname -> number of lines with bad bytes
 
         for fname in fileNames:
             filepath = os.path.join(self.config.data_path, fname)
@@ -173,6 +177,8 @@ class ACHMDVValidator:
                         if bad_bytes:
                             special_lines += 1
                             special_files.add(fname)
+                            file_bad_line_counts[fname] = file_bad_line_counts.get(fname, 0) + 1
+                            file_first_bad_line.setdefault(fname, int(file_line))
                             for b in bad_bytes:
                                 byte_counts[b] = byte_counts.get(b, 0) + 1
                                 if b >= 0x80:
@@ -251,6 +257,8 @@ class ACHMDVValidator:
             control_counts,
             non_ascii_counts,
             samples,
+            file_first_bad_line,
+            file_bad_line_counts,
         )
 
     def _bank_abas(self):
@@ -368,6 +376,8 @@ class ACHMDVValidator:
                 self.special_char_control_counts,
                 self.special_char_non_ascii_counts,
                 self.special_char_samples,
+                self.special_char_file_first_bad_line,
+                self.special_char_file_bad_line_counts,
             ) = self._count_dataset_stats(fileNames)
 
             special_file_count = len(self.special_char_files)
@@ -397,6 +407,23 @@ class ACHMDVValidator:
                         f"sec_code(utf8_chars@50-53)={s.get('sec_code_utf8_chars_50_53')} "
                         f"(shift_detected={'YES' if s.get('sec_code_bytes_50_53_ascii') != s.get('sec_code_utf8_chars_50_53') else 'NO'})"
                     )
+
+                # Top 10 filenames with special bytes (with example line number and count of affected lines)
+                try:
+                    top_files = sorted(
+                        self.special_char_file_bad_line_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )[:10]
+                    if top_files:
+                        examples_lines.append("Top files with Non-ASCII/Special characters (up to 10):")
+                        for idx, (fname, cnt) in enumerate(top_files, 1):
+                            first_line = self.special_char_file_first_bad_line.get(fname)
+                            examples_lines.append(
+                                f"  {idx}. {fname} (bad_lines={cnt}, first_bad_line={first_line})"
+                            )
+                except Exception:
+                    pass
 
             # Print totals directly under "Files processed" to reduce clutter
             self.log.log_header(
@@ -750,6 +777,18 @@ class ACHMDVValidator:
             "encoding_integrity": {
                 "files_with_special_bytes": int(len(self.special_char_files)),
                 "lines_with_special_bytes": int(self.special_char_lines),
+                "files_top10": [
+                    {
+                        "file": fname,
+                        "bad_lines": int(cnt),
+                        "first_bad_line": int(self.special_char_file_first_bad_line.get(fname) or 0),
+                    }
+                    for fname, cnt in sorted(
+                        self.special_char_file_bad_line_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )[:10]
+                ],
                 "top_bytes_hex": [
                     {"byte": f"0x{b:02X}", "count": int(cnt)}
                     for b, cnt in sorted(
