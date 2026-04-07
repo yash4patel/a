@@ -8,6 +8,7 @@ from batch_data_check import BatchDateCompletenessAnalyzer
 from config import Config
 from logger_utils import LogManager
 import misc_functions
+from ai_runner import run_ai_summary
 
 
 def validate_file_extensions(data_path, logger=None):
@@ -199,6 +200,22 @@ def main():
         log_manager.write_json_report(workflow_report)
     except Exception:
         pass
+
+    # Optional: Generate AI / agent-based detailed summary from the combined JSON.
+    try:
+        if getattr(config, "ai_summary_enabled", False):
+            run_ai_summary(
+                report_json_path=log_manager.jsonfile,
+                base_url=getattr(config, "ollama_base_url", None),
+                model=getattr(config, "ollama_model", None),
+                dry_run=bool(getattr(config, "ai_summary_dry_run", True)),
+                allow_sensitive_evidence=bool(getattr(config, "ai_allow_sensitive_evidence", False)),
+                include_sanitized_samples=bool(getattr(config, "ai_include_sanitized_samples", False)),
+                max_samples=int(getattr(config, "ai_max_samples", 20)),
+                timeout_s=int(getattr(config, "ai_timeout_s", 180)),
+            )
+    except Exception as e:
+        logger.warning(f"AI summary generation skipped/failed: {e}")
 
     print(f"\nDetails and logs have been saved to: {full_log_path}")
     print(f"JSON summary saved to: {log_manager.jsonfile}")

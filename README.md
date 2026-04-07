@@ -8,8 +8,15 @@ python run_all.py config.sample.ini
 
 ## Agent-based summary (on-prem / optional)
 
-After you run `run_all.py`, you’ll have a combined JSON report next to the log (`*.ACH.json`).
-You can generate a detailed, customer-ready summary from that JSON with:
+You can configure `run_all.py` to automatically generate a detailed, customer-ready summary (`*.ai_summary.md` + `*.ai_summary.json`) from the combined report JSON (`*.ACH.json`) using on-prem Ollama (optional) or deterministic mode (no LLM).
+
+In `config.ini`, set:
+
+- `ai_summary_enabled = True`
+- `ai_summary_dry_run = True` (deterministic) **or** `False` (use Ollama)
+- `ollama_base_url = http://localhost:11434` and `ollama_model = <model>` if using Ollama
+
+You can still run the summarizer directly if desired:
 
 ```bash
 # Deterministic (no LLM calls)

@@ -6,7 +6,9 @@ __pycache__/
 tmp_ai/
 log/
 *.log
-*.json
 *.ai_summary.md
 *.ai_summary.json
+
+# Only ignore generated workflow JSON, not all JSON in the repo
+*.ACH.json
 

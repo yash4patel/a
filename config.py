@@ -42,10 +42,8 @@ class Config:
         self.max_error_percent = conf.getfloat("max_error_percent", 2.0)
         self.log_level = conf.get("log_level", "INFO")
         self.update_delta = conf.getint("update_delta", 5)
-        # Progress logging can be noisy on large datasets; allow disabling.
-        self.show_progress = conf.getboolean("show_progress", False)
         # If False, suppress "Process is X% done" progress logs (reduces clutter for large folders).
-        self.show_progress = conf.getboolean("show_progress", True)
+        self.show_progress = conf.getboolean("show_progress", False)
         self.match_risk_engine = conf.getboolean("match_risk_engine", False)
         self.full_file_path = conf.getboolean("full_file_path", False)
         self.show_problem_lines = conf.getboolean("show_problem_lines", True)
@@ -61,6 +59,21 @@ class Config:
         self.extension = conf.get("extension", "ACH")
         self.ach_type = conf.get("ach_type", "")
         self.is_folded = conf.getboolean("is_folded", True)
+
+        # Optional: Generate AI/agent summary from the combined report JSON.
+        # This is designed for on-prem Ollama usage; can also run in deterministic mode without any LLM calls.
+        self.ai_summary_enabled = conf.getboolean("ai_summary_enabled", False)
+        self.ai_summary_dry_run = conf.getboolean("ai_summary_dry_run", True)
+        self.ollama_base_url = conf.get("ollama_base_url", "").strip()
+        self.ollama_model = conf.get("ollama_model", "").strip()
+        self.ai_allow_sensitive_evidence = conf.getboolean(
+            "ai_allow_sensitive_evidence", False
+        )
+        self.ai_include_sanitized_samples = conf.getboolean(
+            "ai_include_sanitized_samples", False
+        )
+        self.ai_max_samples = conf.getint("ai_max_samples", 20)
+        self.ai_timeout_s = conf.getint("ai_timeout_s", 180)
 
         # Bank ABA(s) for Retail ODFI indicator:
         # If `grep '^5' *.ACH | cut -c41-50` matches any configured ABA (9 digits; or first 8 digits),
