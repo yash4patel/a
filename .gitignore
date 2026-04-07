@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local artifacts
+tmp_ai/
+log/
+*.log
+*.json
+*.ai_summary.md
+*.ai_summary.json
+
