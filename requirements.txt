@@ -1,3 +1,2 @@
 pandas
-mysql-connector-python
-
+ollama-python

@@ -8,7 +8,6 @@ from batch_data_check import BatchDateCompletenessAnalyzer
 from config import Config
 from logger_utils import LogManager
 import misc_functions
-from db_writer import maybe_write_to_mysql
 
 
 def validate_file_extensions(data_path, logger=None):
@@ -200,16 +199,6 @@ def main():
         log_manager.write_json_report(workflow_report)
     except Exception:
         pass
-
-    # Optional: persist full output to MySQL (run + per-validation rows).
-    try:
-        maybe_write_to_mysql(
-            workflow_report=workflow_report,
-            log_path=full_log_path,
-            logger=logger,
-        )
-    except Exception as e:
-        logger.error(f"MySQL write skipped/failed: {e}")
 
     print(f"\nDetails and logs have been saved to: {full_log_path}")
     print(f"JSON summary saved to: {log_manager.jsonfile}")
