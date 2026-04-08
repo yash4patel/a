@@ -75,6 +75,28 @@ class Config:
         self.ai_max_samples = conf.getint("ai_max_samples", 20)
         self.ai_timeout_s = conf.getint("ai_timeout_s", 180)
 
+        # Optional: Metadata-driven execution (ruleset stored in SQL or local JSON).
+        # If enabled, this overrides which sections run and their parameters.
+        self.metadata_enabled = conf.getboolean("metadata_enabled", False)
+        self.metadata_source = conf.get("metadata_source", "local").strip().lower()  # local|mysql
+        self.metadata_json_path = conf.get("metadata_json_path", "").strip()
+        self.metadata_ruleset_name = conf.get("metadata_ruleset_name", "").strip()
+
+        # MySQL connection for metadata
+        self.metadata_mysql_host = conf.get("metadata_mysql_host", "").strip()
+        self.metadata_mysql_user = conf.get("metadata_mysql_user", "").strip()
+        self.metadata_mysql_password = conf.get("metadata_mysql_password", "").strip()
+        self.metadata_mysql_database = conf.get("metadata_mysql_database", "").strip()
+        self.metadata_mysql_table = conf.get("metadata_mysql_table", "validation_metadata").strip()
+        self.metadata_mysql_timeout_s = conf.getint("metadata_mysql_timeout_s", 10)
+
+        # Optional: MongoDB sink for combined workflow report JSON
+        self.mongo_enabled = conf.getboolean("mongo_enabled", False)
+        self.mongo_uri = conf.get("mongo_uri", "").strip()
+        self.mongo_database = conf.get("mongo_database", "").strip() or "ps_validation"
+        self.mongo_collection = conf.get("mongo_collection", "").strip() or "workflow_reports"
+        self.mongo_timeout_ms = conf.getint("mongo_timeout_ms", 5000)
+
         # Bank ABA(s) for Retail ODFI indicator:
         # If `grep '^5' *.ACH | cut -c41-50` matches any configured ABA (9 digits; or first 8 digits),
         # we classify the dataset as "Retail ODFI".

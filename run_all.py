@@ -9,6 +9,13 @@ from config import Config
 from logger_utils import LogManager
 import misc_functions
 from ai_runner import run_ai_summary
+from metadata_engine import (
+    load_metadata_ruleset,
+    get_section_enabled,
+    apply_config_overrides,
+    apply_ruleset_to_reports,
+)
+from mongo_sink import maybe_write_workflow_to_mongo
 
 
 def validate_file_extensions(data_path, logger=None):
@@ -66,6 +73,12 @@ def main():
     except Exception as e:
         print(f"Failed to load config: {e}")
         sys.exit(1)
+
+    # Optional: load metadata-driven rules (SQL or local JSON) and apply overrides.
+    # This controls which sections run and can override config thresholds/params.
+    metadata_ruleset = load_metadata_ruleset(config, logger=None)
+    if metadata_ruleset:
+        apply_config_overrides(config, metadata_ruleset)
 
     if not os.path.isdir(config.data_path):
         print(f"Data path does not exist: {config.data_path}")
@@ -148,58 +161,89 @@ def main():
     else:
         logger.info("File extension validation: PASSED (all files have .ACH extension)")
 
-    try:
-        validator = ACHMDVValidator(config, log_manager)
-        file_names = validator.validate_files()
-        section1 = validator.summarize_results(len(file_names))
-        workflow_report["sections"]["ach_mdv_validator"] = section1
-    except Exception as e:
-        logger.critical(f"ACH RDV Validator crashed: {e}")
-        logger.debug(str(e))
+    if get_section_enabled(metadata_ruleset, "ach_mdv_validator", default=True):
+        try:
+            validator = ACHMDVValidator(config, log_manager)
+            file_names = validator.validate_files()
+            section1 = validator.summarize_results(len(file_names))
+            workflow_report["sections"]["ach_mdv_validator"] = section1
+        except Exception as e:
+            logger.critical(f"ACH RDV Validator crashed: {e}")
+            logger.debug(str(e))
+            workflow_report["sections"]["ach_mdv_validator"] = {
+                "section": "ACH RDV Validation",
+                "status": "FAILED",
+                "error": str(e),
+            }
+    else:
         workflow_report["sections"]["ach_mdv_validator"] = {
             "section": "ACH RDV Validation",
-            "status": "FAILED",
-            "error": str(e),
+            "status": "SKIPPED",
+            "reason": "Disabled by metadata ruleset",
         }
 
-    try:
-        aba_analyzer = ABAEntropyAnalyzer(config, log_manager)
-        ach_type, section2 = aba_analyzer.analyze()
-        workflow_report["sections"]["aba_entropy"] = section2
-        if not ach_type:
+    if get_section_enabled(metadata_ruleset, "aba_entropy", default=True):
+        try:
+            aba_analyzer = ABAEntropyAnalyzer(config, log_manager)
+            ach_type, section2 = aba_analyzer.analyze()
+            workflow_report["sections"]["aba_entropy"] = section2
+            if not ach_type:
+                ach_type = config.ach_type or "ODFI"
+                logger.warning(
+                    f"ABA analyzer returned no type; falling back to config value: {ach_type}"
+                )
+        except Exception as e:
+            logger.critical(f"ABAEntropyAnalyzer crashed: {e}")
+            logger.debug(str(e))
             ach_type = config.ach_type or "ODFI"
-            logger.warning(
-                f"ABA analyzer returned no type; falling back to config value: {ach_type}"
-            )
-    except Exception as e:
-        logger.critical(f"ABAEntropyAnalyzer crashed: {e}")
-        logger.debug(str(e))
+            workflow_report["sections"]["aba_entropy"] = {
+                "section": "ABA Entropy",
+                "status": "FAILED",
+                "error": str(e),
+            }
+    else:
         ach_type = config.ach_type or "ODFI"
         workflow_report["sections"]["aba_entropy"] = {
             "section": "ABA Entropy",
-            "status": "FAILED",
-            "error": str(e),
+            "status": "SKIPPED",
+            "reason": "Disabled by metadata ruleset",
         }
 
-    try:
-        batch_date_analyzer = BatchDateCompletenessAnalyzer(config, log_manager)
-        section3 = batch_date_analyzer.analyze(ach_type, config.extension)
-        workflow_report["sections"]["batch_data_check"] = section3
-    except Exception as e:
-        logger.critical(f"BatchDateCompletenessAnalyzer crashed: {e}")
-        logger.debug(str(e))
+    if get_section_enabled(metadata_ruleset, "batch_data_check", default=True):
+        try:
+            batch_date_analyzer = BatchDateCompletenessAnalyzer(config, log_manager)
+            section3 = batch_date_analyzer.analyze(ach_type, config.extension)
+            workflow_report["sections"]["batch_data_check"] = section3
+        except Exception as e:
+            logger.critical(f"BatchDateCompletenessAnalyzer crashed: {e}")
+            logger.debug(str(e))
+            workflow_report["sections"]["batch_data_check"] = {
+                "section": "Batch Date Completeness",
+                "status": "FAILED",
+                "error": str(e),
+            }
+    else:
         workflow_report["sections"]["batch_data_check"] = {
             "section": "Batch Date Completeness",
-            "status": "FAILED",
-            "error": str(e),
+            "status": "SKIPPED",
+            "reason": "Disabled by metadata ruleset",
         }
 
     logger.info("=== WORKFLOW COMPLETED ===")
     workflow_report["run_finished_at"] = datetime.now().isoformat(timespec="seconds")
+    if metadata_ruleset:
+        workflow_report["metadata_ruleset"] = metadata_ruleset
+        apply_ruleset_to_reports(workflow_report=workflow_report, ruleset=metadata_ruleset)
     try:
         log_manager.write_json_report(workflow_report)
     except Exception:
         pass
+
+    # Optional: store combined workflow JSON into MongoDB as a document
+    try:
+        maybe_write_workflow_to_mongo(config=config, workflow_report=workflow_report, logger=logger)
+    except Exception as e:
+        logger.warning(f"MongoDB write skipped/failed: {e}")
 
     # Optional: Generate AI / agent-based detailed summary from the combined JSON.
     try:

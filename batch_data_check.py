@@ -277,6 +277,13 @@ class BatchDateCompletenessAnalyzer:
             self.logger.info("=" * 70)
             self.logger.info(f"ACH Type Detected: {ach_type}")
             self.logger.info(f"Processing file extension: {extension}")
+            # Metadata-driven override: allow record type to count to be set via config
+            try:
+                record_type_to_count = int(
+                    getattr(self.config, "batch_record_type_to_count", record_type_to_count)
+                )
+            except Exception:
+                pass
             self.logger.info(f"Counting record type: {record_type_to_count}")
 
             mypath = self.config.data_path
@@ -295,10 +302,11 @@ class BatchDateCompletenessAnalyzer:
                 self.logger.info("")
                 return report
 
+            # Allow metadata/config override (metadata-driven execution)
             if ach_type == "RDFI":
-                needed_days = 180
+                needed_days = int(getattr(self.config, "batch_needed_days_rdfi", 180))
             elif ach_type == "ODFI":
-                needed_days = 90
+                needed_days = int(getattr(self.config, "batch_needed_days_odfi", 90))
             else:
                 msg = f"[CRITICAL] Invalid ach_type: {ach_type}"
                 self.logger.critical(msg)

@@ -84,6 +84,37 @@ class ACHMDVValidator:
 
         self.prepend_file_path = self.config.data_path if self.config.full_file_path else ""
 
+    def _check_enabled(self, check_name: str) -> bool:
+        """
+        Metadata-driven check gating. If config.mdv_checks_enabled is present,
+        checks not explicitly enabled are treated as enabled by default.
+        """
+        cfg = getattr(self.config, "mdv_checks_enabled", None)
+        if not isinstance(cfg, dict):
+            return True
+        v = cfg.get(check_name)
+        if v is None:
+            return True
+        try:
+            return bool(v)
+        except Exception:
+            return True
+
+    def _enabled(self, check_name: str) -> bool:
+        # Backwards-compatible alias for readability at call sites.
+        return self._check_enabled(check_name)
+
+    def _mark_problem(self, check_name: str, fname: str) -> bool:
+        """
+        Increment problem counters only if the check is enabled.
+        Returns True if the problem was counted.
+        """
+        if not self._enabled(check_name):
+            return False
+        self.problematic_files.add(fname)
+        self.problem_counter += 1
+        return True
+
     def _is_binary_file(self, filepath):
         """Check if file appears to be binary or encrypted."""
         try:
@@ -313,6 +344,8 @@ class ACHMDVValidator:
         return True
 
     def _process_problem_line(self, key, row_length, line, fname, file_line):
+        if not self._enabled("Bad Record Lengths"):
+            return
         if (key != 9) or ((key == 9) and (self.last_key_seen != 9)):
             if row_length != 94:
                 if (
@@ -327,8 +360,7 @@ class ACHMDVValidator:
                         self.badlines.append(line)
                         self.badfilenames.append(fname)
 
-                self.problematic_files.add(fname)
-                self.problem_counter += 1
+                self._mark_problem("Bad Record Lengths", fname)
                 self.bad_lengths[key].append((fname, file_line))
 
     def validate_files(self):
@@ -542,41 +574,40 @@ class ACHMDVValidator:
                                 f"[Skipping File] {fname} - Too many consecutive bad keys at line {file_line} "
                                 f"(likely corrupted, encrypted, or binary file)"
                             )
-                            self.problematic_files.add(fname)
-                            self.problem_counter += 1
+                            self._mark_problem("Bad Keys", fname)
                             self.skipped_binary_files.append(fname)
                             return
 
                         if consecutive_errors <= 3:
-                            self.bad_keys.append((fname, line, file_line))
-                            self.problem_counter += 1
-                            self.problematic_files.add(fname)
-                            self.logger.error(f"[Bad Key] File={fname} Line={file_line}")
+                            if self._enabled("Bad Keys"):
+                                self.bad_keys.append((fname, line, file_line))
+                                self._mark_problem("Bad Keys", fname)
+                                self.logger.error(f"[Bad Key] File={fname} Line={file_line}")
                         key = 10
 
                     if key == 1:
                         type_1_count += 1
 
                         if type_1_count > 1:
-                            self.problems[key] += 1
-                            self.problematic_files.add(fname)
-                            self.problem_counter += 1
-                            self.multiple_header_files.append(
-                                (fname, file_line, type_1_count)
-                            )
-                            self.logger.error(
-                                f"[Multiple Headers] File={fname} has {type_1_count} Type-1 headers "
-                                f"(concatenated file detected) at line {file_line}"
-                            )
+                            if self._enabled("Multiple Headers (Concatenated Files)"):
+                                self.problems[key] += 1
+                                self._mark_problem("Multiple Headers (Concatenated Files)", fname)
+                                self.multiple_header_files.append(
+                                    (fname, file_line, type_1_count)
+                                )
+                                self.logger.error(
+                                    f"[Multiple Headers] File={fname} has {type_1_count} Type-1 headers "
+                                    f"(concatenated file detected) at line {file_line}"
+                                )
 
                         if self.last_key_seen is not None and self.last_key_seen != 9:
-                            self.problems[key] += 1
-                            self.problematic_files.add(fname)
-                            self.problem_counter += 1
-                            self.bad_order[key].append((fname, line, file_line))
-                            self.logger.error(
-                                f"[Order] Unexpected 1 record in {fname} at line {file_line}"
-                            )
+                            if self._enabled("Record Order Issues"):
+                                self.problems[key] += 1
+                                self._mark_problem("Record Order Issues", fname)
+                                self.bad_order[key].append((fname, line, file_line))
+                                self.logger.error(
+                                    f"[Order] Unexpected 1 record in {fname} at line {file_line}"
+                                )
 
                     if key == 5:
                         self.type5_total_records += 1
@@ -593,13 +624,13 @@ class ACHMDVValidator:
                                 )
 
                         if self.last_key_seen not in [1, 8]:
-                            self.problems[key] += 1
-                            self.problematic_files.add(fname)
-                            self.problem_counter += 1
-                            self.bad_order[key].append((fname, line, file_line))
-                            self.logger.error(
-                                f"[Order] 5 record not after 1/8 in {fname} line {file_line}"
-                            )
+                            if self._enabled("Record Order Issues"):
+                                self.problems[key] += 1
+                                self._mark_problem("Record Order Issues", fname)
+                                self.bad_order[key].append((fname, line, file_line))
+                                self.logger.error(
+                                    f"[Order] 5 record not after 1/8 in {fname} line {file_line}"
+                                )
 
                         sec_code = line[50:53]
                         self.sec_codes_count = getattr(self, "sec_codes_count", {})
@@ -607,10 +638,13 @@ class ACHMDVValidator:
                             self.sec_codes_count.get(sec_code, 0) + 1
                         )
 
-                        if sec_code not in self.config.sec_codes and fname not in self.problematic_files:
+                        if (
+                            self._enabled("Bad SEC Codes")
+                            and sec_code not in self.config.sec_codes
+                            and fname not in self.problematic_files
+                        ):
                             self.bad_secs.append((fname, line, sec_code, file_line))
-                            self.problematic_files.add(fname)
-                            self.problem_counter += 1
+                            self._mark_problem("Bad SEC Codes", fname)
                             self.logger.error(
                                 f"[Bad SEC] File={fname} Line={file_line} SEC={sec_code}"
                             )
@@ -649,23 +683,23 @@ class ACHMDVValidator:
 
                     if key == 6:
                         if self.last_key_seen not in [5, 6, 7]:
-                            self.problems[key] += 1
-                            self.problematic_files.add(fname)
-                            self.problem_counter += 1
-                            self.bad_order[key].append((fname, line, file_line))
-                            self.logger.error(
-                                f"[Order] 6 record out of order in {fname} line {file_line}"
-                            )
+                            if self._enabled("Record Order Issues"):
+                                self.problems[key] += 1
+                                self._mark_problem("Record Order Issues", fname)
+                                self.bad_order[key].append((fname, line, file_line))
+                                self.logger.error(
+                                    f"[Order] 6 record out of order in {fname} line {file_line}"
+                                )
 
                     if key == 7:
                         if self.last_key_seen not in [6, 7]:
-                            self.problems[key] += 1
-                            self.problematic_files.add(fname)
-                            self.problem_counter += 1
-                            self.bad_order[key].append((fname, line, file_line))
-                            self.logger.error(
-                                f"[Order] 7 record out of order in {fname} line {file_line}"
-                            )
+                            if self._enabled("Record Order Issues"):
+                                self.problems[key] += 1
+                                self._mark_problem("Record Order Issues", fname)
+                                self.bad_order[key].append((fname, line, file_line))
+                                self.logger.error(
+                                    f"[Order] 7 record out of order in {fname} line {file_line}"
+                                )
 
                         if sec_code in ["IAT", "POS"]:
                             try:
@@ -690,32 +724,34 @@ class ACHMDVValidator:
                                         else [],
                                         "found": sorted(set(seven_record_list)),
                                     }
-                                    self.problematic_files.add(fname)
-                                    self.problem_counter += 1
                                     if sec_code == "IAT":
-                                        self.iat_bad_addendum_files += 1
+                                        if self._enabled("Bad IAT Addendum"):
+                                            self._mark_problem("Bad IAT Addendum", fname)
+                                            self.iat_bad_addendum_files += 1
                                     else:
-                                        self.pos_bad_addendum_files += 1
+                                        if self._enabled("Bad POS Addendum"):
+                                            self._mark_problem("Bad POS Addendum", fname)
+                                            self.pos_bad_addendum_files += 1
                         sec_code = ""
 
                     if key == 9:
                         if self.last_key_seen not in [8, 9]:
-                            self.problems[key] += 1
-                            self.problematic_files.add(fname)
-                            self.problem_counter += 1
-                            self.bad_order[key].append((fname, line, file_line))
-                            self.logger.error(
-                                f"[Order] 9 record out of order in {fname} line {file_line}"
-                            )
+                            if self._enabled("Record Order Issues"):
+                                self.problems[key] += 1
+                                self._mark_problem("Record Order Issues", fname)
+                                self.bad_order[key].append((fname, line, file_line))
+                                self.logger.error(
+                                    f"[Order] 9 record out of order in {fname} line {file_line}"
+                                )
 
                     if key != 1 and self.last_key_seen is None:
-                        self.no_one_record += 1
-                        self.problematic_files.add(fname)
-                        self.problem_counter += 1
-                        self.missing_header_files.append((fname, file_line))
-                        self.logger.error(
-                            f"[Bad First Line] File={fname} Line={file_line}"
-                        )
+                        if self._enabled("Missing File Header (Type 1)"):
+                            self.no_one_record += 1
+                            self._mark_problem("Missing File Header (Type 1)", fname)
+                            self.missing_header_files.append((fname, file_line))
+                            self.logger.error(
+                                f"[Bad First Line] File={fname} Line={file_line}"
+                            )
 
                     if key == 9 and row_length == 55:
                         row_length = 94
@@ -725,11 +761,11 @@ class ACHMDVValidator:
                     self.last_key_seen = key
 
             if self.last_key_seen != 9:
-                self.problems[9] += 1
-                self.problematic_files.add(fname)
-                self.problem_counter += 1
-                self.missing_eof_files.append(fname)
-                self.logger.error(f"[EOF Error] File did not end with key=9: {fname}")
+                if self._enabled("EOF Missing (Type 9)"):
+                    self.problems[9] += 1
+                    self._mark_problem("EOF Missing (Type 9)", fname)
+                    self.missing_eof_files.append(fname)
+                    self.logger.error(f"[EOF Error] File did not end with key=9: {fname}")
 
         except Exception as e:
             self.logger.error(f"Unhandled error validating file {fname}: {e}")
@@ -1031,6 +1067,12 @@ class ACHMDVValidator:
 
         json_checks = []
         for check_name, count, error_data in checks:
+            if not self._enabled(check_name):
+                status = "SKIPPED"
+                self.logger.info(f"{check_name:.<50} {status}")
+                json_checks.append({"name": check_name, "status": status, "issues": 0})
+                continue
+
             status = "PASSED" if count == 0 else "FAILED"
             self.logger.info(f"{check_name:.<50} {status} ({count} issues)")
             json_checks.append(
@@ -1042,8 +1084,9 @@ class ACHMDVValidator:
                 self._print_error_details(check_name, error_data)
                 self.logger.info("")
 
-        total_checks = len(checks)
-        failed = sum(1 for _, count, _ in checks if count > 0)
+        enabled_checks = [c for c in checks if self._enabled(c[0])]
+        total_checks = len(enabled_checks)
+        failed = sum(1 for _, count, _ in enabled_checks if count > 0)
         passed = total_checks - failed
 
         json_report["checks"] = json_checks
