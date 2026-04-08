@@ -1,2 +1,4 @@
 pandas
 ollama-python
+pymongo
+mysql-connector-python

@@ -1,0 +1,52 @@
+{
+  "workflow": {
+    "sections": [
+      { "id": "file_extension_validation", "enabled": true },
+      { "id": "ach_mdv_validator", "enabled": true },
+      { "id": "aba_entropy", "enabled": true },
+      { "id": "batch_data_check", "enabled": true }
+    ]
+  },
+  "ach_mdv_validator": {
+    "max_error_percent": 2,
+    "sec_codes": [
+      "ARC",
+      "CBR",
+      "CCD",
+      "CIE",
+      "COR",
+      "CTX",
+      "MTE",
+      "PBR",
+      "POP",
+      "POS",
+      "PPD",
+      "RCK",
+      "TEL",
+      "WEB",
+      "ENR",
+      "IAT",
+      "BOC",
+      "DNE"
+    ],
+    "checks": {
+      "Bad SEC Codes": { "enabled": true },
+      "Bad Keys": { "enabled": true },
+      "Missing File Header (Type 1)": { "enabled": true },
+      "Multiple Headers (Concatenated Files)": { "enabled": true },
+      "Record Order Issues": { "enabled": true },
+      "Bad Record Lengths": { "enabled": true },
+      "Bad IAT Addendum": { "enabled": true },
+      "Bad POS Addendum": { "enabled": true },
+      "EOF Missing (Type 9)": { "enabled": true }
+    }
+  },
+  "batch_data_check": {
+    "required_days_by_type": {
+      "ODFI": 90,
+      "RDFI": 180
+    },
+    "record_type_to_count": 5
+  }
+}
+
