@@ -16,6 +16,86 @@ class BatchDateCompletenessAnalyzer:
         self.config = config
         self.log = log_manager
         self.logger = log_manager.logger
+        self.metadata = self._build_default_metadata()
+
+    def _build_default_metadata(self):
+        # JSON-shaped metadata object (in-code) that drives runtime behavior.
+        # This mirrors the example schema you shared and can be overridden via config/callsite.
+        return {
+            "section_name": "Batch Date Completeness",
+            "defaults": {"ach_type": "ODFI", "extension": "ACH", "record_type_to_count": 5},
+            "date_detection": {
+                "sample_size": 10,
+                "preview_count": 3,
+                "validation_sample_count": 3,
+                "strip_extension": True,
+                "preferred_format": None,
+                "allow_other_detected_formats_as_fallback": True,
+            },
+            "date_formats": [
+                {
+                    "name": "YYYYMMDD",
+                    "regex": r"((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])",
+                    "group_order": ["year", "month", "day"],
+                },
+                {
+                    "name": "YYMMDD",
+                    "regex": r"(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])",
+                    "group_order": ["year", "month", "day"],
+                    "two_digit_year": {"base": 2000, "min": 0, "max": 50},
+                },
+                {
+                    "name": "YYYY-MM-DD",
+                    "regex": r"((?:19|20)\d{2})[-_/](0[1-9]|1[0-2])[-_/](0[1-9]|[12]\d|3[01])",
+                    "group_order": ["year", "month", "day"],
+                },
+                {
+                    "name": "DDMMYYYY",
+                    "regex": r"(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])((?:19|20)\d{2})",
+                    "group_order": ["day", "month", "year"],
+                },
+                {
+                    "name": "MMDDYYYY",
+                    "regex": r"(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])((?:19|20)\d{2})",
+                    "group_order": ["month", "day", "year"],
+                },
+            ],
+            "ach_type_rules": {
+                "ODFI": {
+                    "required_days": 90,
+                    "requirement_label": "3 MONTHS (90 DAYS) OF DATA",
+                },
+                "RDFI": {
+                    "required_days": 180,
+                    "requirement_label": "6 MONTHS (180 DAYS) OF DATA",
+                },
+            },
+            "record_detection": {
+                "default_record_type": 5,
+                "encoding": "ascii",
+                "decode_errors": "replace",
+                "auto_switch_if_missing": True,
+                "fallback_order": [6, "first_available"],
+            },
+            "date_range": {"count_mode": "inclusive", "fill_missing_dates": True},
+            "calendar": {
+                "exclude_weekends": True,
+                "holiday_calendar": "USFederalHolidayCalendar",
+            },
+            "anomaly_rules": {
+                "low_volume_ratio": 0.1,
+                "high_volume_ratio": 2.0,
+                "zero_reference_strategy": "non_zero_median",
+            },
+        }
+
+    def _meta(self, *path, default=None):
+        cur = self.metadata
+        for p in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(p)
+        return cur if cur is not None else default
 
     def extract_date_patterns(self, filename):
         """
@@ -23,70 +103,50 @@ class BatchDateCompletenessAnalyzer:
         Returns list of (pattern_type, year, month, day) tuples.
         """
         possible_dates = []
+        strip_ext = bool(self._meta("date_detection", "strip_extension", default=True))
+        name = filename.rsplit(".", 1)[0] if strip_ext else filename
 
-        name_without_ext = filename.rsplit(".", 1)[0]
+        date_formats = self._meta("date_formats", default=[])
+        if not isinstance(date_formats, list):
+            date_formats = []
 
-        pattern1 = re.findall(
-            r"((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])",
-            name_without_ext,
-        )
-        for match in pattern1:
-            try:
-                year, month, day = int(match[0]), int(match[1]), int(match[2])
-                date(year, month, day)
-                possible_dates.append(("YYYYMMDD", year, month, day))
-            except Exception:
-                pass
+        for fmt in date_formats:
+            if not isinstance(fmt, dict):
+                continue
+            name_key = str(fmt.get("name") or "").strip()
+            regex = fmt.get("regex")
+            group_order = fmt.get("group_order")
+            if not name_key or not regex or not isinstance(group_order, list):
+                continue
 
-        pattern2 = re.findall(
-            r"(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])", name_without_ext
-        )
-        for match in pattern2:
-            try:
-                yy = int(match[0])
-                if 0 <= yy <= 50:
-                    year = 2000 + yy
-                    month, day = int(match[1]), int(match[2])
-                    date(year, month, day)
-                    possible_dates.append(("YYMMDD", year, month, day))
-            except Exception:
-                pass
+            matches = re.findall(regex, name)
+            for match in matches:
+                try:
+                    groups = list(match) if isinstance(match, (list, tuple)) else [match]
+                    parts = {}
+                    for idx, label in enumerate(group_order):
+                        parts[label] = int(groups[idx])
 
-        pattern3 = re.findall(
-            r"((?:19|20)\d{2})[-_/](0[1-9]|1[0-2])[-_/](0[1-9]|[12]\d|3[01])",
-            name_without_ext,
-        )
-        for match in pattern3:
-            try:
-                year, month, day = int(match[0]), int(match[1]), int(match[2])
-                date(year, month, day)
-                possible_dates.append(("YYYY-MM-DD", year, month, day))
-            except Exception:
-                pass
+                    # Handle two-digit year rule if configured
+                    if "two_digit_year" in fmt and "year" in parts:
+                        td = fmt.get("two_digit_year") or {}
+                        base = int(td.get("base", 2000))
+                        ymin = int(td.get("min", 0))
+                        ymax = int(td.get("max", 50))
+                        yy = int(parts["year"])
+                        if ymin <= yy <= ymax:
+                            parts["year"] = base + yy
+                        else:
+                            # outside allowed range => skip this match
+                            continue
 
-        pattern4 = re.findall(
-            r"(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])((?:19|20)\d{2})",
-            name_without_ext,
-        )
-        for match in pattern4:
-            try:
-                day, month, year = int(match[0]), int(match[1]), int(match[2])
-                date(year, month, day)
-                possible_dates.append(("DDMMYYYY", year, month, day))
-            except Exception:
-                pass
-
-        pattern5 = re.findall(
-            r"(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])((?:19|20)\d{2})",
-            name_without_ext,
-        )
-        for match in pattern5:
-            try:
-                month, day, year = int(match[0]), int(match[1]), int(match[2])
-                date(year, month, day)
-                possible_dates.append(("MMDDYYYY", year, month, day))
-            except Exception:
-                pass
+                    y = int(parts.get("year"))
+                    m = int(parts.get("month"))
+                    d = int(parts.get("day"))
+                    date(y, m, d)  # validate
+                    possible_dates.append((name_key, y, m, d))
+                except Exception:
+                    continue
 
         return possible_dates
 
@@ -105,9 +165,13 @@ class BatchDateCompletenessAnalyzer:
                     all_patterns[pattern_type] = []
                 all_patterns[pattern_type].append((fname, year, month, day))
 
+        preferred = self._meta("date_detection", "preferred_format", default=None)
         best_pattern = None
         best_count = 0
 
+        # If preferred format is explicitly set and detected, choose it.
+        if preferred and preferred in all_patterns:
+            best_pattern = preferred
         for pattern_type, matches in all_patterns.items():
             unique_files = len(set(m[0] for m in matches))
             if unique_files > best_count:
