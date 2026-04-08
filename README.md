@@ -34,44 +34,6 @@ This produces:
 - `report.ACH.ai_summary.md`
 - `report.ACH.ai_summary.json`
 
-## Metadata-driven checks (SQL/JSON)
-
-This repo supports an optional **metadata-driven** execution mode where:
-- Validation sections can be enabled/disabled from metadata
-- Thresholds/parameters can be overridden from metadata
-- Individual `ach_mdv_validator` checks can be enabled/disabled from metadata
-
-Metadata can be stored in SQL as JSON (MySQL) or provided as a local JSON file.
-
-### Local JSON ruleset
-
-In `config.ini`:
-- `metadata_enabled = True`
-- `metadata_source = file`
-- `metadata_json_path = metadata.sample.ruleset.json`
-
-### MySQL ruleset
-
-Use the DDL in `metadata.mysql.ddl.sql` to create the table, then insert a ruleset row.
-In `config.ini`:
-- `metadata_enabled = True`
-- `metadata_source = mysql`
-- `metadata_mysql_host = ...`
-- `metadata_mysql_user = ...`
-- `metadata_mysql_password = ...`
-- `metadata_mysql_database = ...`
-- `metadata_mysql_table = validation_ruleset`
-- `metadata_ruleset_name = default`
-
-## MongoDB sink (workflow JSON)
-
-If enabled, the combined workflow JSON report is inserted into MongoDB as a single document.
-In `config.ini`:
-- `mongo_enabled = True`
-- `mongo_uri = mongodb://...`
-- `mongo_database = ps_auto`
-- `mongo_collection = validation_runs`
-
 ## Retail ODFI indicator
 
 If you set `aba_number` (one or more, comma/space-separated) in the `.ini`, the validator computes an overall summary based on:
