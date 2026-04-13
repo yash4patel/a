@@ -1,4 +1,6 @@
 import configparser
+import json
+import os
 
 import re
 import folder_tools
@@ -85,6 +87,16 @@ class Config:
         self.batch_needed_days_rdfi = conf.getint("batch_needed_days_rdfi", 180)
         self.batch_record_type_to_count = conf.getint("batch_record_type_to_count", 5)
 
+        # Optional: ABA entropy analyzer metadata overrides (JSON).
+        # Provide either a JSON file path OR inline JSON.
+        # If both are set, `aba_entropy_metadata_path` takes precedence.
+        self.aba_entropy_metadata_path = conf.get("aba_entropy_metadata_path", "").strip()
+        self.aba_entropy_metadata_json = conf.get("aba_entropy_metadata_json", "").strip()
+        self.aba_entropy_metadata = self._load_optional_json_metadata(
+            self.aba_entropy_metadata_path,
+            self.aba_entropy_metadata_json,
+        )
+
         # Bank ABA(s) for Retail ODFI indicator:
         # If `grep '^5' *.ACH | cut -c41-50` matches any configured ABA (9 digits; or first 8 digits),
         # we classify the dataset as "Retail ODFI".
@@ -109,4 +121,25 @@ class Config:
             if aba not in seen:
                 seen.add(aba)
                 self.aba_numbers.append(aba)
+
+    def _load_optional_json_metadata(self, json_path: str, inline_json: str):
+        if json_path:
+            try:
+                candidate = os.path.expanduser(json_path)
+                if not os.path.isabs(candidate):
+                    candidate = os.path.join(os.path.dirname(self.filepath), candidate)
+                with open(candidate, "r", encoding="utf-8") as f:
+                    parsed = json.load(f)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+
+        if inline_json:
+            try:
+                parsed = json.loads(inline_json)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+
+        return None
 
