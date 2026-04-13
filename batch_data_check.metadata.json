@@ -1,0 +1,62 @@
+{
+  "section_name": "Batch Date Completeness",
+  "defaults": {
+    "ach_type": "ODFI",
+    "extension": "ACH",
+    "record_type_to_count": 5
+  },
+  "date_detection": {
+    "sample_size": 10,
+    "preview_count": 3,
+    "validation_sample_count": 3,
+    "strip_extension": true,
+    "preferred_format": null,
+    "allow_other_detected_formats_as_fallback": true
+  },
+  "date_formats": [
+    {
+      "name": "YYYYMMDD",
+      "regex": "((?:19|20)\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])",
+      "group_order": ["year", "month", "day"]
+    },
+    {
+      "name": "YYMMDD",
+      "regex": "(\\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])",
+      "group_order": ["year", "month", "day"],
+      "two_digit_year": { "base": 2000, "min": 0, "max": 50 }
+    },
+    {
+      "name": "YYYY-MM-DD",
+      "regex": "((?:19|20)\\d{2})[-_/](0[1-9]|1[0-2])[-_/](0[1-9]|[12]\\d|3[01])",
+      "group_order": ["year", "month", "day"]
+    },
+    {
+      "name": "DDMMYYYY",
+      "regex": "(0[1-9]|[12]\\d|3[01])(0[1-9]|1[0-2])((?:19|20)\\d{2})",
+      "group_order": ["day", "month", "year"]
+    },
+    {
+      "name": "MMDDYYYY",
+      "regex": "(0[1-9]|1[0-2])(0[1-9]|[12]\\d|3[01])((?:19|20)\\d{2})",
+      "group_order": ["month", "day", "year"]
+    }
+  ],
+  "ach_type_rules": {
+    "ODFI": { "required_days": 90, "requirement_label": "3 MONTHS (90 DAYS) OF DATA" },
+    "RDFI": { "required_days": 180, "requirement_label": "6 MONTHS (180 DAYS) OF DATA" }
+  },
+  "record_detection": {
+    "default_record_type": 5,
+    "encoding": "ascii",
+    "decode_errors": "replace",
+    "auto_switch_if_missing": true,
+    "fallback_order": [6, "first_available"]
+  },
+  "date_range": { "count_mode": "inclusive", "fill_missing_dates": true },
+  "calendar": { "exclude_weekends": true, "holiday_calendar": "USFederalHolidayCalendar" },
+  "anomaly_rules": {
+    "low_volume_ratio": 0.1,
+    "high_volume_ratio": 2.0,
+    "zero_reference_strategy": "non_zero_median"
+  }
+}

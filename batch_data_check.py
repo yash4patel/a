@@ -1,6 +1,8 @@
+import json
 import os
 import re
 import traceback
+from copy import deepcopy
 from datetime import date, timedelta
 
 import folder_tools
@@ -16,7 +18,29 @@ class BatchDateCompletenessAnalyzer:
         self.config = config
         self.log = log_manager
         self.logger = log_manager.logger
-        self.metadata = self._build_default_metadata()
+        self.metadata = self._load_metadata()
+
+    def _deep_merge_dicts(self, base, override):
+        """
+        Deep-merge JSON-shaped dicts (override wins).
+        Lists are replaced (not merged).
+        """
+        if not isinstance(base, dict) or not isinstance(override, dict):
+            return deepcopy(override)
+        merged = deepcopy(base)
+        for k, v in override.items():
+            if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+                merged[k] = self._deep_merge_dicts(merged[k], v)
+            else:
+                merged[k] = deepcopy(v)
+        return merged
+
+    def _load_metadata(self):
+        meta = self._build_default_metadata()
+        override = getattr(self.config, "batch_data_metadata", None)
+        if isinstance(override, dict) and override:
+            meta = self._deep_merge_dicts(meta, override)
+        return meta
 
     def _build_default_metadata(self):
         # JSON-shaped metadata object (in-code) that drives runtime behavior.
@@ -166,12 +190,22 @@ class BatchDateCompletenessAnalyzer:
                 all_patterns[pattern_type].append((fname, year, month, day))
 
         preferred = self._meta("date_detection", "preferred_format", default=None)
+        allow_fallback = bool(
+            self._meta(
+                "date_detection",
+                "allow_other_detected_formats_as_fallback",
+                default=True,
+            )
+        )
         best_pattern = None
         best_count = 0
 
         # If preferred format is explicitly set and detected, choose it.
         if preferred and preferred in all_patterns:
             best_pattern = preferred
+            best_count = len(set(m[0] for m in all_patterns.get(preferred, [])))
+        else:
+            preferred = None
         for pattern_type, matches in all_patterns.items():
             unique_files = len(set(m[0] for m in matches))
             if unique_files > best_count:
@@ -194,7 +228,7 @@ class BatchDateCompletenessAnalyzer:
                 if pattern_type == best_pattern:
                     return year, month, day
 
-            if dates:
+            if allow_fallback and dates:
                 return dates[0][1], dates[0][2], dates[0][3]
 
             raise ValueError(f"No date found matching pattern {best_pattern}")
@@ -303,13 +337,17 @@ class BatchDateCompletenessAnalyzer:
         Count all record types in an ACH file.
         """
         record_counts = {}
+        encoding = str(self._meta("record_detection", "encoding", default="ascii") or "ascii")
+        decode_errors = str(
+            self._meta("record_detection", "decode_errors", default="replace") or "replace"
+        )
         try:
             with open(file_path, "rb") as f:
                 for line_bytes in f:
                     try:
-                        line = line_bytes.decode("ascii", "replace")
-                        if len(line) > 0:
-                            key = int(line[0])
+                        first = line_bytes[:1].decode(encoding, decode_errors)
+                        if first and first.isdigit():
+                            key = int(first)
                             record_counts[key] = record_counts.get(key, 0) + 1
                     except Exception:
                         continue
@@ -318,7 +356,7 @@ class BatchDateCompletenessAnalyzer:
 
         return record_counts
 
-    def analyze(self, ach_type="ODFI", extension="ACH", record_type_to_count=5):
+    def analyze(self, ach_type=None, extension=None, record_type_to_count=None):
         """
         Analyze ACH batch date completeness.
         Parameters:
@@ -326,6 +364,14 @@ class BatchDateCompletenessAnalyzer:
         - extension: File extension to filter (default "ACH")
         - record_type_to_count: Which record type to count (default 5)
         """
+        ach_type = (ach_type or self._meta("defaults", "ach_type", default="ODFI") or "ODFI").strip()
+        extension = (extension or self._meta("defaults", "extension", default="ACH") or "ACH").strip()
+        if record_type_to_count is None:
+            record_type_to_count = self._meta(
+                "record_detection",
+                "default_record_type",
+                default=self._meta("defaults", "record_type_to_count", default=5),
+            )
         report = {
             "section": "Batch Date Completeness",
             "status": "UNKNOWN",
@@ -341,11 +387,12 @@ class BatchDateCompletenessAnalyzer:
             self.logger.info("=" * 70)
             self.logger.info(f"ACH Type Detected: {ach_type}")
             self.logger.info(f"Processing file extension: {extension}")
-            # Metadata-driven override: allow record type to count to be set via config
+            # Config scalar override (only if explicitly set in config.ini).
             try:
-                record_type_to_count = int(
-                    getattr(self.config, "batch_record_type_to_count", record_type_to_count)
-                )
+                if bool(getattr(self.config, "batch_record_type_to_count_is_set", False)):
+                    record_type_to_count = int(
+                        getattr(self.config, "batch_record_type_to_count", record_type_to_count)
+                    )
             except Exception:
                 pass
             self.logger.info(f"Counting record type: {record_type_to_count}")
@@ -366,12 +413,26 @@ class BatchDateCompletenessAnalyzer:
                 self.logger.info("")
                 return report
 
-            # Allow metadata/config override (metadata-driven execution)
-            if ach_type == "RDFI":
-                needed_days = int(getattr(self.config, "batch_needed_days_rdfi", 180))
-            elif ach_type == "ODFI":
-                needed_days = int(getattr(self.config, "batch_needed_days_odfi", 90))
-            else:
+            rules = self._meta("ach_type_rules", ach_type, default={}) or {}
+            try:
+                needed_days = int(rules.get("required_days"))
+            except Exception:
+                needed_days = 180 if ach_type == "RDFI" else 90
+
+            # Config scalar override (only if explicitly set in config.ini).
+            try:
+                if ach_type == "RDFI" and bool(
+                    getattr(self.config, "batch_needed_days_rdfi_is_set", False)
+                ):
+                    needed_days = int(getattr(self.config, "batch_needed_days_rdfi", needed_days))
+                elif ach_type == "ODFI" and bool(
+                    getattr(self.config, "batch_needed_days_odfi_is_set", False)
+                ):
+                    needed_days = int(getattr(self.config, "batch_needed_days_odfi", needed_days))
+            except Exception:
+                pass
+
+            if ach_type not in ("ODFI", "RDFI"):
                 msg = f"[CRITICAL] Invalid ach_type: {ach_type}"
                 self.logger.critical(msg)
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
@@ -386,11 +447,20 @@ class BatchDateCompletenessAnalyzer:
 
             print("Will try and figure out the file date format...\n")
 
-            sample_size = min(10, len(fileNames))
+            try:
+                sample_size = int(self._meta("date_detection", "sample_size", default=10))
+            except Exception:
+                sample_size = 10
+            sample_size = min(max(sample_size, 1), len(fileNames))
             sample_files = fileNames[:sample_size]
 
             print("Sample filenames:")
-            for i, fname in enumerate(sample_files[:3], 1):
+            try:
+                preview_count = int(self._meta("date_detection", "preview_count", default=3))
+            except Exception:
+                preview_count = 3
+            preview_count = max(preview_count, 1)
+            for i, fname in enumerate(sample_files[:preview_count], 1):
                 print(f"  {i}. {fname}")
             print()
 
@@ -414,8 +484,15 @@ class BatchDateCompletenessAnalyzer:
                         return report
 
                 print("\nValidating date parser on sample files...")
+                try:
+                    validation_sample_count = int(
+                        self._meta("date_detection", "validation_sample_count", default=3)
+                    )
+                except Exception:
+                    validation_sample_count = 3
+                validation_sample_count = max(validation_sample_count, 1)
                 test_success = 0
-                for fname in sample_files[:3]:
+                for fname in sample_files[:validation_sample_count]:
                     try:
                         year, month, day = get_date(fname)
                         test_date = date(year, month, day)
@@ -436,9 +513,7 @@ class BatchDateCompletenessAnalyzer:
                     self.logger.info("")
                     return report
 
-                print(
-                    f"\nDate parser validated ({test_success}/{min(3, len(sample_files))} successful)\n"
-                )
+                print(f"\nDate parser validated ({test_success}/{min(validation_sample_count, len(sample_files))} successful)\n")
 
             except Exception as e:
                 self.logger.critical(f"Date detection failed: {e}")
@@ -462,19 +537,28 @@ class BatchDateCompletenessAnalyzer:
                     self.logger.warning(
                         f"Type-{record_type_to_count} records not found in sample file"
                     )
-                    if sample_records:
+                    auto_switch = bool(
+                        self._meta("record_detection", "auto_switch_if_missing", default=True)
+                    )
+                    if auto_switch and sample_records:
                         available = sorted(sample_records.keys())
                         self.logger.warning(f"Available record types: {available}")
-                        if 6 in sample_records:
-                            record_type_to_count = 6
-                            self.logger.info(
-                                "Auto-switching to Type-6 records (most common detail record)"
-                            )
-                        elif available:
-                            record_type_to_count = available[0]
-                            self.logger.info(
-                                f"Auto-switching to Type-{record_type_to_count} records"
-                            )
+                        fallback_order = self._meta(
+                            "record_detection", "fallback_order", default=[6, "first_available"]
+                        )
+                        if not isinstance(fallback_order, list):
+                            fallback_order = [6, "first_available"]
+                        chosen = None
+                        for fb in fallback_order:
+                            if isinstance(fb, int) and fb in sample_records:
+                                chosen = fb
+                                break
+                            if isinstance(fb, str) and fb == "first_available" and available:
+                                chosen = available[0]
+                                break
+                        if chosen is not None:
+                            record_type_to_count = int(chosen)
+                            self.logger.info(f"Auto-switching to Type-{record_type_to_count} records")
 
             date_counts = {}
             total_files = len(fileNames)
@@ -486,7 +570,7 @@ class BatchDateCompletenessAnalyzer:
 
             for file_counter, fname in enumerate(fileNames, 1):
                 progress = round(100 * file_counter / max(1, total_files))
-                if progress >= next_update:
+                if bool(getattr(self.config, "show_progress", False)) and progress >= next_update:
                     self.logger.info(f"Batch-Date Completeness {next_update}% done")
                     next_update += self.config.update_delta
 
@@ -503,9 +587,19 @@ class BatchDateCompletenessAnalyzer:
                 try:
                     with open(os.path.join(mypath, fname), "rb") as f:
                         found_record = False
+                        encoding = str(
+                            self._meta("record_detection", "encoding", default="ascii") or "ascii"
+                        )
+                        decode_errors = str(
+                            self._meta("record_detection", "decode_errors", default="replace")
+                            or "replace"
+                        )
                         for line_bytes in f:
                             try:
-                                key = int(line_bytes.decode("ascii", "replace")[0])
+                                first = line_bytes[:1].decode(encoding, decode_errors)
+                                if not first or not first.isdigit():
+                                    continue
+                                key = int(first)
                                 if key == record_type_to_count:
                                     found_record = True
                                     date_counts[file_date] = (
@@ -589,13 +683,17 @@ class BatchDateCompletenessAnalyzer:
                 "record_type_counted": int(record_type_to_count),
             }
 
+            requirement_label = str(rules.get("requirement_label") or "").strip()
             if ach_type == "RDFI" and date_range_days < needed_days:
                 self.logger.error("")
                 self.logger.error("=" * 70)
                 self.logger.error(
                     f"*** DATA REQUIREMENT NOT SATISFIED FOR {ach_type} MODEL BUILD ***"
                 )
-                self.logger.error("*** RDFI REQUIRES 6 MONTHS (180 DAYS) OF DATA ***")
+                if requirement_label:
+                    self.logger.error(f"*** {ach_type} REQUIRES {requirement_label} ***")
+                else:
+                    self.logger.error(f"*** {ach_type} REQUIRES {needed_days} DAYS OF DATA ***")
                 self.logger.error(
                     f"*** CURRENT DATA RANGE: {date_range_days} DAYS ({date_range_days/30:.1f} MONTHS) ***"
                 )
@@ -603,7 +701,10 @@ class BatchDateCompletenessAnalyzer:
                 self.logger.error("")
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
                 print(f"*** DATA REQUIREMENT NOT SATISFIED FOR {ach_type} MODEL BUILD ***")
-                print("*** RDFI REQUIRES 6 MONTHS (180 DAYS) OF DATA ***")
+                if requirement_label:
+                    print(f"*** {ach_type} REQUIRES {requirement_label} ***")
+                else:
+                    print(f"*** {ach_type} REQUIRES {needed_days} DAYS OF DATA ***")
                 print(
                     f"*** CURRENT DATA RANGE: {date_range_days} DAYS ({date_range_days/30:.1f} MONTHS) ***"
                 )
@@ -621,7 +722,10 @@ class BatchDateCompletenessAnalyzer:
                 self.logger.error(
                     f"*** DATA REQUIREMENT NOT SATISFIED FOR {ach_type} MODEL BUILD ***"
                 )
-                self.logger.error("*** ODFI REQUIRES 3 MONTHS (90 DAYS) OF DATA ***")
+                if requirement_label:
+                    self.logger.error(f"*** {ach_type} REQUIRES {requirement_label} ***")
+                else:
+                    self.logger.error(f"*** {ach_type} REQUIRES {needed_days} DAYS OF DATA ***")
                 self.logger.error(
                     f"*** CURRENT DATA RANGE: {date_range_days} DAYS ({date_range_days/30:.1f} MONTHS) ***"
                 )
@@ -629,7 +733,10 @@ class BatchDateCompletenessAnalyzer:
                 self.logger.error("")
                 print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
                 print(f"*** DATA REQUIREMENT NOT SATISFIED FOR {ach_type} MODEL BUILD ***")
-                print("*** ODFI REQUIRES 3 MONTHS (90 DAYS) OF DATA ***")
+                if requirement_label:
+                    print(f"*** {ach_type} REQUIRES {requirement_label} ***")
+                else:
+                    print(f"*** {ach_type} REQUIRES {needed_days} DAYS OF DATA ***")
                 print(
                     f"*** CURRENT DATA RANGE: {date_range_days} DAYS ({date_range_days/30:.1f} MONTHS) ***"
                 )
@@ -642,10 +749,13 @@ class BatchDateCompletenessAnalyzer:
                 report["reason"] = f"Data range {date_range_days} < required {needed_days} days for {ach_type}"
                 return report
 
-            cur = theMin
-            while cur <= theMax:
-                date_counts.setdefault(cur, 0)
-                cur += timedelta(days=1)
+            fill_missing = bool(self._meta("date_range", "fill_missing_dates", default=True))
+            count_mode = str(self._meta("date_range", "count_mode", default="inclusive") or "inclusive")
+            if fill_missing:
+                cur = theMin
+                while cur <= theMax if count_mode == "inclusive" else cur < theMax:
+                    date_counts.setdefault(cur, 0)
+                    cur += timedelta(days=1)
 
             try:
                 import pandas as pd  # type: ignore
@@ -659,12 +769,27 @@ class BatchDateCompletenessAnalyzer:
 
             df_batches = pd.DataFrame(list(date_counts.items()), columns=["Date", "DateValue"])
             df_batches["Date"] = pd.to_datetime(df_batches["Date"], errors="coerce")
-            df_batches = df_batches[df_batches["Date"].dt.weekday < 5]
+            exclude_weekends = bool(self._meta("calendar", "exclude_weekends", default=True))
+            if exclude_weekends:
+                df_batches = df_batches[df_batches["Date"].dt.weekday < 5]
 
-            cal = USFederalHolidayCalendar()
-            holidays = cal.holidays(start=theMin, end=theMax).to_pydatetime()
-            self.logger.info(f"Excluding {len(holidays)} federal holidays from analysis.")
-            df_batches = df_batches[~df_batches["Date"].isin(holidays)]
+            holiday_calendar = self._meta(
+                "calendar", "holiday_calendar", default="USFederalHolidayCalendar"
+            )
+            if holiday_calendar:
+                holidays = []
+                if str(holiday_calendar) == "USFederalHolidayCalendar":
+                    cal = USFederalHolidayCalendar()
+                    holidays = cal.holidays(start=theMin, end=theMax).to_pydatetime()
+                else:
+                    self.logger.warning(
+                        f"Unknown holiday_calendar '{holiday_calendar}', skipping holiday filter."
+                    )
+                if holidays:
+                    self.logger.info(
+                        f"Excluding {len(holidays)} holidays from analysis ({holiday_calendar})."
+                    )
+                    df_batches = df_batches[~df_batches["Date"].isin(holidays)]
             df_batches.reset_index(drop=True, inplace=True)
 
             if len(df_batches) == 0:
@@ -680,10 +805,40 @@ class BatchDateCompletenessAnalyzer:
                 return report
 
             median = df_batches["DateValue"].median()
-            self.logger.info(f"Median batch count per business day: {median}")
+            reference = median
+            zero_strategy = str(
+                self._meta("anomaly_rules", "zero_reference_strategy", default="non_zero_median")
+                or "non_zero_median"
+            )
+            if (reference is None) or (float(reference) == 0.0 and zero_strategy == "non_zero_median"):
+                non_zero = df_batches[df_batches["DateValue"] > 0]["DateValue"]
+                if len(non_zero) > 0:
+                    reference = non_zero.median()
 
-            too_small = df_batches["DateValue"] < median / 10
-            too_big = df_batches["DateValue"] > 2 * median
+            try:
+                low_ratio = float(self._meta("anomaly_rules", "low_volume_ratio", default=0.1))
+            except Exception:
+                low_ratio = 0.1
+            try:
+                high_ratio = float(self._meta("anomaly_rules", "high_volume_ratio", default=2.0))
+            except Exception:
+                high_ratio = 2.0
+
+            self.logger.info(f"Median batch count per day (post filters): {median}")
+            self.logger.info(
+                f"Anomaly baseline reference: {reference} (strategy={zero_strategy}, low_ratio={low_ratio}, high_ratio={high_ratio})"
+            )
+
+            # Compute thresholds from reference; if reference is 0, this will only flag >0 as high volume.
+            try:
+                ref = float(reference) if reference is not None else 0.0
+            except Exception:
+                ref = 0.0
+            low_thresh = ref * low_ratio
+            high_thresh = ref * high_ratio
+
+            too_small = df_batches["DateValue"] < low_thresh
+            too_big = df_batches["DateValue"] > high_thresh
 
             missing_days = int(too_small.sum())
             overloaded_days = int(too_big.sum())
@@ -712,6 +867,11 @@ class BatchDateCompletenessAnalyzer:
 
             report["volume_anomalies"] = {
                 "median": float(median) if median is not None else None,
+                "reference": float(reference) if reference is not None else None,
+                "low_volume_ratio": float(low_ratio),
+                "high_volume_ratio": float(high_ratio),
+                "low_threshold": float(low_thresh),
+                "high_threshold": float(high_thresh),
                 "missing_days_low_volume": int(missing_days),
                 "overloaded_days_high_volume": int(overloaded_days),
             }

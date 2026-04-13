@@ -83,9 +83,22 @@ class Config:
 
         # Optional: Allow overriding Batch Date Completeness thresholds from config.
         # If metadata_enabled is True, these are applied as overrides; otherwise the analyzer defaults apply.
+        self.batch_needed_days_odfi_is_set = "batch_needed_days_odfi" in conf
+        self.batch_needed_days_rdfi_is_set = "batch_needed_days_rdfi" in conf
+        self.batch_record_type_to_count_is_set = "batch_record_type_to_count" in conf
         self.batch_needed_days_odfi = conf.getint("batch_needed_days_odfi", 90)
         self.batch_needed_days_rdfi = conf.getint("batch_needed_days_rdfi", 180)
         self.batch_record_type_to_count = conf.getint("batch_record_type_to_count", 5)
+
+        # Optional: Batch data check analyzer metadata overrides (JSON).
+        # Provide either a JSON file path OR inline JSON.
+        # If both are set, `batch_data_metadata_path` takes precedence.
+        self.batch_data_metadata_path = conf.get("batch_data_metadata_path", "").strip()
+        self.batch_data_metadata_json = conf.get("batch_data_metadata_json", "").strip()
+        self.batch_data_metadata = self._load_optional_json_metadata(
+            self.batch_data_metadata_path,
+            self.batch_data_metadata_json,
+        )
 
         # Optional: ABA entropy analyzer metadata overrides (JSON).
         # Provide either a JSON file path OR inline JSON.
