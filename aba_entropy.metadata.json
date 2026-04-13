@@ -1,0 +1,52 @@
+{
+  "section_name": "ABA Entropy",
+  "file_selection": {
+    "extension": null
+  },
+  "line_processing": {
+    "encoding": "ascii",
+    "decode_errors": "replace",
+    "record_type_position_0_based": 0
+  },
+  "metrics": [
+    {
+      "id": "type5_odfi",
+      "label": "ODFI (Type-5)",
+      "record_key": 5,
+      "field_slice_0_based": [81, 87],
+      "normalize": {
+        "strip": true,
+        "digits_only": true,
+        "skip_if_empty": true
+      }
+    },
+    {
+      "id": "type6_rdfi",
+      "label": "RDFI (Type-6)",
+      "record_key": 6,
+      "field_slice_0_based": [5, 12],
+      "normalize": {
+        "strip": true,
+        "digits_only": true,
+        "skip_if_empty": true
+      }
+    }
+  ],
+  "scoring": {
+    "method": "entropy",
+    "entropy_signed": true
+  },
+  "decision": {
+    "left_metric": "type5_odfi",
+    "operator": ">",
+    "right_metric": "type6_rdfi",
+    "if_true": {
+      "ach_type": "ODFI",
+      "message": "This appears to be ODFI data."
+    },
+    "if_false": {
+      "ach_type": "RDFI",
+      "message": "This appears to be RDFI data."
+    }
+  }
+}
