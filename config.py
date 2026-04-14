@@ -100,6 +100,16 @@ class Config:
             self.batch_data_metadata_json,
         )
 
+        # Optional: ACH MDV validator metadata overrides (JSON).
+        # Provide either a JSON file path OR inline JSON.
+        # If both are set, `ach_mdv_metadata_path` takes precedence.
+        self.ach_mdv_metadata_path = conf.get("ach_mdv_metadata_path", "").strip()
+        self.ach_mdv_metadata_json = conf.get("ach_mdv_metadata_json", "").strip()
+        self.ach_mdv_metadata = self._load_optional_json_metadata(
+            self.ach_mdv_metadata_path,
+            self.ach_mdv_metadata_json,
+        )
+
         # Optional: ABA entropy analyzer metadata overrides (JSON).
         # Provide either a JSON file path OR inline JSON.
         # If both are set, `aba_entropy_metadata_path` takes precedence.

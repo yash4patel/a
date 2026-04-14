@@ -1,6 +1,7 @@
 import os
 import re
 import traceback
+from copy import deepcopy
 
 import folder_tools
 
@@ -10,6 +11,8 @@ class ACHMDVValidator:
         self.config = config
         self.log = log_manager
         self.logger = log_manager.logger
+
+        self.metadata = self._load_metadata()
 
         # STATE TRACKING
         self.problematic_files = set()
@@ -84,25 +87,189 @@ class ACHMDVValidator:
 
         self.prepend_file_path = self.config.data_path if self.config.full_file_path else ""
 
+    def _deep_merge_dicts(self, base, override):
+        """
+        Deep-merge JSON-shaped dicts (override wins).
+        Lists are replaced (not merged).
+        """
+        if not isinstance(base, dict) or not isinstance(override, dict):
+            return deepcopy(override)
+        merged = deepcopy(base)
+        for k, v in override.items():
+            if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+                merged[k] = self._deep_merge_dicts(merged[k], v)
+            else:
+                merged[k] = deepcopy(v)
+        return merged
+
+    def _load_metadata(self):
+        meta = self._build_default_metadata()
+        override = getattr(self.config, "ach_mdv_metadata", None)
+        if isinstance(override, dict) and override:
+            meta = self._deep_merge_dicts(meta, override)
+
+        # Backwards compatibility: if mdv_checks_enabled is provided in config, overlay that as check gating.
+        checks_enabled = getattr(self.config, "mdv_checks_enabled", None)
+        if isinstance(checks_enabled, dict) and checks_enabled:
+            meta.setdefault("checks", {})
+            for check_name, enabled in checks_enabled.items():
+                meta["checks"].setdefault(check_name, {})
+                meta["checks"][check_name]["enabled"] = bool(enabled)
+        return meta
+
+    def _build_default_metadata(self):
+        # In-code default metadata contract. This is mirrored by `ach_mdv_validator.metadata.json`.
+        return {
+            "section_name": "ACH RDV Validation",
+            "file_selection": {
+                "extension": None,
+                "excluded_extensions": [".gpg", ".pgp", ".zip", ".tar", ".gz", ".enc", ".asc"],
+            },
+            "decoding": {
+                "encoding": "ascii",
+                "decode_errors": "replace",
+                "rstrip_newlines": True,
+            },
+            "record_layout": {
+                "expected_line_length": 94,
+                "record_type_position_0_based": 0,
+                "type5_company_id_slice_0_based": [40, 50],
+                "type5_sec_code_slice_0_based": [50, 53],
+                "type7_addenda_type_code_slice_0_based": [1, 3],
+                "type7_rc_flag_slice_0_based": [3, 4],
+                "type7_return_code_digits_slice_0_based": [4, 6],
+            },
+            "binary_detection": {
+                "sample_bytes": 1024,
+                "null_byte_is_binary": True,
+                "text_ratio_threshold": 0.85,
+                "allowed_text_bytes": {
+                    "ranges_inclusive": [[32, 126]],
+                    "extra_bytes": [9, 10, 13],
+                },
+                "on_error_treat_as_binary": True,
+            },
+            "encoding_integrity": {
+                "enabled": True,
+                "allowed_bytes_printable_ascii_only": True,
+                "sample_limit": 20,
+                "preview_bytes": 120,
+                "sec_code_diagnostics": {
+                    "bytes_slice_0_based": [50, 53],
+                    "utf8_chars_slice_0_based": [50, 53],
+                },
+            },
+            "dataset_totals": {
+                "enabled": True,
+                "count_type5_batches": True,
+                "count_type6_transactions": True,
+                "count_total_records": True,
+                "type7_addenda": {
+                    "enabled": True,
+                    "standard_return_addenda_type_code": "99",
+                    "noc_addenda_type_code": "98",
+                },
+            },
+            "checks": {
+                "Bad Keys": {
+                    "enabled": True,
+                    "valid_record_types": [1, 5, 6, 7, 8, 9],
+                    "max_consecutive_bad_keys": 10,
+                    "sample_errors_limit": 3,
+                    "skip_file_on_max_consecutive": True,
+                },
+                "Multiple Headers (Concatenated Files)": {"enabled": True},
+                "Record Order Issues": {
+                    "enabled": True,
+                    "allowed_previous_for_key": {
+                        "1": [9],
+                        "5": [1, 8],
+                        "6": [5, 6, 7],
+                        "7": [6, 7],
+                        "9": [8, 9],
+                    },
+                },
+                "Bad SEC Codes": {
+                    "enabled": True,
+                    "sec_code_slice_0_based": [50, 53],
+                    "sec_codes_source": "config.sec_codes",
+                },
+                "Bad IAT Addendum": {
+                    "enabled": True,
+                    "sec_code": "IAT",
+                    "type7_type_code_slice_0_based": [1, 3],
+                    "required_type_codes": ["10", "11", "12", "13", "14", "15", "16"],
+                },
+                "Bad POS Addendum": {
+                    "enabled": True,
+                    "sec_code": "POS",
+                    "type7_type_code_slice_0_based": [1, 3],
+                    "min_type7_records": 1,
+                },
+                "Missing File Header (Type 1)": {"enabled": True},
+                "EOF Missing (Type 9)": {"enabled": True},
+                "Bad Record Lengths": {
+                    "enabled": True,
+                    "expected_length": 94,
+                    "type9_length_special_case": {"if_length": 55, "treat_as_length": 94},
+                },
+            },
+            "retail_odfi_indicator": {
+                "enabled": True,
+                "company_id_slice_0_based": [40, 50],
+                "digits_only_uniqueness_preferred": True,
+                "low_unique_thresholds": [1, 2],
+                "close_prefix_match_min_len": 5,
+                "match_config_abas": True,
+                "store_match_samples_limit": 50,
+            },
+        }
+
+    def _meta(self, *path, default=None):
+        cur = self.metadata
+        for p in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(p)
+        return cur if cur is not None else default
+
     def _check_enabled(self, check_name: str) -> bool:
         """
         Metadata-driven check gating. If config.mdv_checks_enabled is present,
         checks not explicitly enabled are treated as enabled by default.
         """
-        cfg = getattr(self.config, "mdv_checks_enabled", None)
-        if not isinstance(cfg, dict):
-            return True
-        v = cfg.get(check_name)
-        if v is None:
+        # Primary: metadata check enablement (defaults to True if missing).
+        enabled = self._meta("checks", check_name, "enabled", default=None)
+        if enabled is None:
             return True
         try:
-            return bool(v)
+            return bool(enabled)
         except Exception:
             return True
 
     def _enabled(self, check_name: str) -> bool:
         # Backwards-compatible alias for readability at call sites.
         return self._check_enabled(check_name)
+
+    def _allowed_previous_keys_for(self, key: int):
+        """
+        Metadata-driven record order policy.
+        Returns a list of allowed previous record types for the given key.
+        If not configured, returns None (caller should fall back to historical behavior).
+        """
+        m = self._meta("checks", "Record Order Issues", "allowed_previous_for_key", default=None)
+        if not isinstance(m, dict):
+            return None
+        allowed = m.get(str(key))
+        if not isinstance(allowed, list):
+            return None
+        out = []
+        for v in allowed:
+            try:
+                out.append(int(v))
+            except Exception:
+                continue
+        return out
 
     def _mark_problem(self, check_name: str, fname: str) -> bool:
         """
@@ -120,26 +287,53 @@ class ACHMDVValidator:
         try:
             if filepath in self._binary_cache:
                 return self._binary_cache[filepath]
+            sample_bytes = int(self._meta("binary_detection", "sample_bytes", default=1024) or 1024)
             with open(filepath, "rb") as f:
-                chunk = f.read(1024)
+                chunk = f.read(sample_bytes)
                 if len(chunk) == 0:
                     self._binary_cache[filepath] = False
                     return False
 
-                if b"\x00" in chunk:
+                null_is_binary = bool(
+                    self._meta("binary_detection", "null_byte_is_binary", default=True)
+                )
+                if null_is_binary and b"\x00" in chunk:
                     self._binary_cache[filepath] = True
                     return True
 
-                text_chars = sum(
-                    1 for b in chunk if 32 <= b <= 126 or b in (9, 10, 13)
+                allowed = self._meta("binary_detection", "allowed_text_bytes", default={}) or {}
+                ranges = allowed.get("ranges_inclusive") or [[32, 126]]
+                extra = allowed.get("extra_bytes") or [9, 10, 13]
+                try:
+                    extra_set = {int(b) for b in extra}
+                except Exception:
+                    extra_set = {9, 10, 13}
+
+                def is_allowed_byte(b: int) -> bool:
+                    if b in extra_set:
+                        return True
+                    for r in ranges:
+                        try:
+                            lo, hi = int(r[0]), int(r[1])
+                        except Exception:
+                            continue
+                        if lo <= b <= hi:
+                            return True
+                    return False
+
+                text_chars = sum(1 for b in chunk if is_allowed_byte(int(b)))
+                thresh = float(
+                    self._meta("binary_detection", "text_ratio_threshold", default=0.85)
+                    or 0.85
                 )
-                is_binary = (text_chars / len(chunk) < 0.85)
+                is_binary = (text_chars / len(chunk) < thresh)
                 self._binary_cache[filepath] = is_binary
                 return is_binary
         except Exception as e:
             self.logger.warning(f"Error checking if file is binary {filepath}: {e}")
-            self._binary_cache[filepath] = True
-            return True
+            on_err = bool(self._meta("binary_detection", "on_error_treat_as_binary", default=True))
+            self._binary_cache[filepath] = bool(on_err)
+            return bool(on_err)
 
     def _count_dataset_stats(self, fileNames):
         """
@@ -161,6 +355,13 @@ class ACHMDVValidator:
 
         Uses a lightweight byte-scan and skips binary/encrypted files (same policy as validation).
         """
+        totals_policy = self._meta("dataset_totals", default={}) or {}
+        count_batches = bool(totals_policy.get("count_type5_batches", True))
+        count_transactions = bool(totals_policy.get("count_type6_transactions", True))
+        count_total_records = bool(totals_policy.get("count_total_records", True))
+        t7_policy = self._meta("dataset_totals", "type7_addenda", default={}) or {}
+        t7_enabled = bool(t7_policy.get("enabled", True))
+
         batches = 0
         transactions = 0
         total_records = 0
@@ -178,9 +379,62 @@ class ACHMDVValidator:
         control_counts = {}
         non_ascii_counts = {}
         samples = []
-        SAMPLE_LIMIT = 20
+        try:
+            SAMPLE_LIMIT = int(self._meta("encoding_integrity", "sample_limit", default=20) or 20)
+        except Exception:
+            SAMPLE_LIMIT = 20
+        try:
+            preview_bytes = int(self._meta("encoding_integrity", "preview_bytes", default=120) or 120)
+        except Exception:
+            preview_bytes = 120
+        preview_bytes = max(0, preview_bytes)
         file_first_bad_line = {}  # fname -> first line number with bad bytes
         file_bad_line_counts = {}  # fname -> number of lines with bad bytes
+        scan_enabled = bool(self._meta("encoding_integrity", "enabled", default=True))
+        ascii_only = bool(
+            self._meta("encoding_integrity", "allowed_bytes_printable_ascii_only", default=True)
+        )
+        diag_bytes_slice = self._meta(
+            "encoding_integrity", "sec_code_diagnostics", "bytes_slice_0_based", default=[50, 53]
+        )
+        diag_utf8_slice = self._meta(
+            "encoding_integrity",
+            "sec_code_diagnostics",
+            "utf8_chars_slice_0_based",
+            default=[50, 53],
+        )
+        try:
+            diag_b0, diag_b1 = int(diag_bytes_slice[0]), int(diag_bytes_slice[1])
+        except Exception:
+            diag_b0, diag_b1 = 50, 53
+        try:
+            diag_u0, diag_u1 = int(diag_utf8_slice[0]), int(diag_utf8_slice[1])
+        except Exception:
+            diag_u0, diag_u1 = 50, 53
+
+        # Type-7 slice policy (byte offsets, fixed width)
+        addenda_slice = self._meta(
+            "record_layout", "type7_addenda_type_code_slice_0_based", default=[1, 3]
+        )
+        rc_flag_slice = self._meta("record_layout", "type7_rc_flag_slice_0_based", default=[3, 4])
+        rc_digits_slice = self._meta(
+            "record_layout", "type7_return_code_digits_slice_0_based", default=[4, 6]
+        )
+        try:
+            add0, add1 = int(addenda_slice[0]), int(addenda_slice[1])
+        except Exception:
+            add0, add1 = 1, 3
+        try:
+            rcf0, rcf1 = int(rc_flag_slice[0]), int(rc_flag_slice[1])
+        except Exception:
+            rcf0, rcf1 = 3, 4
+        try:
+            rcd0, rcd1 = int(rc_digits_slice[0]), int(rc_digits_slice[1])
+        except Exception:
+            rcd0, rcd1 = 4, 6
+
+        std_return_code = str(t7_policy.get("standard_return_addenda_type_code") or "99")
+        noc_code = str(t7_policy.get("noc_addenda_type_code") or "98")
 
         for fname in fileNames:
             filepath = os.path.join(self.config.data_path, fname)
@@ -191,82 +445,92 @@ class ACHMDVValidator:
                     for file_line, line_bytes in enumerate(f, 1):
                         if not line_bytes:
                             continue
-                        total_records += 1
+                        if count_total_records:
+                            total_records += 1
                         raw = line_bytes.rstrip(b"\r\n")
 
-                        # Byte-level special character detection.
-                        # Allowed bytes for NACHA fixed-width: printable ASCII 0x20-0x7E and space padding.
-                        # Flag anything outside that range.
-                        bad_positions = []
-                        bad_bytes = []
-                        for i, b in enumerate(raw):
-                            if 0x20 <= b <= 0x7E:
-                                continue
-                            bad_positions.append(i)
-                            bad_bytes.append(b)
+                        if scan_enabled and ascii_only:
+                            # Byte-level special character detection.
+                            # Allowed bytes for NACHA fixed-width: printable ASCII 0x20-0x7E and space padding.
+                            # Flag anything outside that range.
+                            bad_positions = []
+                            bad_bytes = []
+                            for i, b in enumerate(raw):
+                                if 0x20 <= b <= 0x7E:
+                                    continue
+                                bad_positions.append(i)
+                                bad_bytes.append(b)
 
-                        if bad_bytes:
-                            special_lines += 1
-                            special_files.add(fname)
-                            file_bad_line_counts[fname] = file_bad_line_counts.get(fname, 0) + 1
-                            file_first_bad_line.setdefault(fname, int(file_line))
-                            for b in bad_bytes:
-                                byte_counts[b] = byte_counts.get(b, 0) + 1
-                                if b >= 0x80:
-                                    non_ascii_counts[b] = non_ascii_counts.get(b, 0) + 1
-                                elif b < 0x20 or b == 0x7F:
-                                    control_counts[b] = control_counts.get(b, 0) + 1
+                            if bad_bytes:
+                                special_lines += 1
+                                special_files.add(fname)
+                                file_bad_line_counts[fname] = file_bad_line_counts.get(fname, 0) + 1
+                                file_first_bad_line.setdefault(fname, int(file_line))
+                                for b in bad_bytes:
+                                    byte_counts[b] = byte_counts.get(b, 0) + 1
+                                    if b >= 0x80:
+                                        non_ascii_counts[b] = non_ascii_counts.get(b, 0) + 1
+                                    elif b < 0x20 or b == 0x7F:
+                                        control_counts[b] = control_counts.get(b, 0) + 1
 
-                            if len(samples) < SAMPLE_LIMIT:
-                                # Diagnostics for SEC code offset issues (bytes vs utf-8 char indexing)
-                                sec_bytes = raw[50:53]
-                                sec_bytes_ascii = sec_bytes.decode("ascii", "replace")
-                                try:
-                                    utf8_text = raw.decode("utf-8", "replace")
-                                    sec_utf8_chars = utf8_text[50:53] if len(utf8_text) >= 53 else ""
-                                except Exception:
-                                    sec_utf8_chars = ""
+                                if len(samples) < SAMPLE_LIMIT:
+                                    # Diagnostics for SEC code offset issues (bytes vs utf-8 char indexing)
+                                    sec_bytes = raw[diag_b0:diag_b1]
+                                    sec_bytes_ascii = sec_bytes.decode("ascii", "replace")
+                                    try:
+                                        utf8_text = raw.decode("utf-8", "replace")
+                                        sec_utf8_chars = (
+                                            utf8_text[diag_u0:diag_u1] if len(utf8_text) >= diag_u1 else ""
+                                        )
+                                    except Exception:
+                                        sec_utf8_chars = ""
 
-                                preview = raw[:120].decode("ascii", "replace")
-                                samples.append(
-                                    {
-                                        "file": fname,
-                                        "line_number": int(file_line),
-                                        "bad_byte_count": int(len(bad_bytes)),
-                                        "bad_byte_positions_0_based": bad_positions[:50],
-                                        "bad_bytes_hex": [f"0x{b:02X}" for b in bad_bytes[:20]],
-                                        "sec_code_bytes_50_53_ascii": sec_bytes_ascii,
-                                        "sec_code_utf8_chars_50_53": sec_utf8_chars,
-                                        "preview_ascii_replace": preview,
-                                    }
-                                )
+                                    preview = raw[:preview_bytes].decode("ascii", "replace") if preview_bytes else ""
+                                    samples.append(
+                                        {
+                                            "file": fname,
+                                            "line_number": int(file_line),
+                                            "bad_byte_count": int(len(bad_bytes)),
+                                            "bad_byte_positions_0_based": bad_positions[:50],
+                                            "bad_bytes_hex": [f"0x{b:02X}" for b in bad_bytes[:20]],
+                                            "sec_code_bytes_50_53_ascii": sec_bytes_ascii,
+                                            "sec_code_utf8_chars_50_53": sec_utf8_chars,
+                                            "preview_ascii_replace": preview,
+                                        }
+                                    )
 
                         b0 = line_bytes[:1]
                         if b0 == b"5":
-                            batches += 1
+                            if count_batches:
+                                batches += 1
                         elif b0 == b"6":
-                            transactions += 1
+                            if count_transactions:
+                                transactions += 1
                         else:
                             # Type-7 addenda parsing (byte offsets, fixed width)
-                            if raw[:1] == b"7":
+                            if t7_enabled and raw[:1] == b"7":
                                 type7_count += 1
-                                addenda_type = raw[1:3].decode("ascii", "ignore")
+                                addenda_type = raw[add0:add1].decode("ascii", "ignore")
                                 if addenda_type:
                                     addenda_type_counts[addenda_type] = (
                                         addenda_type_counts.get(addenda_type, 0) + 1
                                     )
-                                if addenda_type == "99":
+                                if addenda_type == std_return_code:
                                     standard_returns_799 += 1
-                                elif addenda_type == "98":
+                                elif addenda_type == noc_code:
                                     nocs_798 += 1
 
-                                rc_flag = raw[3:4].decode("ascii", "ignore") if len(raw) >= 4 else ""
+                                rc_flag = (
+                                    raw[rcf0:rcf1].decode("ascii", "ignore")
+                                    if len(raw) >= rcf1
+                                    else ""
+                                )
                                 if rc_flag not in ("R", "C"):
                                     rc_flag_counts["OTHER"] += 1
                                     continue
                                 rc_flag_counts[rc_flag] += 1
 
-                                digits = raw[4:6].decode("ascii", "ignore")
+                                digits = raw[rcd0:rcd1].decode("ascii", "ignore")
                                 digits = "".join(ch for ch in digits if ch.isdigit())
                                 code = f"{rc_flag}{digits}" if len(digits) == 2 else f"{rc_flag}??"
                                 return_code_counts[code] = return_code_counts.get(code, 0) + 1
@@ -336,18 +600,41 @@ class ACHMDVValidator:
         return False
 
     def test_seven_record_test(self, sec_code, seven_record_list):
-        if sec_code == "IAT":
-            required = set(map(str, range(10, 17)))
-            return required.issubset(set(seven_record_list))
-        if sec_code == "POS":
-            return len(seven_record_list) > 0
+        if sec_code == str(self._meta("checks", "Bad IAT Addendum", "sec_code", default="IAT") or "IAT"):
+            req = self._meta("checks", "Bad IAT Addendum", "required_type_codes", default=None)
+            if not isinstance(req, list) or not req:
+                req = [str(i) for i in range(10, 17)]
+            required = {str(x) for x in req}
+            return required.issubset(set(map(str, seven_record_list)))
+        if sec_code == str(self._meta("checks", "Bad POS Addendum", "sec_code", default="POS") or "POS"):
+            try:
+                min_recs = int(self._meta("checks", "Bad POS Addendum", "min_type7_records", default=1) or 1)
+            except Exception:
+                min_recs = 1
+            return len(seven_record_list) >= max(1, min_recs)
         return True
 
     def _process_problem_line(self, key, row_length, line, fname, file_line):
         if not self._enabled("Bad Record Lengths"):
             return
+        try:
+            expected = int(self._meta("checks", "Bad Record Lengths", "expected_length", default=94) or 94)
+        except Exception:
+            expected = 94
+        # Type-9 special casing (some files use 55 chars for 9-record)
+        try:
+            spec = self._meta(
+                "checks", "Bad Record Lengths", "type9_length_special_case", default=None
+            )
+            if isinstance(spec, dict) and key == 9:
+                if_len = int(spec.get("if_length"))
+                treat_as = int(spec.get("treat_as_length"))
+                if row_length == if_len:
+                    row_length = treat_as
+        except Exception:
+            pass
         if (key != 9) or ((key == 9) and (self.last_key_seen != 9)):
-            if row_length != 94:
+            if row_length != expected:
                 if (
                     self.config.show_problem_lines
                     and self.problem_line_counter < self.config.problem_line_limit
@@ -367,9 +654,20 @@ class ACHMDVValidator:
         try:
             self.logger.info("=== STARTING SECTION 1 ACH RDV VALIDATION TEST ===")
 
-            fileNames = folder_tools.get_filenames(self.config.data_path)
+            # If metadata provides an extension, use it; otherwise fall back to listing all (historical behavior).
+            ext = self._meta("file_selection", "extension", default=None)
+            if ext:
+                fileNames = folder_tools.get_filenames(self.config.data_path, extension=str(ext))
+            else:
+                fileNames = folder_tools.get_filenames(self.config.data_path)
 
-            excluded_extensions = [".gpg", ".pgp", ".zip", ".tar", ".gz", ".enc", ".asc"]
+            excluded_extensions = self._meta(
+                "file_selection",
+                "excluded_extensions",
+                default=[".gpg", ".pgp", ".zip", ".tar", ".gz", ".enc", ".asc"],
+            )
+            if not isinstance(excluded_extensions, list):
+                excluded_extensions = [".gpg", ".pgp", ".zip", ".tar", ".gz", ".enc", ".asc"]
             original_count = len(fileNames)
             fileNames = [
                 f
@@ -391,26 +689,48 @@ class ACHMDVValidator:
             )
 
             # Dataset-level stats requested by customers
-            self.logger.info("Computing dataset totals (records, batches, transactions, and returns)...")
-            (
-                self.total_batches,
-                self.total_transactions,
-                self.total_records,
-                self.type7_addenda_records,
-                self.type7_addenda_type_counts,
-                self.type7_standard_returns_799,
-                self.type7_nocs_798,
-                self.type7_rc_flag_counts,
-                self.type7_return_code_counts,
-                self.special_char_files,
-                self.special_char_lines,
-                self.special_char_byte_counts,
-                self.special_char_control_counts,
-                self.special_char_non_ascii_counts,
-                self.special_char_samples,
-                self.special_char_file_first_bad_line,
-                self.special_char_file_bad_line_counts,
-            ) = self._count_dataset_stats(fileNames)
+            totals_enabled = bool(self._meta("dataset_totals", "enabled", default=True))
+            if totals_enabled:
+                self.logger.info(
+                    "Computing dataset totals (records, batches, transactions, and returns)..."
+                )
+                (
+                    self.total_batches,
+                    self.total_transactions,
+                    self.total_records,
+                    self.type7_addenda_records,
+                    self.type7_addenda_type_counts,
+                    self.type7_standard_returns_799,
+                    self.type7_nocs_798,
+                    self.type7_rc_flag_counts,
+                    self.type7_return_code_counts,
+                    self.special_char_files,
+                    self.special_char_lines,
+                    self.special_char_byte_counts,
+                    self.special_char_control_counts,
+                    self.special_char_non_ascii_counts,
+                    self.special_char_samples,
+                    self.special_char_file_first_bad_line,
+                    self.special_char_file_bad_line_counts,
+                ) = self._count_dataset_stats(fileNames)
+            else:
+                self.total_batches = 0
+                self.total_transactions = 0
+                self.total_records = 0
+                self.type7_addenda_records = 0
+                self.type7_addenda_type_counts = {}
+                self.type7_standard_returns_799 = 0
+                self.type7_nocs_798 = 0
+                self.type7_rc_flag_counts = {"R": 0, "C": 0, "OTHER": 0}
+                self.type7_return_code_counts = {}
+                self.special_char_files = set()
+                self.special_char_lines = 0
+                self.special_char_byte_counts = {}
+                self.special_char_control_counts = {}
+                self.special_char_non_ascii_counts = {}
+                self.special_char_samples = []
+                self.special_char_file_first_bad_line = {}
+                self.special_char_file_bad_line_counts = {}
 
             special_file_count = len(self.special_char_files)
             special_line_count = int(self.special_char_lines)
@@ -549,21 +869,68 @@ class ACHMDVValidator:
         seven_record_list = []
         type_1_count = 0
         consecutive_errors = 0
-        MAX_CONSECUTIVE_ERRORS = 10
+        try:
+            MAX_CONSECUTIVE_ERRORS = int(
+                self._meta("checks", "Bad Keys", "max_consecutive_bad_keys", default=10) or 10
+            )
+        except Exception:
+            MAX_CONSECUTIVE_ERRORS = 10
+        try:
+            bad_key_sample_limit = int(
+                self._meta("checks", "Bad Keys", "sample_errors_limit", default=3) or 3
+            )
+        except Exception:
+            bad_key_sample_limit = 3
+        skip_on_bad_keys = bool(
+            self._meta("checks", "Bad Keys", "skip_file_on_max_consecutive", default=True)
+        )
+        valid_record_types = self._meta(
+            "checks", "Bad Keys", "valid_record_types", default=[1, 5, 6, 7, 8, 9]
+        )
+        if not isinstance(valid_record_types, list):
+            valid_record_types = [1, 5, 6, 7, 8, 9]
+
+        # Decoding policy
+        encoding = str(self._meta("decoding", "encoding", default="ascii") or "ascii")
+        decode_errors = str(self._meta("decoding", "decode_errors", default="replace") or "replace")
+        rstrip_newlines = bool(self._meta("decoding", "rstrip_newlines", default=True))
+
+        # Layout slices
+        sec_slice = self._meta(
+            "checks", "Bad SEC Codes", "sec_code_slice_0_based", default=[50, 53]
+        )
+        try:
+            sec0, sec1 = int(sec_slice[0]), int(sec_slice[1])
+        except Exception:
+            sec0, sec1 = 50, 53
+        company_slice = self._meta("retail_odfi_indicator", "company_id_slice_0_based", default=[40, 50])
+        try:
+            cid0, cid1 = int(company_slice[0]), int(company_slice[1])
+        except Exception:
+            cid0, cid1 = 40, 50
+        type7_type_code_slice = self._meta(
+            "checks", "Bad IAT Addendum", "type7_type_code_slice_0_based", default=[1, 3]
+        )
+        try:
+            t7_0, t7_1 = int(type7_type_code_slice[0]), int(type7_type_code_slice[1])
+        except Exception:
+            t7_0, t7_1 = 1, 3
 
         try:
             with open(filepath, "rb") as f:
                 for file_line, line_bytes in enumerate(f, 1):
                     # IMPORTANT: do NOT lstrip() — ACH is fixed-width; positions must be stable.
-                    line = line_bytes.decode("ascii", "replace").rstrip("\r\n")
+                    line = line_bytes.decode(encoding, decode_errors)
+                    if rstrip_newlines:
+                        line = line.rstrip("\r\n")
 
                     row_length = len(line)
                     if row_length == 0:
                         continue
 
                     try:
-                        key = int(line[0])
-                        if key not in [1, 5, 6, 7, 8, 9]:
+                        key = int(line[int(self._meta("record_layout", "record_type_position_0_based", default=0) or 0)])
+                        if key not in valid_record_types:
                             raise ValueError
                         consecutive_errors = 0
                     except Exception:
@@ -576,9 +943,10 @@ class ACHMDVValidator:
                             )
                             self._mark_problem("Bad Keys", fname)
                             self.skipped_binary_files.append(fname)
-                            return
+                            if skip_on_bad_keys:
+                                return
 
-                        if consecutive_errors <= 3:
+                        if consecutive_errors <= bad_key_sample_limit:
                             if self._enabled("Bad Keys"):
                                 self.bad_keys.append((fname, line, file_line))
                                 self._mark_problem("Bad Keys", fname)
@@ -600,7 +968,13 @@ class ACHMDVValidator:
                                     f"(concatenated file detected) at line {file_line}"
                                 )
 
-                        if self.last_key_seen is not None and self.last_key_seen != 9:
+                        # Record order policy (metadata-driven)
+                        allowed_prev = self._allowed_previous_keys_for(1)
+                        if allowed_prev is None:
+                            bad_order = (self.last_key_seen is not None and self.last_key_seen != 9)
+                        else:
+                            bad_order = (self.last_key_seen is not None and self.last_key_seen not in allowed_prev)
+                        if bad_order:
                             if self._enabled("Record Order Issues"):
                                 self.problems[key] += 1
                                 self._mark_problem("Record Order Issues", fname)
@@ -611,8 +985,9 @@ class ACHMDVValidator:
 
                     if key == 5:
                         self.type5_total_records += 1
-                        if len(line) >= 50:
-                            field_41_50 = line[40:50]  # cut -c41-50
+                        field_41_50 = ""
+                        if len(line) >= cid1:
+                            field_41_50 = line[cid0:cid1]
                             self.type5_pos41_50_all_counts_raw[field_41_50] = (
                                 self.type5_pos41_50_all_counts_raw.get(field_41_50, 0) + 1
                             )
@@ -623,7 +998,12 @@ class ACHMDVValidator:
                                     + 1
                                 )
 
-                        if self.last_key_seen not in [1, 8]:
+                        allowed_prev = self._allowed_previous_keys_for(5)
+                        if allowed_prev is None:
+                            bad_order = (self.last_key_seen not in [1, 8])
+                        else:
+                            bad_order = (self.last_key_seen is not None and self.last_key_seen not in allowed_prev)
+                        if bad_order:
                             if self._enabled("Record Order Issues"):
                                 self.problems[key] += 1
                                 self._mark_problem("Record Order Issues", fname)
@@ -632,15 +1012,16 @@ class ACHMDVValidator:
                                     f"[Order] 5 record not after 1/8 in {fname} line {file_line}"
                                 )
 
-                        sec_code = line[50:53]
+                        sec_code = line[sec0:sec1] if len(line) >= sec1 else ""
                         self.sec_codes_count = getattr(self, "sec_codes_count", {})
                         self.sec_codes_count[sec_code] = (
                             self.sec_codes_count.get(sec_code, 0) + 1
                         )
 
+                        allowed_secs = getattr(self.config, "sec_codes", [])
                         if (
                             self._enabled("Bad SEC Codes")
-                            and sec_code not in self.config.sec_codes
+                            and sec_code not in allowed_secs
                             and fname not in self.problematic_files
                         ):
                             self.bad_secs.append((fname, line, sec_code, file_line))
@@ -650,7 +1031,8 @@ class ACHMDVValidator:
                             )
 
                         # Retail ODFI indicator (config-based): Type-5 pos 41-50 matches any configured bank ABA.
-                        if self._bank_abas() and len(line) >= 50:
+                        retail_enabled = bool(self._meta("retail_odfi_indicator", "enabled", default=True))
+                        if retail_enabled and self._bank_abas() and len(line) >= cid1:
                             matching_abas = self._matching_bank_abas(field_41_50)
 
                             if matching_abas:
@@ -661,7 +1043,18 @@ class ACHMDVValidator:
                                     self.type5_pos41_50_match_values.get(field_41_50, 0)
                                     + 1
                                 )
-                                if len(self.type5_pos41_50_match_samples) < 50:
+                                try:
+                                    sample_limit = int(
+                                        self._meta(
+                                            "retail_odfi_indicator",
+                                            "store_match_samples_limit",
+                                            default=50,
+                                        )
+                                        or 50
+                                    )
+                                except Exception:
+                                    sample_limit = 50
+                                if len(self.type5_pos41_50_match_samples) < sample_limit:
                                     self.type5_pos41_50_match_samples.append(
                                         (fname, file_line, field_41_50)
                                     )
@@ -682,7 +1075,12 @@ class ACHMDVValidator:
                         seven_record_list = []
 
                     if key == 6:
-                        if self.last_key_seen not in [5, 6, 7]:
+                        allowed_prev = self._allowed_previous_keys_for(6)
+                        if allowed_prev is None:
+                            bad_order = (self.last_key_seen not in [5, 6, 7])
+                        else:
+                            bad_order = (self.last_key_seen is not None and self.last_key_seen not in allowed_prev)
+                        if bad_order:
                             if self._enabled("Record Order Issues"):
                                 self.problems[key] += 1
                                 self._mark_problem("Record Order Issues", fname)
@@ -692,7 +1090,12 @@ class ACHMDVValidator:
                                 )
 
                     if key == 7:
-                        if self.last_key_seen not in [6, 7]:
+                        allowed_prev = self._allowed_previous_keys_for(7)
+                        if allowed_prev is None:
+                            bad_order = (self.last_key_seen not in [6, 7])
+                        else:
+                            bad_order = (self.last_key_seen is not None and self.last_key_seen not in allowed_prev)
+                        if bad_order:
                             if self._enabled("Record Order Issues"):
                                 self.problems[key] += 1
                                 self._mark_problem("Record Order Issues", fname)
@@ -701,30 +1104,56 @@ class ACHMDVValidator:
                                     f"[Order] 7 record out of order in {fname} line {file_line}"
                                 )
 
-                        if sec_code in ["IAT", "POS"]:
+                        iat_code = str(
+                            self._meta("checks", "Bad IAT Addendum", "sec_code", default="IAT") or "IAT"
+                        )
+                        pos_code = str(
+                            self._meta("checks", "Bad POS Addendum", "sec_code", default="POS") or "POS"
+                        )
+                        if sec_code in (iat_code, pos_code):
                             try:
-                                type_code = line[1:3]
+                                type_code = line[t7_0:t7_1]
                             except Exception:
                                 type_code = "00"
                             seven_record_list.append(type_code)
                         else:
-                            row_length = 94
+                            try:
+                                row_length = int(
+                                    self._meta("record_layout", "expected_line_length", default=94) or 94
+                                )
+                            except Exception:
+                                row_length = 94
 
                     if key == 8:
-                        if sec_code in ["IAT", "POS"]:
+                        iat_code = str(
+                            self._meta("checks", "Bad IAT Addendum", "sec_code", default="IAT") or "IAT"
+                        )
+                        pos_code = str(
+                            self._meta("checks", "Bad POS Addendum", "sec_code", default="POS") or "POS"
+                        )
+                        if sec_code in (iat_code, pos_code):
                             if not self.test_seven_record_test(sec_code, seven_record_list):
                                 error_key = (fname, sec_code)
                                 if error_key not in self.bad_7_addendum[sec_code]:
+                                    # Required type codes come from metadata for IAT; POS uses min_type7_records.
+                                    iat_required = self._meta(
+                                        "checks",
+                                        "Bad IAT Addendum",
+                                        "required_type_codes",
+                                        default=[str(i) for i in range(10, 17)],
+                                    )
+                                    if not isinstance(iat_required, list) or not iat_required:
+                                        iat_required = [str(i) for i in range(10, 17)]
                                     self.bad_7_addendum[sec_code][error_key] = {
                                         "missing": sorted(
-                                            set(map(str, range(10, 17)))
+                                            set(map(str, iat_required))
                                             - set(seven_record_list)
                                         )
-                                        if sec_code == "IAT"
+                                        if sec_code == iat_code
                                         else [],
                                         "found": sorted(set(seven_record_list)),
                                     }
-                                    if sec_code == "IAT":
+                                    if sec_code == iat_code:
                                         if self._enabled("Bad IAT Addendum"):
                                             self._mark_problem("Bad IAT Addendum", fname)
                                             self.iat_bad_addendum_files += 1
@@ -735,7 +1164,12 @@ class ACHMDVValidator:
                         sec_code = ""
 
                     if key == 9:
-                        if self.last_key_seen not in [8, 9]:
+                        allowed_prev = self._allowed_previous_keys_for(9)
+                        if allowed_prev is None:
+                            bad_order = (self.last_key_seen not in [8, 9])
+                        else:
+                            bad_order = (self.last_key_seen is not None and self.last_key_seen not in allowed_prev)
+                        if bad_order:
                             if self._enabled("Record Order Issues"):
                                 self.problems[key] += 1
                                 self._mark_problem("Record Order Issues", fname)
@@ -752,9 +1186,6 @@ class ACHMDVValidator:
                             self.logger.error(
                                 f"[Bad First Line] File={fname} Line={file_line}"
                             )
-
-                    if key == 9 and row_length == 55:
-                        row_length = 94
 
                     self._process_problem_line(key, row_length, line, fname, file_line)
 
@@ -866,7 +1297,8 @@ class ACHMDVValidator:
         bank_abas = self._bank_abas()
         total_type5 = self.type5_total_records
 
-        if total_type5 > 0:
+        retail_enabled = bool(self._meta("retail_odfi_indicator", "enabled", default=True))
+        if retail_enabled and total_type5 > 0:
             top_all = sorted(
                 self.type5_pos41_50_all_counts_raw.items(),
                 key=lambda kv: kv[1],
@@ -883,9 +1315,18 @@ class ACHMDVValidator:
 
             # Retail inference rules
             # Use digits-only uniqueness when available; otherwise fall back to raw uniqueness.
-            uniq_for_inference = unique_digits if unique_digits > 0 else unique_raw
-            retail_by_low_unique = uniq_for_inference in (1, 2)
-            retail_by_config_match = self.type5_pos41_50_match_records > 0
+            prefer_digits = bool(
+                self._meta("retail_odfi_indicator", "digits_only_uniqueness_preferred", default=True)
+            )
+            uniq_for_inference = unique_digits if (prefer_digits and unique_digits > 0) else unique_raw
+            thresholds = self._meta("retail_odfi_indicator", "low_unique_thresholds", default=[1, 2])
+            if not isinstance(thresholds, list) or not thresholds:
+                thresholds = [1, 2]
+            retail_by_low_unique = uniq_for_inference in set(int(x) for x in thresholds if str(x).isdigit())
+            retail_by_config_match = (
+                bool(self._meta("retail_odfi_indicator", "match_config_abas", default=True))
+                and self.type5_pos41_50_match_records > 0
+            )
 
             close_matches = []
             if bank_abas and self.type5_pos41_50_all_counts_digits:
@@ -895,9 +1336,16 @@ class ACHMDVValidator:
                     key=lambda kv: kv[1],
                     reverse=True,
                 )[:50]
+                try:
+                    min_prefix_len = int(
+                        self._meta("retail_odfi_indicator", "close_prefix_match_min_len", default=5)
+                        or 5
+                    )
+                except Exception:
+                    min_prefix_len = 5
                 for observed, cnt in top_observed_digits:
                     for aba in bank_abas:
-                        if self._is_close_prefix_match(aba, observed, min_prefix_len=5):
+                        if self._is_close_prefix_match(aba, observed, min_prefix_len=min_prefix_len):
                             close_matches.append((aba, observed, cnt))
                 # de-dup (aba, observed)
                 seen = set()
