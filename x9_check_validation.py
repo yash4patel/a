@@ -280,10 +280,13 @@ def validate_critical_fields_for_record(line: str, record_type: str, line_number
     issues = []
 
     if record_type == "25":
+        aux_on_us = _slice(line, 3, 18)
         payor_rt = _slice(line, 19, 27)
         payor_cd = _slice(line, 27, 28)
         on_us = _slice(line, 28, 48)
         item_amount = _slice(line, 48, 58)
+        if not aux_on_us:
+            issues.append(f"Record 25 line {line_number}: missing AUX_ON_US")
         if not payor_rt or not payor_rt.isdigit() or len(payor_rt) != 8:
             issues.append(
                 f"Record 25 line {line_number}: invalid/missing payor_bank_routing_number (8 digits required)"
@@ -299,18 +302,27 @@ def validate_critical_fields_for_record(line: str, record_type: str, line_number
                 )
         if not on_us:
             issues.append(f"Record 25 line {line_number}: missing ON_US (MICR) data")
+        micr_line = f"{aux_on_us}{on_us}".strip()
+        if not micr_line:
+            issues.append(f"Record 25 line {line_number}: missing MICR line")
         if not item_amount or not item_amount.isdigit():
             issues.append(f"Record 25 line {line_number}: missing/invalid item_amount")
 
     elif record_type == "26":
         bofd_rt = _slice(line, 4, 13)
+        bofd_business_date = _slice(line, 13, 21)
+        bofd_item_seq = _slice(line, 21, 36)
         bofd_account = _slice(line, 36, 54)
         if not bofd_rt or not bofd_rt.isdigit() or len(bofd_rt) != 9:
             issues.append(f"Record 26 line {line_number}: invalid/missing bofd_routing_number (9 digits required)")
         elif not _is_valid_aba_routing(bofd_rt):
             issues.append(f"Record 26 line {line_number}: invalid ABA routing checksum for {bofd_rt}")
-        if not bofd_account:
-            issues.append(f"Record 26 line {line_number}: missing deposit_account_number_at_bofd")
+        if not bofd_business_date or not bofd_business_date.isdigit() or len(bofd_business_date) != 8:
+            issues.append(f"Record 26 line {line_number}: missing/invalid bofd_business_date (YYYYMMDD required)")
+        if not bofd_item_seq:
+            issues.append(f"Record 26 line {line_number}: missing bofd_item_sequence_number")
+        # Deposit account requirement is validated conditionally in Phase 2:
+        # mandatory for deposits, optional for withdrawals.
 
     elif record_type == "31":
         payor_rt = _slice(line, 3, 11)
@@ -800,6 +812,146 @@ def top_10(df):
     )
     top_df.drop(columns=["ITEM_AMOUNT_FLOAT"], inplace=True)
     return top_df
+
+
+def run_phase2_field_level_checks(df_forward: pd.DataFrame):
+    """
+    Phase 2 - Field-Level Validation by Record Type.
+    Returns list of log_check payload tuples: (check_name, status, details, guideline).
+    """
+    results = []
+    if df_forward.empty:
+        results.append(
+            (
+                "Phase 2: Field-Level Validation Availability",
+                "INFO",
+                "No RT25 forward records available. Phase 2 field checks skipped.",
+                "Field-level checks run on presentment check details.",
+            )
+        )
+        return results
+
+    total = len(df_forward)
+    required_cols = [
+        "25_auxiliary_on_us",
+        "25_payor_bank_routing_number",
+        "25_payor_bank_routing_number_check_digit",
+        "25_on_us",
+        "26_bofd_routing_number",
+        "26_bofd_business_date",
+        "26_bofd_item_sequence_number",
+        "26_deposit_account_number_at_bofd",
+        "TRANSACTION_TYPE",
+        "26_payee_name",
+    ]
+    for col in required_cols:
+        if col not in df_forward.columns:
+            df_forward[col] = ""
+
+    # RT25 required fields
+    rt25_aux_missing = (df_forward["25_auxiliary_on_us"].astype(str).str.strip() == "").sum()
+    rt25_payor_rt_missing = (
+        ~df_forward["25_payor_bank_routing_number"].astype(str).str.fullmatch(r"\d{8}")
+    ).sum()
+    rt25_payor_cd_missing = (
+        ~df_forward["25_payor_bank_routing_number_check_digit"].astype(str).str.fullmatch(r"\d")
+    ).sum()
+    rt25_onus_missing = (df_forward["25_on_us"].astype(str).str.strip() == "").sum()
+    rt25_micr_missing = (
+        (df_forward["25_on_us"].astype(str).str.strip() == "")
+        & (df_forward["25_auxiliary_on_us"].astype(str).str.strip() == "")
+    ).sum()
+
+    rt25_failed = any(
+        [
+            rt25_aux_missing > 0,
+            rt25_payor_rt_missing > 0,
+            rt25_payor_cd_missing > 0,
+            rt25_onus_missing > 0,
+            rt25_micr_missing > 0,
+        ]
+    )
+    rt25_status = "FAIL" if rt25_failed else "PASS"
+    rt25_details = (
+        f"Total RT25 records: {total:,}\n"
+        f"Missing AUX ON_US: {rt25_aux_missing:,}\n"
+        f"Invalid/Missing Payor Bank RT (8 digits): {rt25_payor_rt_missing:,}\n"
+        f"Invalid/Missing Payor Bank Check Digit: {rt25_payor_cd_missing:,}\n"
+        f"Missing ON_US: {rt25_onus_missing:,}\n"
+        f"Missing MICR (AUX+ON_US both empty): {rt25_micr_missing:,}"
+    )
+    results.append(
+        (
+            "Phase 2 - RT25 Mandatory Fields",
+            rt25_status,
+            rt25_details,
+            "RT25 must include AUX ON_US, payor RT/check digit, ON_US, and MICR data.",
+        )
+    )
+
+    # RT26 required fields
+    rt26_bofd_rt_missing = (
+        ~df_forward["26_bofd_routing_number"].astype(str).str.fullmatch(r"\d{9}")
+    ).sum()
+    rt26_bofd_business_date_missing = (
+        ~df_forward["26_bofd_business_date"].astype(str).str.fullmatch(r"\d{8}")
+    ).sum()
+    rt26_bofd_item_seq_missing = (df_forward["26_bofd_item_sequence_number"].astype(str).str.strip() == "").sum()
+    rt26_deposit_account_missing = (df_forward["26_deposit_account_number_at_bofd"].astype(str).str.strip() == "").sum()
+
+    # Conditional requirement: mandatory for deposits, optional for withdrawals.
+    is_deposit = df_forward["TRANSACTION_TYPE"] == "DEPOSIT"
+    is_withdrawal = df_forward["TRANSACTION_TYPE"] == "WITHDRAWAL"
+    dep_total = int(is_deposit.sum())
+    wdr_total = int(is_withdrawal.sum())
+    rt26_deposit_account_missing_for_deposits = (
+        df_forward.loc[is_deposit, "26_deposit_account_number_at_bofd"].astype(str).str.strip() == ""
+    ).sum()
+    rt26_deposit_account_missing_for_withdrawals = (
+        df_forward.loc[is_withdrawal, "26_deposit_account_number_at_bofd"].astype(str).str.strip() == ""
+    ).sum()
+
+    rt26_failed = any(
+        [
+            rt26_bofd_rt_missing > 0,
+            rt26_bofd_business_date_missing > 0,
+            rt26_bofd_item_seq_missing > 0,
+            rt26_deposit_account_missing_for_deposits > 0,
+        ]
+    )
+    rt26_status = "FAIL" if rt26_failed else "PASS"
+    rt26_details = (
+        f"Total RT26-linked records: {total:,}\n"
+        f"Invalid/Missing BOFD RT (9 digits): {rt26_bofd_rt_missing:,}\n"
+        f"Invalid/Missing BOFD Business Endorsement Date (YYYYMMDD): {rt26_bofd_business_date_missing:,}\n"
+        f"Missing BOFD Sequence Number: {rt26_bofd_item_seq_missing:,}\n"
+        f"Missing Deposit Account Number (all txns): {rt26_deposit_account_missing:,}\n"
+        f"Deposits: {dep_total:,}, missing deposit account (mandatory): {rt26_deposit_account_missing_for_deposits:,}\n"
+        f"Withdrawals: {wdr_total:,}, missing deposit account (optional): {rt26_deposit_account_missing_for_withdrawals:,}"
+    )
+    results.append(
+        (
+            "Phase 2 - RT26 Mandatory Fields",
+            rt26_status,
+            rt26_details,
+            "RT26 must include BOFD RT, business date, BOFD sequence. Deposit account is mandatory for deposits and optional for withdrawals.",
+        )
+    )
+
+    # Optional fields visibility
+    rt26_payee_populated = (df_forward["26_payee_name"].astype(str).str.strip() != "").sum()
+    results.append(
+        (
+            "Phase 2 - RT26 Optional Fields",
+            "INFO",
+            (
+                f"RT26 Payee Name populated: {rt26_payee_populated:,}/{total:,}\n"
+                "User Field: not present in current parser (future feature)."
+            ),
+            "Optional fields are informational and do not fail validation.",
+        )
+    )
+    return results
 
 
 def weekdays_between_dates(start_date, end_date):
@@ -1886,6 +2038,14 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     )
 
     log_summary("Transaction Classification & Distribution")
+
+    # ============================================================
+    # PHASE 2: FIELD-LEVEL VALIDATION BY RECORD TYPE
+    # ============================================================
+    phase2_results = run_phase2_field_level_checks(df_forward)
+    for check_name, status, details, guideline in phase2_results:
+        log_check(check_name, status, details, guideline)
+    log_summary("Phase 2 - Field-Level Validation by Record Type")
 
     # ============================================================
     # SECTION 3: AMOUNT VALIDATION
