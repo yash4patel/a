@@ -46,7 +46,11 @@
     "type7_addenda": {
       "enabled": true,
       "standard_return_addenda_type_code": "99",
-      "noc_addenda_type_code": "98"
+      "noc_addenda_type_code": "98",
+      "return_code_distribution": {
+        "restrict_to_addenda_type_codes": ["98", "99"],
+        "invalid_top_patterns_limit": 10
+      }
     }
   },
   "checks": {

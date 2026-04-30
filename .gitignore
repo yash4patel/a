@@ -10,6 +10,7 @@ log/
 *.ai_summary.json
 .smoke/
 .smoke_mdv/
+.smoke_rc/
 
 # Only ignore generated workflow JSON, not all JSON in the repo
 *.ACH.json

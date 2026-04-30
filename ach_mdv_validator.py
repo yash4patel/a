@@ -52,7 +52,12 @@ class ACHMDVValidator:
         self.type7_standard_returns_799 = 0
         self.type7_nocs_798 = 0
         self.type7_rc_flag_counts = {"R": 0, "C": 0, "OTHER": 0}  # cut -c4-4
-        self.type7_return_code_counts = {}  # cut -c5-6 with R/C prefix => R01, C29
+        self.type7_return_code_counts = {}  # valid codes only, e.g. R01, C29
+        # Invalid return-code patterns (e.g. blank/non-digit/short line at the slice)
+        self.type7_invalid_return_code_counts = {}
+        self.type7_invalid_return_code_reasons = {}
+        # How many Type-7 addenda lines were ignored for return-code distribution due to addenda-type filtering.
+        self.type7_return_code_skipped_non_target_addenda = 0
 
         # Special character / encoding integrity detection (byte-level)
         # Any non-ASCII or unexpected control bytes can break fixed-position parsing when decoded.
@@ -168,6 +173,15 @@ class ACHMDVValidator:
                     "enabled": True,
                     "standard_return_addenda_type_code": "99",
                     "noc_addenda_type_code": "98",
+                    # Return/NOC code parsing policy.
+                    # The field slices (rc_flag, digits) are in record_layout; this governs *which* Type-7 addenda
+                    # are eligible to be included in the return-code distribution, and how to report invalid cases.
+                    "return_code_distribution": {
+                        # If set, only include these addenda type codes (e.g. 98/99). This avoids noise from other Type-7 addenda.
+                        "restrict_to_addenda_type_codes": ["98", "99"],
+                        # How many invalid raw-slice patterns to show in Top-N reports.
+                        "invalid_top_patterns_limit": 10,
+                    },
                 },
             },
             "checks": {
@@ -361,6 +375,16 @@ class ACHMDVValidator:
         count_total_records = bool(totals_policy.get("count_total_records", True))
         t7_policy = self._meta("dataset_totals", "type7_addenda", default={}) or {}
         t7_enabled = bool(t7_policy.get("enabled", True))
+        # Return/NOC return-code distribution policy
+        rc_dist_policy = t7_policy.get("return_code_distribution") or {}
+        restrict_addenda = rc_dist_policy.get("restrict_to_addenda_type_codes")
+        if restrict_addenda is None:
+            # Backwards compatibility with older metadata shape.
+            only_98_99 = bool(t7_policy.get("return_code_only_for_98_99", True))
+            restrict_addenda = ["98", "99"] if only_98_99 else None
+        restrict_addenda_set = None
+        if isinstance(restrict_addenda, list) and restrict_addenda:
+            restrict_addenda_set = {str(x) for x in restrict_addenda if str(x)}
 
         batches = 0
         transactions = 0
@@ -371,6 +395,10 @@ class ACHMDVValidator:
         nocs_798 = 0
         rc_flag_counts = {"R": 0, "C": 0, "OTHER": 0}
         return_code_counts = {}
+        invalid_return_code_pattern_counts = {}
+        invalid_return_code_reason_counts = {}
+        skipped_non_target_addenda = 0
+        # Legacy aliases removed; use invalid_return_code_*_counts above.
 
         # Special character detection
         special_files = set()
@@ -435,6 +463,14 @@ class ACHMDVValidator:
 
         std_return_code = str(t7_policy.get("standard_return_addenda_type_code") or "99")
         noc_code = str(t7_policy.get("noc_addenda_type_code") or "98")
+        rc_dist_policy = t7_policy.get("return_code_distribution") or {}
+        restrict_addenda = rc_dist_policy.get("restrict_to_addenda_type_codes")
+        if restrict_addenda is None:
+            restrict_addenda = [std_return_code, noc_code]
+        if not isinstance(restrict_addenda, list):
+            restrict_addenda = [std_return_code, noc_code]
+        restrict_addenda = [str(x) for x in restrict_addenda if str(x).strip()]
+        restrict_addenda_set = set(restrict_addenda)
 
         for fname in fileNames:
             filepath = os.path.join(self.config.data_path, fname)
@@ -530,10 +566,39 @@ class ACHMDVValidator:
                                     continue
                                 rc_flag_counts[rc_flag] += 1
 
-                                digits = raw[rcd0:rcd1].decode("ascii", "ignore")
-                                digits = "".join(ch for ch in digits if ch.isdigit())
-                                code = f"{rc_flag}{digits}" if len(digits) == 2 else f"{rc_flag}??"
-                                return_code_counts[code] = return_code_counts.get(code, 0) + 1
+                                # Return/NOC code parsing.
+                                # By default we only compute return-code distribution for addenda type 98/99.
+                                if restrict_addenda_set and addenda_type not in restrict_addenda_set:
+                                    skipped_non_target_addenda += 1
+                                    continue
+
+                                raw_digits_bytes = raw[rcd0:rcd1] if len(raw) >= rcd1 else b""
+                                raw_digits_text = raw_digits_bytes.decode("ascii", "ignore")
+                                digits = "".join(ch for ch in raw_digits_text if ch.isdigit())
+
+                                if len(raw) < rcd1:
+                                    reason = "short_line"
+                                elif raw_digits_bytes.strip() == b"":
+                                    reason = "blank"
+                                elif len(digits) != 2:
+                                    reason = "non_digit_or_partial"
+                                else:
+                                    reason = ""
+
+                                if reason:
+                                    # Show the *actual* raw bytes at the slice (hex), not '??'.
+                                    # Example: R:[20 20] means two spaces, C:[58 58] means 'XX', etc.
+                                    raw_hex = " ".join(f"{b:02X}" for b in raw_digits_bytes)
+                                    invalid_pattern = f"{rc_flag}:[{raw_hex}]"
+                                    invalid_return_code_pattern_counts[invalid_pattern] = (
+                                        invalid_return_code_pattern_counts.get(invalid_pattern, 0) + 1
+                                    )
+                                    invalid_return_code_reason_counts[reason] = (
+                                        invalid_return_code_reason_counts.get(reason, 0) + 1
+                                    )
+                                else:
+                                    code = f"{rc_flag}{digits}"
+                                    return_code_counts[code] = return_code_counts.get(code, 0) + 1
             except Exception:
                 continue
         return (
@@ -546,6 +611,9 @@ class ACHMDVValidator:
             nocs_798,
             rc_flag_counts,
             return_code_counts,
+            invalid_return_code_pattern_counts,
+            invalid_return_code_reason_counts,
+            skipped_non_target_addenda,
             special_files,
             special_lines,
             byte_counts,
@@ -704,6 +772,9 @@ class ACHMDVValidator:
                     self.type7_nocs_798,
                     self.type7_rc_flag_counts,
                     self.type7_return_code_counts,
+                    self.type7_invalid_return_code_counts,
+                    self.type7_invalid_return_code_reasons,
+                    self.type7_return_code_skipped_non_target_addenda,
                     self.special_char_files,
                     self.special_char_lines,
                     self.special_char_byte_counts,
@@ -723,6 +794,9 @@ class ACHMDVValidator:
                 self.type7_nocs_798 = 0
                 self.type7_rc_flag_counts = {"R": 0, "C": 0, "OTHER": 0}
                 self.type7_return_code_counts = {}
+                self.type7_invalid_return_code_counts = {}
+                self.type7_invalid_return_code_reasons = {}
+                self.type7_return_code_skipped_non_target_addenda = 0
                 self.special_char_files = set()
                 self.special_char_lines = 0
                 self.special_char_byte_counts = {}
@@ -823,6 +897,46 @@ class ACHMDVValidator:
                     )
                     for idx, (code, cnt) in enumerate(top_rc, 1):
                         self.logger.info(f"  {idx}. {code} -> {cnt}")
+
+                # Invalid return/NOC code patterns (where RC flag exists but digits slice is missing/blank/non-digit).
+                if self.type7_invalid_return_code_counts:
+                    invalid_top_limit = 10
+                    try:
+                        rc_dist_policy = (
+                            (self._meta("dataset_totals", "type7_addenda", default={}) or {}).get(
+                                "return_code_distribution"
+                            )
+                            or {}
+                        )
+                        invalid_top_limit = int(
+                            rc_dist_policy.get("invalid_top_patterns_limit", 10) or 10
+                        )
+                    except Exception:
+                        invalid_top_limit = 10
+
+                    invalid_top = sorted(
+                        self.type7_invalid_return_code_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )[: max(1, invalid_top_limit)]
+                    self.logger.info("Invalid return/NOC code patterns (Top 10):")
+                    for idx, (pattern, cnt) in enumerate(invalid_top, 1):
+                        self.logger.info(f"  {idx}. {pattern} -> {cnt}")
+
+                    if self.type7_invalid_return_code_reasons:
+                        reasons_sorted = sorted(
+                            self.type7_invalid_return_code_reasons.items(),
+                            key=lambda kv: kv[1],
+                            reverse=True,
+                        )
+                        self.logger.info("Invalid return/NOC code reasons:")
+                        for reason, cnt in reasons_sorted:
+                            self.logger.info(f"  - {reason}: {cnt}")
+                if self.type7_return_code_skipped_non_target_addenda:
+                    self.logger.info(
+                        "Return/NOC code parsing skipped for non-target addenda types: "
+                        f"{int(self.type7_return_code_skipped_non_target_addenda)} line(s)"
+                    )
 
             bank_abas = self._bank_abas()
             if bank_abas:
@@ -1240,6 +1354,22 @@ class ACHMDVValidator:
                     )[:10]
                 ],
                 "record_type_7_return_code_distinct": int(len(self.type7_return_code_counts)),
+                "record_type_7_invalid_return_code_patterns_top10": [
+                    {"pattern": pattern, "count": int(cnt)}
+                    for pattern, cnt in sorted(
+                        self.type7_invalid_return_code_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )[:10]
+                ],
+                "record_type_7_invalid_return_code_reason_counts": {
+                    str(reason): int(cnt)
+                    for reason, cnt in sorted(
+                        self.type7_invalid_return_code_reasons.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )
+                },
             },
             "encoding_integrity": {
                 "files_with_special_bytes": int(len(self.special_char_files)),
