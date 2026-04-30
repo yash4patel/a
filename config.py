@@ -77,6 +77,60 @@ class Config:
         self.ai_max_samples = conf.getint("ai_max_samples", 20)
         self.ai_timeout_s = conf.getint("ai_timeout_s", 180)
 
+        # Optional: performance / historical processing estimate
+        # Used to estimate production backfill time for high-volume tenants.
+        #
+        # NOTE: These keys are named `perf_*` to match `config.sample.ini`.
+        self.perf_enabled = conf.getboolean("perf_enabled", False)
+
+        def _safe_int(key: str, default: int) -> int:
+            raw = conf.get(key, "").strip()
+            if raw == "":
+                return default
+            try:
+                return int(raw)
+            except Exception:
+                return default
+
+        def _safe_float(key: str, default: float) -> float:
+            raw = conf.get(key, "").strip()
+            if raw == "":
+                return default
+            try:
+                return float(raw)
+            except Exception:
+                return default
+
+        self.perf_historical_total_bytes = _safe_int("perf_historical_total_bytes", 0)
+        self.perf_historical_total_gb = _safe_float("perf_historical_total_gb", 0.0)
+        self.perf_historical_total_files = _safe_int("perf_historical_total_files", 0)
+        self.perf_parallel_workers = _safe_int("perf_parallel_workers", 1)
+        self.perf_max_files_for_size_stats = _safe_int("perf_max_files_for_size_stats", 2000)
+
+        # Backwards compatible aliases (older naming).
+        self.historical_estimate_enabled = conf.getboolean(
+            "historical_estimate_enabled", self.perf_enabled
+        )
+        self.historical_total_files = _safe_int(
+            "historical_total_files", self.perf_historical_total_files
+        )
+        self.historical_total_gb = _safe_float("historical_total_gb", 0.0)
+        self.historical_parallel_workers = _safe_int(
+            "historical_parallel_workers", self.perf_parallel_workers
+        )
+
+        # Convenience: if bytes not provided, allow GB-based entry to drive bytes.
+        # Prefer perf_* key, then fall back to older historical_total_gb.
+        if self.perf_historical_total_bytes <= 0:
+            gb = float(self.perf_historical_total_gb or 0.0)
+            if gb <= 0:
+                gb = float(self.historical_total_gb or 0.0)
+            if gb > 0:
+                try:
+                    self.perf_historical_total_bytes = int(gb * 1024 * 1024 * 1024)
+                except Exception:
+                    pass
+
         # Metadata-driven behavior (in-code defaults + optional overrides).
         # The goal is: behavior is driven by metadata, without external SQL/JSON dependencies.
         self.metadata_enabled = conf.getboolean("metadata_enabled", False)

@@ -1,6 +1,7 @@
 import os
 import sys
 from datetime import datetime
+from time import perf_counter
 
 from aba_entropy import ABAEntropyAnalyzer
 from ach_mdv_validator import ACHMDVValidator
@@ -97,6 +98,7 @@ def main():
     logger = log_manager.logger
 
     logger.info("=== STARTING ACH VALIDATION WORKFLOW ===")
+    run_t0 = perf_counter()
 
     workflow_report = {
         "tenant_name": tenant_name,
@@ -114,8 +116,76 @@ def main():
         "sections": {},
     }
 
+    perf_enabled = bool(getattr(config, "perf_enabled", False))
+    perf = {
+        "enabled": bool(perf_enabled),
+        "run": {},
+        "sections": {},
+        "dataset": {},
+        "historical_estimate": {},
+    }
+
+    def _fmt_duration_s(s: float) -> str:
+        try:
+            s = float(s)
+        except Exception:
+            return "n/a"
+        if s < 60:
+            return f"{s:.1f}s"
+        if s < 3600:
+            return f"{s/60:.1f}m"
+        return f"{s/3600:.2f}h"
+
+    def _sec(name: str):
+        t0 = perf_counter()
+
+        class _Sec:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                dt = perf_counter() - t0
+                perf["sections"].setdefault(name, {})
+                perf["sections"][name]["duration_s"] = float(dt)
+                return False
+
+        return _Sec()
+
+    if perf_enabled:
+        # Dataset size stats for throughput & backfill estimate
+        try:
+            all_files = [
+                f
+                for f in os.listdir(config.data_path)
+                if os.path.isfile(os.path.join(config.data_path, f))
+            ]
+            perf["dataset"]["files_total_in_path"] = int(len(all_files))
+            # Prefer sampling only the configured extension if present (keeps stats focused on ACH).
+            ext = str(getattr(config, "extension", "ACH") or "ACH").strip()
+            if ext and not ext.startswith("."):
+                ext = f".{ext}"
+            if ext:
+                all_files = [f for f in all_files if f.endswith(ext)]
+            perf["dataset"]["files_total_matching_extension"] = int(len(all_files))
+            max_n = int(getattr(config, "perf_max_files_for_size_stats", 2000) or 2000)
+            sample = all_files[: max(0, min(len(all_files), max_n))]
+            total_bytes = 0
+            for fname in sample:
+                try:
+                    total_bytes += int(os.path.getsize(os.path.join(config.data_path, fname)))
+                except Exception:
+                    continue
+            perf["dataset"]["size_sample_files"] = int(len(sample))
+            perf["dataset"]["size_sample_bytes_total"] = int(total_bytes)
+            perf["dataset"]["size_sample_avg_bytes_per_file"] = float(
+                (total_bytes / len(sample)) if sample else 0.0
+            )
+        except Exception:
+            pass
+
     logger.info("Validating file extensions...")
-    is_valid, error_msg, invalid_files = validate_file_extensions(config.data_path, logger)
+    with _sec("file_extension_validation"):
+        is_valid, error_msg, invalid_files = validate_file_extensions(config.data_path, logger)
     workflow_report["sections"]["file_extension_validation"] = {
         "status": "PASSED" if is_valid else "FAILED",
         "invalid_files_count": int(len(invalid_files)),
@@ -149,10 +219,22 @@ def main():
         logger.info("File extension validation: PASSED (all files have .ACH extension)")
 
     try:
-        validator = ACHMDVValidator(config, log_manager)
-        file_names = validator.validate_files()
-        section1 = validator.summarize_results(len(file_names))
-        workflow_report["sections"]["ach_mdv_validator"] = section1
+        with _sec("ach_mdv_validator"):
+            validator = ACHMDVValidator(config, log_manager)
+            file_names = validator.validate_files()
+            section1 = validator.summarize_results(len(file_names))
+            workflow_report["sections"]["ach_mdv_validator"] = section1
+            if perf_enabled:
+                try:
+                    dt = float(perf["sections"]["ach_mdv_validator"]["duration_s"])
+                    total_records = int((section1.get("totals") or {}).get("records_total") or 0)
+                    perf["sections"]["ach_mdv_validator"]["records_total"] = int(total_records)
+                    if dt > 0:
+                        perf["sections"]["ach_mdv_validator"]["records_per_s"] = float(
+                            total_records / dt
+                        )
+                except Exception:
+                    pass
     except Exception as e:
         logger.critical(f"ACH RDV Validator crashed: {e}")
         logger.debug(str(e))
@@ -163,14 +245,15 @@ def main():
         }
 
     try:
-        aba_analyzer = ABAEntropyAnalyzer(config, log_manager)
-        ach_type, section2 = aba_analyzer.analyze()
-        workflow_report["sections"]["aba_entropy"] = section2
-        if not ach_type:
-            ach_type = config.ach_type or "ODFI"
-            logger.warning(
-                f"ABA analyzer returned no type; falling back to config value: {ach_type}"
-            )
+        with _sec("aba_entropy"):
+            aba_analyzer = ABAEntropyAnalyzer(config, log_manager)
+            ach_type, section2 = aba_analyzer.analyze()
+            workflow_report["sections"]["aba_entropy"] = section2
+            if not ach_type:
+                ach_type = config.ach_type or "ODFI"
+                logger.warning(
+                    f"ABA analyzer returned no type; falling back to config value: {ach_type}"
+                )
     except Exception as e:
         logger.critical(f"ABAEntropyAnalyzer crashed: {e}")
         logger.debug(str(e))
@@ -182,9 +265,10 @@ def main():
         }
 
     try:
-        batch_date_analyzer = BatchDateCompletenessAnalyzer(config, log_manager)
-        section3 = batch_date_analyzer.analyze(ach_type, config.extension)
-        workflow_report["sections"]["batch_data_check"] = section3
+        with _sec("batch_data_check"):
+            batch_date_analyzer = BatchDateCompletenessAnalyzer(config, log_manager)
+            section3 = batch_date_analyzer.analyze(ach_type, config.extension)
+            workflow_report["sections"]["batch_data_check"] = section3
     except Exception as e:
         logger.critical(f"BatchDateCompletenessAnalyzer crashed: {e}")
         logger.debug(str(e))
@@ -193,6 +277,96 @@ def main():
             "status": "FAILED",
             "error": str(e),
         }
+
+    run_dt = perf_counter() - run_t0
+    perf["run"]["duration_s"] = float(run_dt)
+
+    # Backfill / historical estimate (optional)
+    if perf_enabled:
+        try:
+            workers = int(getattr(config, "perf_parallel_workers", 1) or 1)
+            workers = max(1, workers)
+        except Exception:
+            workers = 1
+
+        try:
+            hist_bytes = int(getattr(config, "perf_historical_total_bytes", 0) or 0)
+        except Exception:
+            hist_bytes = 0
+        try:
+            hist_files = int(getattr(config, "perf_historical_total_files", 0) or 0)
+        except Exception:
+            hist_files = 0
+
+        # Estimate throughput from observed size sample and *MDV section time* (dominant cost),
+        # falling back to overall run time if missing.
+        mdv_dt = float((perf.get("sections") or {}).get("ach_mdv_validator", {}).get("duration_s") or 0.0)
+        denom_dt = mdv_dt if mdv_dt > 0 else run_dt
+        sample_bytes = int((perf.get("dataset") or {}).get("size_sample_bytes_total") or 0)
+        bytes_per_s = float(sample_bytes / denom_dt) if (denom_dt > 0 and sample_bytes > 0) else 0.0
+        perf["run"]["throughput_bytes_per_s"] = float(bytes_per_s)
+        perf["run"]["throughput_files_per_s"] = float(
+            (int((perf.get("dataset") or {}).get("size_sample_files") or 0) / denom_dt)
+            if denom_dt > 0
+            else 0.0
+        )
+
+        # Derive historical bytes if only file count is supplied.
+        if hist_bytes <= 0:
+            # If user provided GB, prefer it.
+            try:
+                hist_gb = float(getattr(config, "perf_historical_total_gb", 0.0) or 0.0)
+            except Exception:
+                hist_gb = 0.0
+            if hist_gb > 0:
+                hist_bytes = int(hist_gb * 1024 * 1024 * 1024)
+
+        if hist_bytes <= 0 and hist_files > 0:
+            avg_bpf = float((perf.get("dataset") or {}).get("size_sample_avg_bytes_per_file") or 0.0)
+            if avg_bpf > 0:
+                hist_bytes = int(hist_files * avg_bpf)
+
+        if hist_bytes > 0 and bytes_per_s > 0:
+            est_s_single = hist_bytes / bytes_per_s
+            est_s_parallel = est_s_single / workers
+            perf["historical_estimate"] = {
+                "basis": "bytes",
+                "historical_total_bytes": int(hist_bytes),
+                "observed_bytes_per_s": float(bytes_per_s),
+                "parallel_workers": int(workers),
+                "estimated_wall_time_s": float(est_s_parallel),
+                "estimated_wall_time_human": _fmt_duration_s(est_s_parallel),
+            }
+            logger.info(
+                "Historical backfill estimate (based on observed throughput): "
+                f"{perf['historical_estimate']['estimated_wall_time_human']} "
+                f"with {workers} worker(s)"
+            )
+        elif hist_files > 0 and perf["run"].get("throughput_files_per_s"):
+            fps = float(perf["run"]["throughput_files_per_s"] or 0.0)
+            if fps > 0:
+                est_s_single = hist_files / fps
+                est_s_parallel = est_s_single / workers
+                perf["historical_estimate"] = {
+                    "basis": "files",
+                    "historical_total_files": int(hist_files),
+                    "observed_files_per_s": float(fps),
+                    "parallel_workers": int(workers),
+                    "estimated_wall_time_s": float(est_s_parallel),
+                    "estimated_wall_time_human": _fmt_duration_s(est_s_parallel),
+                }
+                logger.info(
+                    "Historical backfill estimate (based on observed throughput): "
+                    f"{perf['historical_estimate']['estimated_wall_time_human']} "
+                    f"with {workers} worker(s)"
+                )
+        else:
+            perf["historical_estimate"] = {
+                "basis": None,
+                "note": "Provide perf_historical_total_bytes or perf_historical_total_files to compute an estimate.",
+            }
+
+    workflow_report["performance"] = perf
 
     logger.info("=== WORKFLOW COMPLETED ===")
     workflow_report["run_finished_at"] = datetime.now().isoformat(timespec="seconds")
