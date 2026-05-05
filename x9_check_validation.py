@@ -211,7 +211,10 @@ def _normalize_scalar_text(value: Any) -> str:
     if pd.isna(value):
         return ""
     text = str(value).strip()
-    return "" if text.lower() in {"nan", "none", "null", "<na>"} else text
+    if text.lower() in {"nan", "none", "null", "<na>"}:
+        return ""
+    text = text.strip("\"'").strip()
+    return "" if not text else text
 
 
 def _normalize_text_series(df: pd.DataFrame, column: str) -> pd.Series:
@@ -219,6 +222,7 @@ def _normalize_text_series(df: pd.DataFrame, column: str) -> pd.Series:
     if column not in df.columns:
         return pd.Series("", index=df.index, dtype="string")
     series = df[column].astype("string").fillna("").str.strip()
+    series = series.str.strip("\"'").str.strip()
     return series.replace(r"(?i)^(nan|none|null|<na>)$", "", regex=True)
 
 
