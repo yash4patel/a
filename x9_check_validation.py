@@ -1044,6 +1044,35 @@ def run_phase2_field_level_checks(df_forward: pd.DataFrame, df_return: pd.DataFr
                 "RT32 must include BOFD RT, business date, BOFD sequence, and deposit account number.",
             )
         )
+
+        issues_31 = df_return[
+            ~(
+                df_return["31_payor_bank_routing_number"].astype(str).str.fullmatch(r"\d{8}")
+                & df_return["31_payor_bank_routing_number_check_digit"].astype(str).str.fullmatch(r"\d")
+                & (df_return["31_on_us_return_record"].astype(str).str.strip() != "")
+                & df_return["31_item_amount"].astype(str).str.fullmatch(r"\d+")
+            )
+        ].copy()
+        issues_32 = df_return[
+            ~(
+                df_return["32_bofd_routing_number"].astype(str).str.fullmatch(r"\d{9}")
+                & df_return["32_bofd_business_date"].astype(str).str.fullmatch(r"\d{8}")
+                & (df_return["32_bofd_item_sequence_number"].astype(str).str.strip() != "")
+                & (df_return["32_deposit_account_number_at_bofd"].astype(str).str.strip() != "")
+            )
+        ].copy()
+        return_field_issues = pd.concat([issues_31, issues_32], ignore_index=True).drop_duplicates()
+        if not return_field_issues.empty:
+            top_files = return_field_issues["filename"].value_counts().head(10).reset_index()
+            top_files.columns = ["filename", "issue_count"]
+            results.append(
+                (
+                    "Phase 2 - Return Field Issue Files (Top 10)",
+                    "INFO",
+                    f"\n{top_files.to_string(index=False)}",
+                    "Use return_result TSV for row-level investigation by filename.",
+                )
+            )
     else:
         results.append(
             (
@@ -2039,6 +2068,96 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                 "No valid presentment records (RT25) found after structure validation; proceeding with return validation.",
                 "Return files are optional and may appear separately from presentment files.",
             )
+            # In return-only runs, skip forward-focused sections to avoid confusing 0/NaN stats.
+            phase2_results = run_phase2_field_level_checks(df_forward, df_return)
+            for check_name, status, details, guideline in phase2_results:
+                log_check(check_name, status, details, guideline)
+            log_summary("Phase 2 - Field-Level Validation by Record Type")
+            log_check(
+                "Forward-Focused Sections Skipped",
+                "INFO",
+                "Sections 2-5 (transaction distribution, amount, field structure, and forward data integrity) skipped because no RT25 presentment records were found.",
+                "This is expected for return-only datasets.",
+            )
+
+            # Continue with return validation section only.
+            if df_return.shape[0] > 0:
+                log_check(
+                    "Return Records Summary",
+                    "INFO",
+                    f"Processing {len(df_return):,} return records",
+                    "Review return records for patterns indicating systemic issues.",
+                )
+
+                if "31_payor_bank_routing_number" in df_return.columns and "31_payor_bank_routing_number_check_digit" in df_return.columns:
+                    df_return["RETURN_PAYOR_ROUTING"] = (
+                        df_return["31_payor_bank_routing_number"].astype(str)
+                        + df_return["31_payor_bank_routing_number_check_digit"].astype(str)
+                    )
+
+                required_fields = [
+                    "RETURN_PAYOR_ROUTING",
+                    "31_on_us_return_record",
+                    "32_bofd_routing_number",
+                    "32_deposit_account_number_at_bofd",
+                ]
+                existing_required = [f for f in required_fields if f in df_return.columns]
+                na_counts = df_return[existing_required].isnull().sum()
+                for field, count in na_counts.items():
+                    log_check(
+                        f"Return Records Missing Value Check: {field}",
+                        "FAIL" if count > 0 else "PASS",
+                        f"{count:,} missing values in {field}",
+                        "There should be no missing values. Investigate if count > 0.",
+                    )
+
+                for field in existing_required:
+                    top_vals = df_return[field].value_counts().head(5)
+                    if not top_vals.empty:
+                        details_df = top_vals.reset_index()
+                        details_df.columns = ["Value", "Count"]
+                        log_check(
+                            f"Return Records Top Values: {field}",
+                            "INFO",
+                            f"\n{details_df.to_string(index=False)}",
+                            "Review if these values are expected.",
+                        )
+
+                if "31_return_reason" in df_return.columns:
+                    reason_counts = df_return["31_return_reason"].value_counts().head(10)
+                    if not reason_counts.empty:
+                        reason_df = reason_counts.reset_index()
+                        reason_df.columns = ["Return_Reason", "Count"]
+                        log_check(
+                            "Return Records Return Reason Distribution",
+                            "INFO",
+                            f"Top return reasons:\n{reason_df.to_string(index=False)}",
+                            "Review if return reasons indicate systematic issues.",
+                        )
+
+                if "35_endorsing_bank_endorsement_date" in df_return.columns:
+                    endorsement_dates = pd.to_datetime(
+                        df_return["35_endorsing_bank_endorsement_date"],
+                        format="%Y%m%d",
+                        errors="coerce",
+                    ).dropna()
+                    if not endorsement_dates.empty:
+                        log_check(
+                            "Return Records Endorsement Date Range",
+                            "INFO",
+                            (
+                                f"Endorsement dates from {endorsement_dates.min().date()} "
+                                f"to {endorsement_dates.max().date()}"
+                            ),
+                            "Ensure dates align with data collection period.",
+                        )
+
+            log_summary("Return Records Validation")
+            log_individual_check_results()
+            log_footer(check_results["FAIL"], check_results["WARN"])
+            log_section_end("SECTION 1 X937 RDV VALIDATION TEST")
+            print("\nX937 validation completed.")
+            return
         else:
             log_check(
                 "Forward Record Availability",
