@@ -206,6 +206,35 @@ def _slice(line: str, start: int, end: int = None) -> str:
     return line[start:end].strip()
 
 
+def _normalize_scalar_text(value: Any) -> str:
+    """Normalize scalar text values and collapse null-like tokens to empty."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none", "null", "<na>"} else text
+
+
+def _normalize_text_series(df: pd.DataFrame, column: str) -> pd.Series:
+    """Return normalized text series for a dataframe column."""
+    if column not in df.columns:
+        return pd.Series("", index=df.index, dtype="string")
+    series = df[column].astype("string").fillna("").str.strip()
+    return series.replace(r"(?i)^(nan|none|null|<na>)$", "", regex=True)
+
+
+def _unique_non_empty(values: pd.Series, limit: int = 5) -> List[str]:
+    """Extract first unique non-empty normalized values from a series."""
+    unique = []
+    for value in values:
+        text = _normalize_scalar_text(value)
+        if not text or text in unique:
+            continue
+        unique.append(text)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
 def _is_valid_aba_routing(routing9: str) -> bool:
     """Validate ABA routing using checksum (3-7-1 weighting)."""
     if len(routing9) != 9 or not routing9.isdigit():
@@ -760,10 +789,10 @@ def x9_to_json(filename):
 def classify_transaction(row, our_aba_list):
     """Classify transaction based on payor and BOFD routing numbers."""
     try:
-        payor = str(row.get("25_payor_bank_routing_number", "")).strip() + str(
+        payor = _normalize_scalar_text(row.get("25_payor_bank_routing_number", "")) + _normalize_scalar_text(
             row.get("25_payor_bank_routing_number_check_digit", "")
-        ).strip()
-        bofd = str(row.get("26_bofd_routing_number", "")).strip()
+        )
+        bofd = _normalize_scalar_text(row.get("26_bofd_routing_number", ""))
         payor_is_ours = payor in our_aba_list
         bofd_is_ours = bofd in our_aba_list
         if payor_is_ours and bofd_is_ours:
@@ -780,9 +809,11 @@ def classify_transaction(row, our_aba_list):
 def credit_debit_flag(row, our_aba_list):
     """Determine credit/debit flag based on routing numbers."""
     try:
-        if row.get("BOFD_ROUTING") in our_aba_list:
+        bofd = _normalize_scalar_text(row.get("BOFD_ROUTING"))
+        payor = _normalize_scalar_text(row.get("PAYOR_ROUTING"))
+        if bofd in our_aba_list:
             return "CREDIT"
-        if row.get("PAYOR_ROUTING") in our_aba_list:
+        if payor in our_aba_list:
             return "DEBIT"
         return "TRANSIT"
     except Exception:
@@ -841,18 +872,16 @@ def run_phase2_field_level_checks(df_forward: pd.DataFrame, df_return: pd.DataFr
             if col not in df_forward.columns:
                 df_forward[col] = ""
 
-        rt25_aux_missing = (df_forward["25_auxiliary_on_us"].astype(str).str.strip() == "").sum()
-        rt25_payor_rt_missing = (
-            ~df_forward["25_payor_bank_routing_number"].astype(str).str.fullmatch(r"\d{8}")
-        ).sum()
-        rt25_payor_cd_missing = (
-            ~df_forward["25_payor_bank_routing_number_check_digit"].astype(str).str.fullmatch(r"\d")
-        ).sum()
-        rt25_onus_missing = (df_forward["25_on_us"].astype(str).str.strip() == "").sum()
-        rt25_micr_missing = (
-            (df_forward["25_on_us"].astype(str).str.strip() == "")
-            & (df_forward["25_auxiliary_on_us"].astype(str).str.strip() == "")
-        ).sum()
+        rt25_aux_series = _normalize_text_series(df_forward, "25_auxiliary_on_us")
+        rt25_payor_rt_series = _normalize_text_series(df_forward, "25_payor_bank_routing_number")
+        rt25_payor_cd_series = _normalize_text_series(df_forward, "25_payor_bank_routing_number_check_digit")
+        rt25_onus_series = _normalize_text_series(df_forward, "25_on_us")
+
+        rt25_aux_missing = (rt25_aux_series == "").sum()
+        rt25_payor_rt_missing = (~rt25_payor_rt_series.str.fullmatch(r"\d{8}")).sum()
+        rt25_payor_cd_missing = (~rt25_payor_cd_series.str.fullmatch(r"\d")).sum()
+        rt25_onus_missing = (rt25_onus_series == "").sum()
+        rt25_micr_missing = ((rt25_onus_series == "") & (rt25_aux_series == "")).sum()
 
         rt25_failed = any(
             [
@@ -881,29 +910,22 @@ def run_phase2_field_level_checks(df_forward: pd.DataFrame, df_return: pd.DataFr
             )
         )
 
-        rt26_bofd_rt_missing = (
-            ~df_forward["26_bofd_routing_number"].astype(str).str.fullmatch(r"\d{9}")
-        ).sum()
-        rt26_bofd_business_date_missing = (
-            ~df_forward["26_bofd_business_date"].astype(str).str.fullmatch(r"\d{8}")
-        ).sum()
-        rt26_bofd_item_seq_missing = (
-            df_forward["26_bofd_item_sequence_number"].astype(str).str.strip() == ""
-        ).sum()
-        rt26_deposit_account_missing = (
-            df_forward["26_deposit_account_number_at_bofd"].astype(str).str.strip() == ""
-        ).sum()
+        rt26_bofd_rt_series = _normalize_text_series(df_forward, "26_bofd_routing_number")
+        rt26_bofd_date_series = _normalize_text_series(df_forward, "26_bofd_business_date")
+        rt26_bofd_item_seq_series = _normalize_text_series(df_forward, "26_bofd_item_sequence_number")
+        rt26_deposit_account_series = _normalize_text_series(df_forward, "26_deposit_account_number_at_bofd")
+
+        rt26_bofd_rt_missing = (~rt26_bofd_rt_series.str.fullmatch(r"\d{9}")).sum()
+        rt26_bofd_business_date_missing = (~rt26_bofd_date_series.str.fullmatch(r"\d{8}")).sum()
+        rt26_bofd_item_seq_missing = (rt26_bofd_item_seq_series == "").sum()
+        rt26_deposit_account_missing = (rt26_deposit_account_series == "").sum()
 
         is_deposit = df_forward["TRANSACTION_TYPE"] == "DEPOSIT"
         is_withdrawal = df_forward["TRANSACTION_TYPE"] == "WITHDRAWAL"
         dep_total = int(is_deposit.sum())
         wdr_total = int(is_withdrawal.sum())
-        rt26_deposit_account_missing_for_deposits = (
-            df_forward.loc[is_deposit, "26_deposit_account_number_at_bofd"].astype(str).str.strip() == ""
-        ).sum()
-        rt26_deposit_account_missing_for_withdrawals = (
-            df_forward.loc[is_withdrawal, "26_deposit_account_number_at_bofd"].astype(str).str.strip() == ""
-        ).sum()
+        rt26_deposit_account_missing_for_deposits = (rt26_deposit_account_series[is_deposit] == "").sum()
+        rt26_deposit_account_missing_for_withdrawals = (rt26_deposit_account_series[is_withdrawal] == "").sum()
 
         rt26_failed = any(
             [
@@ -932,7 +954,7 @@ def run_phase2_field_level_checks(df_forward: pd.DataFrame, df_return: pd.DataFr
             )
         )
 
-        rt26_payee_populated = (df_forward["26_payee_name"].astype(str).str.strip() != "").sum()
+        rt26_payee_populated = (_normalize_text_series(df_forward, "26_payee_name") != "").sum()
         results.append(
             (
                 "Phase 2 - RT26 Optional Fields",
@@ -971,16 +993,15 @@ def run_phase2_field_level_checks(df_forward: pd.DataFrame, df_return: pd.DataFr
             if col not in df_return.columns:
                 df_return[col] = ""
 
-        rt31_payor_rt_missing = (
-            ~df_return["31_payor_bank_routing_number"].astype(str).str.fullmatch(r"\d{8}")
-        ).sum()
-        rt31_payor_cd_missing = (
-            ~df_return["31_payor_bank_routing_number_check_digit"].astype(str).str.fullmatch(r"\d")
-        ).sum()
-        rt31_onus_missing = (df_return["31_on_us_return_record"].astype(str).str.strip() == "").sum()
-        rt31_amount_missing = (
-            ~df_return["31_item_amount"].astype(str).str.fullmatch(r"\d+")
-        ).sum()
+        rt31_payor_rt_series = _normalize_text_series(df_return, "31_payor_bank_routing_number")
+        rt31_payor_cd_series = _normalize_text_series(df_return, "31_payor_bank_routing_number_check_digit")
+        rt31_onus_series = _normalize_text_series(df_return, "31_on_us_return_record")
+        rt31_amount_series = _normalize_text_series(df_return, "31_item_amount")
+
+        rt31_payor_rt_missing = (~rt31_payor_rt_series.str.fullmatch(r"\d{8}")).sum()
+        rt31_payor_cd_missing = (~rt31_payor_cd_series.str.fullmatch(r"\d")).sum()
+        rt31_onus_missing = (rt31_onus_series == "").sum()
+        rt31_amount_missing = (~rt31_amount_series.str.fullmatch(r"\d+")).sum()
 
         rt31_failed = any(
             [
@@ -1007,18 +1028,15 @@ def run_phase2_field_level_checks(df_forward: pd.DataFrame, df_return: pd.DataFr
             )
         )
 
-        rt32_bofd_rt_missing = (
-            ~df_return["32_bofd_routing_number"].astype(str).str.fullmatch(r"\d{9}")
-        ).sum()
-        rt32_bofd_date_missing = (
-            ~df_return["32_bofd_business_date"].astype(str).str.fullmatch(r"\d{8}")
-        ).sum()
-        rt32_bofd_seq_missing = (
-            df_return["32_bofd_item_sequence_number"].astype(str).str.strip() == ""
-        ).sum()
-        rt32_deposit_account_missing = (
-            df_return["32_deposit_account_number_at_bofd"].astype(str).str.strip() == ""
-        ).sum()
+        rt32_bofd_rt_series = _normalize_text_series(df_return, "32_bofd_routing_number")
+        rt32_bofd_date_series = _normalize_text_series(df_return, "32_bofd_business_date")
+        rt32_bofd_seq_series = _normalize_text_series(df_return, "32_bofd_item_sequence_number")
+        rt32_deposit_account_series = _normalize_text_series(df_return, "32_deposit_account_number_at_bofd")
+
+        rt32_bofd_rt_missing = (~rt32_bofd_rt_series.str.fullmatch(r"\d{9}")).sum()
+        rt32_bofd_date_missing = (~rt32_bofd_date_series.str.fullmatch(r"\d{8}")).sum()
+        rt32_bofd_seq_missing = (rt32_bofd_seq_series == "").sum()
+        rt32_deposit_account_missing = (rt32_deposit_account_series == "").sum()
 
         rt32_failed = any(
             [
@@ -1047,18 +1065,18 @@ def run_phase2_field_level_checks(df_forward: pd.DataFrame, df_return: pd.DataFr
 
         issues_31 = df_return[
             ~(
-                df_return["31_payor_bank_routing_number"].astype(str).str.fullmatch(r"\d{8}")
-                & df_return["31_payor_bank_routing_number_check_digit"].astype(str).str.fullmatch(r"\d")
-                & (df_return["31_on_us_return_record"].astype(str).str.strip() != "")
-                & df_return["31_item_amount"].astype(str).str.fullmatch(r"\d+")
+                rt31_payor_rt_series.str.fullmatch(r"\d{8}")
+                & rt31_payor_cd_series.str.fullmatch(r"\d")
+                & (rt31_onus_series != "")
+                & rt31_amount_series.str.fullmatch(r"\d+")
             )
         ].copy()
         issues_32 = df_return[
             ~(
-                df_return["32_bofd_routing_number"].astype(str).str.fullmatch(r"\d{9}")
-                & df_return["32_bofd_business_date"].astype(str).str.fullmatch(r"\d{8}")
-                & (df_return["32_bofd_item_sequence_number"].astype(str).str.strip() != "")
-                & (df_return["32_deposit_account_number_at_bofd"].astype(str).str.strip() != "")
+                rt32_bofd_rt_series.str.fullmatch(r"\d{9}")
+                & rt32_bofd_date_series.str.fullmatch(r"\d{8}")
+                & (rt32_bofd_seq_series != "")
+                & (rt32_deposit_account_series != "")
             )
         ].copy()
         return_field_issues = pd.concat([issues_31, issues_32], ignore_index=True).drop_duplicates()
@@ -2089,11 +2107,13 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "Review return records for patterns indicating systemic issues.",
                 )
 
-                if "31_payor_bank_routing_number" in df_return.columns and "31_payor_bank_routing_number_check_digit" in df_return.columns:
-                    df_return["RETURN_PAYOR_ROUTING"] = (
-                        df_return["31_payor_bank_routing_number"].astype(str)
-                        + df_return["31_payor_bank_routing_number_check_digit"].astype(str)
-                    )
+                if (
+                    "31_payor_bank_routing_number" in df_return.columns
+                    and "31_payor_bank_routing_number_check_digit" in df_return.columns
+                ):
+                    df_return["RETURN_PAYOR_ROUTING"] = _normalize_text_series(
+                        df_return, "31_payor_bank_routing_number"
+                    ) + _normalize_text_series(df_return, "31_payor_bank_routing_number_check_digit")
 
                 required_fields = [
                     "RETURN_PAYOR_ROUTING",
@@ -2102,17 +2122,24 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     "32_deposit_account_number_at_bofd",
                 ]
                 existing_required = [f for f in required_fields if f in df_return.columns]
-                na_counts = df_return[existing_required].isnull().sum()
-                for field, count in na_counts.items():
+                missing_counts = {}
+                normalized_return_fields = {}
+                for field in existing_required:
+                    normalized = _normalize_text_series(df_return, field)
+                    normalized_return_fields[field] = normalized
+                    missing_counts[field] = int((normalized == "").sum())
+                for field, count in missing_counts.items():
                     log_check(
                         f"Return Records Missing Value Check: {field}",
                         "FAIL" if count > 0 else "PASS",
-                        f"{count:,} missing values in {field}",
+                        f"{count:,} missing/blank values in {field}",
                         "There should be no missing values. Investigate if count > 0.",
                     )
 
                 for field in existing_required:
-                    top_vals = df_return[field].value_counts().head(5)
+                    top_vals = normalized_return_fields[field][
+                        normalized_return_fields[field] != ""
+                    ].value_counts().head(5)
                     if not top_vals.empty:
                         details_df = top_vals.reset_index()
                         details_df.columns = ["Value", "Count"]
@@ -2175,28 +2202,30 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     # ============================================================
     # SECTION 2: TRANSACTION CLASSIFICATION & DISTRIBUTION
     # ============================================================
-    df_forward["TRANSACTION_TYPE"] = df_forward.apply(lambda row: classify_transaction(row, our_aba_list), axis=1)
+    payor_rt_series = _normalize_text_series(df_forward, "25_payor_bank_routing_number")
+    payor_cd_series = _normalize_text_series(df_forward, "25_payor_bank_routing_number_check_digit")
+    bofd_rt_series = _normalize_text_series(df_forward, "26_bofd_routing_number")
+    on_us_series = _normalize_text_series(df_forward, "25_on_us").str.strip("/")
+    aux_on_us_series = _normalize_text_series(df_forward, "25_auxiliary_on_us")
+    on_us_last_series = on_us_series.apply(lambda value: value.split("/")[-1] if value else "")
+
+    df_forward["PAYOR_ROUTING"] = payor_rt_series + payor_cd_series
+    df_forward["BOFD_ROUTING"] = bofd_rt_series
     df_forward["VALID_ROUTING"] = (
-        df_forward["25_payor_bank_routing_number"].astype(str).str.len().eq(8)
-        & df_forward["25_payor_bank_routing_number_check_digit"].astype(str).str.len().eq(1)
-        & df_forward["26_bofd_routing_number"].astype(str).str.len().eq(9)
+        payor_rt_series.str.fullmatch(r"\d{8}")
+        & payor_cd_series.str.fullmatch(r"\d")
+        & bofd_rt_series.str.fullmatch(r"\d{9}")
     )
-    df_forward["PAYOR_ROUTING"] = (
-        df_forward["25_payor_bank_routing_number"].astype(str)
-        + df_forward["25_payor_bank_routing_number_check_digit"].astype(str)
-    )
-    df_forward["BOFD_ROUTING"] = df_forward["26_bofd_routing_number"].astype(str)
+    df_forward["25_on_us"] = on_us_series
+    df_forward["25_auxiliary_on_us"] = aux_on_us_series
+    df_forward["payer_account"] = on_us_series.str.split("/").str[0].fillna("")
+    df_forward["check_number"] = aux_on_us_series.where(aux_on_us_series != "", on_us_last_series)
+    df_forward["TRANSACTION_TYPE"] = df_forward.apply(lambda row: classify_transaction(row, our_aba_list), axis=1)
     df_forward["CR_DR_FLAG"] = df_forward.apply(lambda row: credit_debit_flag(row, our_aba_list), axis=1)
     df_forward["ITEM_AMOUNT_FLOAT"] = pd.to_numeric(df_forward["25_item_amount"], errors="coerce") / 100
-    df_forward["onus_elements"] = (
-        df_forward["25_on_us"].astype(str).str.strip().str.strip("/").str.split("/").apply(len)
+    df_forward["onus_elements"] = on_us_series.apply(
+        lambda value: len([part for part in value.split("/") if part]) if value else 0
     )
-    df_forward["25_on_us"] = df_forward["25_on_us"].astype(str).str.strip().str.strip("/")
-    df_forward["25_auxiliary_on_us"] = df_forward["25_auxiliary_on_us"].astype(str).str.strip()
-    df_forward["payer_account"] = df_forward["25_on_us"].str.split("/").str[0]
-    aux_on_us = df_forward["25_auxiliary_on_us"].replace("", None)
-    on_us_last = df_forward["25_on_us"].str.split("/").str[-1]
-    df_forward["check_number"] = aux_on_us.fillna(on_us_last)
 
     withdrawals = df_forward[df_forward["TRANSACTION_TYPE"] == "WITHDRAWAL"]
     deposits = df_forward[df_forward["TRANSACTION_TYPE"] == "DEPOSIT"]
@@ -2215,6 +2244,35 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             f"TOTAL: {total:,}"
         ),
         "Review transaction distribution for expected patterns.",
+    )
+
+    transit_invalid_routing = transit[
+        ~(
+            transit["PAYOR_ROUTING"].str.fullmatch(r"\d{9}")
+            & transit["BOFD_ROUTING"].str.fullmatch(r"\d{9}")
+        )
+    ]
+    missing_payor_routing = (df_forward["PAYOR_ROUTING"] == "").sum()
+    missing_bofd_routing = (df_forward["BOFD_ROUTING"] == "").sum()
+    transit_sample_pairs = (
+        transit[["PAYOR_ROUTING", "BOFD_ROUTING"]]
+        .drop_duplicates()
+        .head(10)
+        .to_string(index=False)
+        if not transit.empty
+        else "None"
+    )
+    log_check(
+        "TRANSIT Definition & Classification Diagnostics",
+        "INFO",
+        (
+            "TRANSIT definition: Payor routing (RT25) is not our ABA and BOFD routing (RT26) is not our ABA.\n"
+            f"Missing PAYOR_ROUTING after normalization: {missing_payor_routing:,}\n"
+            f"Missing BOFD_ROUTING after normalization: {missing_bofd_routing:,}\n"
+            f"TRANSIT records with invalid routing format: {len(transit_invalid_routing):,}\n"
+            f"Sample TRANSIT payor/bofd routing pairs (Top 10):\n{transit_sample_pairs}"
+        ),
+        "Use this diagnostic to confirm whether TRANSIT volume is true transit or a routing-data quality issue.",
     )
 
     credit_count = (df_forward["CR_DR_FLAG"] == "CREDIT").sum()
@@ -2366,14 +2424,43 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         f"ON_US field should contain fewer than {onus_max} slash-separated elements.",
     )
 
-    aux_populated = df_forward[df_forward["25_auxiliary_on_us"].astype(str).str.strip() != ""]
-    aux_percentage = round(len(aux_populated) / len(df_forward) * 100, 2) if len(df_forward) else 0
+    aux_populated_count = (df_forward["25_auxiliary_on_us"] != "").sum()
+    aux_percentage = round(aux_populated_count / len(df_forward) * 100, 2) if len(df_forward) else 0
     log_check(
         "Auxiliary ON_US Population",
         "INFO",
-        f"{len(aux_populated):,} records ({aux_percentage}%) have Auxiliary ON_US populated",
+        f"{aux_populated_count:,} records ({aux_percentage}%) have Auxiliary ON_US populated",
         "Review if auxiliary ON_US usage aligns with expected check numbering conventions.",
     )
+
+    probable_non_check_mask = (
+        (df_forward["25_auxiliary_on_us"] == "")
+        & ((df_forward["payer_account"] == "") | (df_forward["25_on_us"] == ""))
+    )
+    probable_non_check_df = df_forward[probable_non_check_mask].copy()
+    probable_non_check_pct = (
+        round(len(probable_non_check_df) / len(df_forward) * 100, 2) if len(df_forward) else 0
+    )
+    if not probable_non_check_df.empty:
+        non_check_top = probable_non_check_df["filename"].value_counts().head(10).reset_index()
+        non_check_top.columns = ["filename", "probable_non_check_count"]
+        log_check(
+            "Probable Non-Check / Deposit-Slip Indicators",
+            "WARN",
+            (
+                f"Records flagged by heuristic: {len(probable_non_check_df):,} ({probable_non_check_pct}%)\n"
+                "Heuristic: AUX ON_US missing and ON_US/payer_account missing.\n"
+                f"Top files:\n{non_check_top.to_string(index=False)}"
+            ),
+            "These may be deposit slips or other non-check items; review duplicate analysis after excluding them.",
+        )
+    else:
+        log_check(
+            "Probable Non-Check / Deposit-Slip Indicators",
+            "INFO",
+            "No records matched the non-check heuristic (AUX ON_US missing + ON_US/payer_account missing).",
+            "Informational heuristic only; adjust logic if customer format differs.",
+        )
 
     log_summary("Field Structure Validation")
 
@@ -2381,31 +2468,50 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     # SECTION 5: DATA INTEGRITY CHECKS
     # ============================================================
     if enable_duplicate_check:
-        df_forward["25_on_us"] = df_forward["25_on_us"].astype(str).str.strip().str.strip("/")
-        df_forward["25_auxiliary_on_us"] = df_forward["25_auxiliary_on_us"].astype(str).str.strip()
-        df_forward["payer_account"] = df_forward["25_on_us"].str.split("/").str[0]
-        aux_on_us = df_forward["25_auxiliary_on_us"].replace("", None)
-        on_us_last = df_forward["25_on_us"].str.split("/").str[-1]
-        df_forward["check_number"] = aux_on_us.fillna(on_us_last)
-
-        null_cnt = df_forward["payer_account"].isna().sum()
+        blank_key_cnt = ((df_forward["payer_account"] == "") | (df_forward["check_number"] == "")).sum()
         duplicate_key = ["payer_account", "check_number"]
-        is_duplicated = df_forward.duplicated(subset=duplicate_key, keep=False)
-        df_duplicates = df_forward[is_duplicated].copy()
+        duplicate_pool = df_forward[
+            (df_forward["payer_account"] != "") & (df_forward["check_number"] != "")
+        ].copy()
+        is_duplicated = duplicate_pool.duplicated(subset=duplicate_key, keep=False)
+        df_duplicates = duplicate_pool[is_duplicated].copy()
 
         if not df_duplicates.empty:
-            df_checknum_counts = df_duplicates.groupby(duplicate_key).size().reset_index(name="count")
-            df_checknum_counts = df_checknum_counts.sort_values(by="count", ascending=False)
+            df_checknum_counts = (
+                df_duplicates.groupby(duplicate_key)
+                .agg(
+                    count=("check_number", "size"),
+                    sample_sequence_numbers=(
+                        "25_ece_institution_item_sequence_number",
+                        lambda values: " | ".join(_unique_non_empty(values, limit=5)),
+                    ),
+                    sample_item_amounts=(
+                        "25_item_amount",
+                        lambda values: " | ".join(_unique_non_empty(values, limit=5)),
+                    ),
+                    sample_bundle_dates=(
+                        "20_bundle_business_date",
+                        lambda values: " | ".join(_unique_non_empty(values, limit=3)),
+                    ),
+                    sample_files=(
+                        "filename",
+                        lambda values: " | ".join(_unique_non_empty(values, limit=3)),
+                    ),
+                )
+                .reset_index()
+                .sort_values(by="count", ascending=False)
+            )
             threshold = 10
             high_volume_duplicates = df_checknum_counts[df_checknum_counts["count"] > threshold]
             log_check(
                 "Duplicate Check Number Check (payer_account + check_number)",
                 "WARN",
                 (
-                    f"Null payer accounts: {null_cnt}\n"
+                    f"Records excluded due to blank duplicate key fields: {blank_key_cnt:,}\n"
+                    f"Records included in duplicate pool: {len(duplicate_pool):,}\n"
                     f"Total duplicate records: {len(df_duplicates):,}\n"
                     f"Unique duplicate check combinations: {len(df_checknum_counts):,}\n\n"
-                    f"Top 20 duplicate checks:\n"
+                    "Top 20 duplicate checks (with sample sequence numbers/amounts/files):\n"
                     f"{df_checknum_counts.head(20).to_string(index=False)}\n\n"
                     f"High volume duplicates (count > {threshold}): {len(high_volume_duplicates)}\n"
                     f"{high_volume_duplicates.to_string(index=False) if not high_volume_duplicates.empty else 'None'}"
@@ -2413,12 +2519,20 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                 "Duplicate checks identified. High volume duplicates may indicate systematic issues.",
             )
 
+            df_duplicates["sequence_number"] = _normalize_text_series(
+                df_duplicates, "25_ece_institution_item_sequence_number"
+            )
+            df_duplicates["item_amount_dollars"] = (
+                pd.to_numeric(df_duplicates["25_item_amount"], errors="coerce") / 100
+            ).round(2)
             tracking_fields = [
                 "payer_account",
                 "check_number",
                 "filename",
+                "sequence_number",
                 "25_ece_institution_item_sequence_number",
                 "25_item_amount",
+                "item_amount_dollars",
                 "20_bundle_business_date",
             ]
             df_duplicates[tracking_fields].to_csv(
@@ -2437,7 +2551,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     settlement_col = "20_bundle_business_date"
     if settlement_col in df_forward.columns:
         df_settle = df_forward.copy()
-        df_settle[settlement_col] = df_settle[settlement_col].astype(str).str.strip()
+        df_settle[settlement_col] = _normalize_text_series(df_settle, settlement_col)
         invalid_mask = ~df_settle[settlement_col].str.match(r"^\d{8}$")
         missing_count = invalid_mask.sum()
         valid_dates = df_settle.loc[~invalid_mask, settlement_col]
@@ -2500,11 +2614,13 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             "Review return records for patterns indicating systemic issues.",
         )
 
-        if "31_payor_bank_routing_number" in df_return.columns and "31_payor_bank_routing_number_check_digit" in df_return.columns:
-            df_return["RETURN_PAYOR_ROUTING"] = (
-                df_return["31_payor_bank_routing_number"].astype(str)
-                + df_return["31_payor_bank_routing_number_check_digit"].astype(str)
-            )
+        if (
+            "31_payor_bank_routing_number" in df_return.columns
+            and "31_payor_bank_routing_number_check_digit" in df_return.columns
+        ):
+            df_return["RETURN_PAYOR_ROUTING"] = _normalize_text_series(
+                df_return, "31_payor_bank_routing_number"
+            ) + _normalize_text_series(df_return, "31_payor_bank_routing_number_check_digit")
 
         required_fields = [
             "RETURN_PAYOR_ROUTING",
@@ -2513,17 +2629,24 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             "32_deposit_account_number_at_bofd",
         ]
         existing_required = [f for f in required_fields if f in df_return.columns]
-        na_counts = df_return[existing_required].isnull().sum()
-        for field, count in na_counts.items():
+        missing_counts = {}
+        normalized_return_fields = {}
+        for field in existing_required:
+            normalized = _normalize_text_series(df_return, field)
+            normalized_return_fields[field] = normalized
+            missing_counts[field] = int((normalized == "").sum())
+        for field, count in missing_counts.items():
             log_check(
                 f"Return Records Missing Value Check: {field}",
                 "FAIL" if count > 0 else "PASS",
-                f"{count:,} missing values in {field}",
+                f"{count:,} missing/blank values in {field}",
                 "There should be no missing values. Investigate if count > 0.",
             )
 
         for field in existing_required:
-            top_vals = df_return[field].value_counts().head(5)
+            top_vals = normalized_return_fields[field][
+                normalized_return_fields[field] != ""
+            ].value_counts().head(5)
             if not top_vals.empty:
                 details_df = top_vals.reset_index()
                 details_df.columns = ["Value", "Count"]
