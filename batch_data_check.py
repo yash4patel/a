@@ -57,30 +57,42 @@ class BatchDateCompletenessAnalyzer:
                 "allow_other_detected_formats_as_fallback": True,
             },
             "date_formats": [
+                # Prefer explicit date+time tokens (prevents accidentally matching YYMMDD inside epoch-like numbers).
+                {
+                    "name": "YYMMDDHHMMSS",
+                    "regex": r"(?<!\d)(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])([01]\d|2[0-3])([0-5]\d)([0-5]\d)(?!\d)",
+                    "group_order": ["year", "month", "day"],
+                    "two_digit_year": {"base": 2000, "min": 0, "max": 50},
+                },
+                {
+                    "name": "YYYYMMDDHHMMSS",
+                    "regex": r"(?<!\d)((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])([01]\d|2[0-3])([0-5]\d)([0-5]\d)(?!\d)",
+                    "group_order": ["year", "month", "day"],
+                },
                 {
                     "name": "YYYYMMDD",
-                    "regex": r"((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])",
+                    "regex": r"(?<!\d)((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)",
                     "group_order": ["year", "month", "day"],
                 },
                 {
                     "name": "YYMMDD",
-                    "regex": r"(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])",
+                    "regex": r"(?<!\d)(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)",
                     "group_order": ["year", "month", "day"],
                     "two_digit_year": {"base": 2000, "min": 0, "max": 50},
                 },
                 {
                     "name": "YYYY-MM-DD",
-                    "regex": r"((?:19|20)\d{2})[-_/](0[1-9]|1[0-2])[-_/](0[1-9]|[12]\d|3[01])",
+                    "regex": r"(?<!\d)((?:19|20)\d{2})[-_/](0[1-9]|1[0-2])[-_/](0[1-9]|[12]\d|3[01])(?!\d)",
                     "group_order": ["year", "month", "day"],
                 },
                 {
                     "name": "DDMMYYYY",
-                    "regex": r"(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])((?:19|20)\d{2})",
+                    "regex": r"(?<!\d)(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])((?:19|20)\d{2})(?!\d)",
                     "group_order": ["day", "month", "year"],
                 },
                 {
                     "name": "MMDDYYYY",
-                    "regex": r"(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])((?:19|20)\d{2})",
+                    "regex": r"(?<!\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])((?:19|20)\d{2})(?!\d)",
                     "group_order": ["month", "day", "year"],
                 },
             ],
