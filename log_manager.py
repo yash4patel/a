@@ -11,15 +11,17 @@ check_results = {
     "TOTAL": 0,
 }
 check_history = []
+_summary_cursor = 0
 _LOGGER_NAME = "X937_XML_Validator"
 
 
 def setup_logging(log_filename: str):
     """Configure file logging with ACH-like format and reset counters."""
-    global check_history
+    global check_history, _summary_cursor
     for key in check_results:
         check_results[key] = 0
     check_history = []
+    _summary_cursor = 0
 
     logger = logging.getLogger(_LOGGER_NAME)
     if logger.handlers:
@@ -97,13 +99,39 @@ def log_check(check_name: str, status: str, details: str, guideline: str):
 
 
 def log_summary(section_name: str):
+    global _summary_cursor
     logger = _logger()
+    section_history = check_history[_summary_cursor:]
+    _summary_cursor = len(check_history)
+
+    section_counts = {"PASS": 0, "WARN": 0, "INFO": 0, "FAIL": 0}
+    section_names = {"PASS": [], "WARN": [], "INFO": [], "FAIL": []}
+    for entry in section_history:
+        status = entry["status"]
+        if status not in section_counts:
+            continue
+        section_counts[status] += 1
+        section_names[status].append(entry["name"])
+
+    def _render_checks(status: str, max_items: int = 6) -> str:
+        names = section_names[status]
+        if not names:
+            return "None"
+        if len(names) <= max_items:
+            return "; ".join(names)
+        remaining = len(names) - max_items
+        return f"{'; '.join(names[:max_items])}; ... (+{remaining} more)"
+
     logger.info(f"========== {section_name} Summary ==========")
-    logger.info(f"Total checks conducted : {check_results['TOTAL']}")
-    logger.info(f"Passed : {check_results['PASS']}")
-    logger.info(f"Warnings : {check_results['WARN']}")
-    logger.info(f"Infos : {check_results['INFO']}")
-    logger.info(f"Failed : {check_results['FAIL']}")
+    logger.info(f"Total checks conducted : {len(section_history)}")
+    logger.info(f"Passed : {section_counts['PASS']}")
+    logger.info(f"  - PASS checks: {_render_checks('PASS')}")
+    logger.info(f"Warnings : {section_counts['WARN']}")
+    logger.info(f"  - WARN checks: {_render_checks('WARN')}")
+    logger.info(f"Infos : {section_counts['INFO']}")
+    logger.info(f"  - INFO checks: {_render_checks('INFO')}")
+    logger.info(f"Failed : {section_counts['FAIL']}")
+    logger.info(f"  - FAIL checks: {_render_checks('FAIL')}")
     logger.info("===========================================")
     logger.info("")
 
