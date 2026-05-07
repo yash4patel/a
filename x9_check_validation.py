@@ -791,7 +791,7 @@ def x9_to_json(filename):
 
 
 def classify_transaction(row, our_aba_list):
-    """Classify transaction based on payor and BOFD routing numbers."""
+    """Classify into three direction buckets using payor/BOFD ABA membership."""
     try:
         payor = _normalize_scalar_text(row.get("25_payor_bank_routing_number", "")) + _normalize_scalar_text(
             row.get("25_payor_bank_routing_number_check_digit", "")
@@ -801,11 +801,11 @@ def classify_transaction(row, our_aba_list):
         bofd_is_ours = bofd in our_aba_list
         if payor_is_ours and bofd_is_ours:
             return "ON_US"
-        if payor_is_ours and not bofd_is_ours:
-            return "WITHDRAWAL"
-        if not payor_is_ours and bofd_is_ours:
+        if bofd_is_ours:
             return "DEPOSIT"
-        return "TRANSIT"
+        # Customer-requested direction model has only three buckets:
+        # DEPOSIT / ON_US / WITHDRAWAL. Both-external items are grouped as WITHDRAWAL.
+        return "WITHDRAWAL"
     except Exception:
         return "UNKNOWN"
 
@@ -819,7 +819,7 @@ def credit_debit_flag(row, our_aba_list):
             return "CREDIT"
         if payor in our_aba_list:
             return "DEBIT"
-        return "TRANSIT"
+        return "EXTERNAL"
     except Exception:
         return "UNKNOWN"
 
@@ -2234,7 +2234,6 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     withdrawals = df_forward[df_forward["TRANSACTION_TYPE"] == "WITHDRAWAL"]
     deposits = df_forward[df_forward["TRANSACTION_TYPE"] == "DEPOSIT"]
     on_us = df_forward[df_forward["TRANSACTION_TYPE"] == "ON_US"]
-    transit = df_forward[df_forward["TRANSACTION_TYPE"] == "TRANSIT"]
     total = len(df_forward)
 
     log_check(
@@ -2244,44 +2243,69 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             f"Withdrawals: {len(withdrawals):,} ({round(len(withdrawals)/total*100,2) if total else 0}%)\n"
             f"Deposits: {len(deposits):,} ({round(len(deposits)/total*100,2) if total else 0}%)\n"
             f"ON_US: {len(on_us):,} ({round(len(on_us)/total*100,2) if total else 0}%)\n"
-            f"TRANSIT: {len(transit):,} ({round(len(transit)/total*100,2) if total else 0}%)\n"
             f"TOTAL: {total:,}"
         ),
-        "Review transaction distribution for expected patterns.",
+        "Direction model uses three buckets: DEPOSIT, ON_US, WITHDRAWAL.",
     )
 
-    transit_invalid_routing = transit[
-        ~(
-            transit["PAYOR_ROUTING"].str.fullmatch(r"\d{9}")
-            & transit["BOFD_ROUTING"].str.fullmatch(r"\d{9}")
-        )
-    ]
+    payor_is_ours_series = df_forward["PAYOR_ROUTING"].isin(our_aba_list)
+    bofd_is_ours_series = df_forward["BOFD_ROUTING"].isin(our_aba_list)
+    both_external = df_forward[~payor_is_ours_series & ~bofd_is_ours_series]
+    payor_ours_bofd_external = df_forward[payor_is_ours_series & ~bofd_is_ours_series]
+    payor_external_bofd_ours = df_forward[~payor_is_ours_series & bofd_is_ours_series]
+    on_us_combo = df_forward[payor_is_ours_series & bofd_is_ours_series]
     missing_payor_routing = (df_forward["PAYOR_ROUTING"] == "").sum()
     missing_bofd_routing = (df_forward["BOFD_ROUTING"] == "").sum()
-    transit_sample_pairs = (
-        transit[["PAYOR_ROUTING", "BOFD_ROUTING"]]
+    both_external_sample_pairs = (
+        both_external[["PAYOR_ROUTING", "BOFD_ROUTING"]]
         .drop_duplicates()
         .head(10)
         .to_string(index=False)
-        if not transit.empty
+        if not both_external.empty
         else "None"
     )
     log_check(
-        "TRANSIT Definition & Classification Diagnostics",
+        "Direction Classification Diagnostics (ABA-based)",
         "INFO",
         (
-            "TRANSIT definition: Payor routing (RT25) is not our ABA and BOFD routing (RT26) is not our ABA.\n"
+            "Direction definitions:\n"
+            " - ON_US: PAYOR_ROUTING in our ABA list and BOFD_ROUTING in our ABA list\n"
+            " - DEPOSIT: PAYOR_ROUTING not in our ABA list and BOFD_ROUTING in our ABA list\n"
+            " - WITHDRAWAL: all remaining records (including both-external payor/bofd)\n"
+            f"ABA combination counts:\n"
+            f" - payor=ours, bofd=ours (ON_US): {len(on_us_combo):,}\n"
+            f" - payor=external, bofd=ours (DEPOSIT): {len(payor_external_bofd_ours):,}\n"
+            f" - payor=ours, bofd=external (WITHDRAWAL): {len(payor_ours_bofd_external):,}\n"
+            f" - payor=external, bofd=external (mapped to WITHDRAWAL): {len(both_external):,}\n"
             f"Missing PAYOR_ROUTING after normalization: {missing_payor_routing:,}\n"
             f"Missing BOFD_ROUTING after normalization: {missing_bofd_routing:,}\n"
-            f"TRANSIT records with invalid routing format: {len(transit_invalid_routing):,}\n"
-            f"Sample TRANSIT payor/bofd routing pairs (Top 10):\n{transit_sample_pairs}"
+            f"Sample both-external payor/bofd routing pairs (Top 10):\n{both_external_sample_pairs}"
         ),
-        "Use this diagnostic to confirm whether TRANSIT volume is true transit or a routing-data quality issue.",
+        "Use this to validate direction logic and confirm ABA mapping is correct.",
+    )
+
+    direction_counts = {
+        "WITHDRAWAL": len(withdrawals),
+        "DEPOSIT": len(deposits),
+        "ON_US": len(on_us),
+    }
+    active_directions = [name for name, count in direction_counts.items() if count > 0]
+    direction_mix_status = "WARN" if total >= 1000 and len(active_directions) <= 1 else "INFO"
+    log_check(
+        "Direction Mix Sanity Check",
+        direction_mix_status,
+        (
+            f"Active directions: {', '.join(active_directions) if active_directions else 'None'}\n"
+            f"Counts: WITHDRAWAL={direction_counts['WITHDRAWAL']:,}, "
+            f"DEPOSIT={direction_counts['DEPOSIT']:,}, ON_US={direction_counts['ON_US']:,}\n"
+            f"Total forward records: {total:,}"
+        ),
+        "If a long date range shows only one direction, verify ABA list/config and source feed composition.",
     )
 
     credit_count = (df_forward["CR_DR_FLAG"] == "CREDIT").sum()
     debit_count = (df_forward["CR_DR_FLAG"] == "DEBIT").sum()
-    transit_count = (df_forward["CR_DR_FLAG"] == "TRANSIT").sum()
+    external_count = (df_forward["CR_DR_FLAG"] == "EXTERNAL").sum()
     unknown_count = (df_forward["CR_DR_FLAG"] == "UNKNOWN").sum()
     log_check(
         "Credit/Debit Distribution",
@@ -2289,7 +2313,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         (
             f"CREDIT records: {credit_count:,}\n"
             f"DEBIT records: {debit_count:,}\n"
-            f"TRANSIT records: {transit_count:,}\n"
+            f"EXTERNAL records (neither routing matches our ABA): {external_count:,}\n"
             f"UNKNOWN records: {unknown_count:,}\n"
             f"TOTAL: {total:,}"
         ),
