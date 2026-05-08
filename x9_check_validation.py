@@ -408,8 +408,8 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
        - Return (03 / 31+32): require 31/32/50/52.
        Return mode is optional (absence does not fail).
     4) Critical fields must be populated (routing/account/MICR/image fields).
-    5) Per check item (25 and 31), require at least one 50/52 pair and front image.
-       Non-TIFF hints fail the item; unknown format is allowed but logged as unknown.
+    5) Per check item (25 and 31), require at least one record 50 (image view detail).
+       Missing 52 is tracked as image-block completeness advisory.
     """
     issues = []
     header_ok = False
@@ -441,6 +441,10 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
     current_bundle_sequence_number = ""
     open_25_context = None
     missing_26_details = []
+    presentment_missing_front_examples = []
+    return_missing_front_examples = []
+    presentment_missing_pair_examples = []
+    return_missing_pair_examples = []
 
     def add_issue(message: str):
         nonlocal dropped_issue_count
@@ -478,17 +482,40 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         nonlocal current_item
         nonlocal presentment_item_count
         nonlocal return_item_count
+        nonlocal presentment_items_without_front_image
+        nonlocal return_items_without_front_image
+        nonlocal presentment_items_without_image_pair
+        nonlocal return_items_without_image_pair
 
         if current_item is None:
             return
 
         item_type = current_item["item_type"]
+        image_50_count = int(current_item.get("image_50_count", 0))
+        image_52_count = int(current_item.get("image_52_count", 0))
+        unique_id = current_item.get("check_ref", {}).get("unique_check_id", "")
 
         is_presentment_item = item_type == "25"
         if is_presentment_item:
             presentment_item_count += 1
+            if image_50_count == 0:
+                presentment_items_without_front_image += 1
+                if len(presentment_missing_front_examples) < 10:
+                    presentment_missing_front_examples.append(unique_id)
+            if image_50_count > 0 and image_52_count == 0:
+                presentment_items_without_image_pair += 1
+                if len(presentment_missing_pair_examples) < 10:
+                    presentment_missing_pair_examples.append(unique_id)
         else:
             return_item_count += 1
+            if image_50_count == 0:
+                return_items_without_front_image += 1
+                if len(return_missing_front_examples) < 10:
+                    return_missing_front_examples.append(unique_id)
+            if image_50_count > 0 and image_52_count == 0:
+                return_items_without_image_pair += 1
+                if len(return_missing_pair_examples) < 10:
+                    return_missing_pair_examples.append(unique_id)
 
         current_item = None
 
@@ -551,6 +578,8 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
                 "item_type": "25",
                 "start_line": idx,
                 "check_ref": check_ctx,
+                "image_50_count": 0,
+                "image_52_count": 0,
             }
             rec25_total += 1
             if open_25_line is not None and not open_25_has_26:
@@ -594,6 +623,8 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
                 "item_type": "31",
                 "start_line": idx,
                 "check_ref": check_ctx_31,
+                "image_50_count": 0,
+                "image_52_count": 0,
             }
             if open_25_line is not None and not open_25_has_26:
                 missing_26_after_25_count += 1
@@ -618,11 +649,12 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
         if rt in {"10", "20", "61", "62", "70", "90", "99", "01"}:
             finalize_current_item(f"record {rt} at line {idx}")
 
-        # Deep image pairing checks intentionally skipped (record-type presence only).
         if rt == "50":
-            pass
+            if current_item is not None:
+                current_item["image_50_count"] = int(current_item.get("image_50_count", 0)) + 1
         elif rt == "52":
-            pass
+            if current_item is not None:
+                current_item["image_52_count"] = int(current_item.get("image_52_count", 0)) + 1
 
     if open_25_line is not None and not open_25_has_26:
         missing_26_after_25_count += 1
@@ -657,6 +689,51 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
 
     missing_required_record_types = sorted(set(missing_presentment_types + missing_return_types))
 
+    if presentment_items_without_front_image > 0:
+        add_issue(
+            (
+                f"Presentment items missing record 50 (no image): {presentment_items_without_front_image:,}"
+                + (
+                    "\nExamples: " + ", ".join(presentment_missing_front_examples)
+                    if presentment_missing_front_examples
+                    else ""
+                )
+            )
+        )
+    if return_items_without_front_image > 0:
+        add_issue(
+            (
+                f"Return items missing record 50 (no image): {return_items_without_front_image:,}"
+                + (
+                    "\nExamples: " + ", ".join(return_missing_front_examples)
+                    if return_missing_front_examples
+                    else ""
+                )
+            )
+        )
+    if presentment_items_without_image_pair > 0:
+        add_issue(
+            (
+                f"Presentment items with record 50 but missing record 52: {presentment_items_without_image_pair:,}"
+                + (
+                    "\nExamples: " + ", ".join(presentment_missing_pair_examples)
+                    if presentment_missing_pair_examples
+                    else ""
+                )
+            )
+        )
+    if return_items_without_image_pair > 0:
+        add_issue(
+            (
+                f"Return items with record 50 but missing record 52: {return_items_without_image_pair:,}"
+                + (
+                    "\nExamples: " + ", ".join(return_missing_pair_examples)
+                    if return_missing_pair_examples
+                    else ""
+                )
+            )
+        )
+
     if dropped_issue_count:
         issues.append(
             f"... plus {dropped_issue_count} additional issues omitted for brevity."
@@ -670,6 +747,8 @@ def validate_x937_file_structure(records: List[str], file_name: str) -> Dict:
             and missing_26_after_25_count == 0
             and len(missing_required_record_types) == 0
             and critical_field_error_count == 0
+            and presentment_items_without_front_image == 0
+            and return_items_without_front_image == 0
         ),
         "header_ok": header_ok,
         "orphan_26_count": orphan_26_count,
@@ -734,7 +813,11 @@ def x9_to_json(filename):
                 line = lines[current_index] if current_index < len(lines) else None
                 addendum = {}
 
-                while line and get_record_type(line) != "25" and current_index < len(lines):
+                while (
+                    line
+                    and get_record_type(line) not in {"25", "31"}
+                    and current_index < len(lines)
+                ):
                     if get_record_type(line) in ("26", "28"):
                         values = get_record_type_values(lines[current_index])
                         for key, value in values.items():
@@ -762,7 +845,11 @@ def x9_to_json(filename):
                 line = lines[current_index] if current_index < len(lines) else None
                 addendum = {}
 
-                while line and get_record_type(line) != "31" and current_index < len(lines):
+                while (
+                    line
+                    and get_record_type(line) not in {"25", "31"}
+                    and current_index < len(lines)
+                ):
                     if get_record_type(line) in ("32", "33", "35"):
                         values = get_record_type_values(lines[current_index])
                         for key, value in values.items():
@@ -1891,6 +1978,18 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
 
     presentment_item_count = sum(r["presentment_item_count"] for r in structure_results)
     return_item_count = sum(r["return_item_count"] for r in structure_results)
+    presentment_items_without_front_image_total = sum(
+        r["presentment_items_without_front_image"] for r in structure_results
+    )
+    return_items_without_front_image_total = sum(
+        r["return_items_without_front_image"] for r in structure_results
+    )
+    presentment_items_without_pair_total = sum(
+        r["presentment_items_without_image_pair"] for r in structure_results
+    )
+    return_items_without_pair_total = sum(
+        r["return_items_without_image_pair"] for r in structure_results
+    )
 
     invalid_files_count = len(invalid_file_rows)
     structure_status = "PASS" if invalid_files_count == 0 else "FAIL"
@@ -2028,19 +2127,38 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         "Critical fields (ABA RTNs, account numbers, and MICR data) must be populated and valid.",
     )
 
+    image_status = (
+        "FAIL"
+        if (presentment_items_without_front_image_total + return_items_without_front_image_total) > 0
+        else (
+            "WARN"
+            if (presentment_items_without_pair_total + return_items_without_pair_total) > 0
+            else "PASS"
+        )
+    )
     image_details = [
-        "Deep 50/52 pairing/front-image/TIFF validation skipped by design.",
-        "Only record-type presence checks for 50/52 are enforced.",
+        "Per-item image linkage validation (RT25/RT31 context).",
+        "Required: at least one record 50 per item. Advisory: record 52 should also be present.",
         f"Presentment items detected (RT25): {presentment_item_count:,}",
         f"Return items detected (RT31): {return_item_count:,}",
+        (
+            "Missing record 50 (no image): "
+            f"presentment={presentment_items_without_front_image_total:,}, "
+            f"return={return_items_without_front_image_total:,}"
+        ),
+        (
+            "Missing record 52 with record 50 present (advisory): "
+            f"presentment={presentment_items_without_pair_total:,}, "
+            f"return={return_items_without_pair_total:,}"
+        ),
     ]
     if return_item_count == 0:
         image_details.append("No return items detected.")
     log_check(
-        "Basic Validation: Image Records (50/52 Presence Only)",
-        "INFO",
+        "Basic Validation: Item Image Linkage (25/31 with 50/52)",
+        image_status,
         "\n".join(image_details),
-        "Deep image-content validation removed; this run checks record-type presence only.",
+        "Each RT25/RT31 item should carry at least one RT50. RT52 is tracked as image-block completeness.",
     )
 
     # 1.3 Bad Record Check (moved after structural checks to reduce front-of-report noise)
@@ -2081,7 +2199,7 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
 
     log_summary("File & Data Quality")
 
-    return_records_present = any(r["return_records_present"] for r in structure_results)
+    return_records_present = any(r["return_records_present"] for r in structure_results) or not df_return.empty
     if df_forward.empty:
         if return_records_present:
             log_check(
@@ -2361,20 +2479,32 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     # ============================================================
     # SECTION 3: AMOUNT VALIDATION
     # ============================================================
-    amount_stats = df_forward["ITEM_AMOUNT_FLOAT"].describe()
-    log_check(
-        "Amount Distribution Statistics",
-        "INFO",
-        (
-            f"Count: {int(amount_stats['count']):,}\n"
-            f"Mean: ${amount_stats['mean']:.2f}\n"
-            f"Median: ${df_forward['ITEM_AMOUNT_FLOAT'].median():.2f}\n"
-            f"Min: ${amount_stats['min']:.2f}\n"
-            f"Max: ${amount_stats['max']:.2f}\n"
-            f"Std Dev: ${amount_stats['std']:.2f}"
-        ),
-        "Review outliers and ensure amounts align with expected transaction patterns.",
-    )
+    valid_amount_series = df_forward["ITEM_AMOUNT_FLOAT"].dropna()
+    if valid_amount_series.empty:
+        log_check(
+            "Amount Distribution Statistics",
+            "INFO",
+            (
+                f"Count: 0\n"
+                "No valid numeric forward amounts available to compute distribution statistics."
+            ),
+            "Amount stats skipped to avoid NaN output; investigate blank/non-numeric RT25 item amounts.",
+        )
+    else:
+        amount_stats = valid_amount_series.describe()
+        log_check(
+            "Amount Distribution Statistics",
+            "INFO",
+            (
+                f"Count: {int(amount_stats['count']):,}\n"
+                f"Mean: ${amount_stats['mean']:.2f}\n"
+                f"Median: ${valid_amount_series.median():.2f}\n"
+                f"Min: ${amount_stats['min']:.2f}\n"
+                f"Max: ${amount_stats['max']:.2f}\n"
+                f"Std Dev: ${amount_stats['std']:.2f}"
+            ),
+            "Review outliers and ensure amounts align with expected transaction patterns.",
+        )
 
     zero_amounts = df_forward[df_forward["ITEM_AMOUNT_FLOAT"] == 0]
     zero_pct = round(len(zero_amounts) / len(df_forward) * 100, 2) if len(df_forward) else 0
