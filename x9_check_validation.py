@@ -2583,12 +2583,33 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     )
 
     aux_populated_count = (df_forward["25_auxiliary_on_us"] != "").sum()
+    on_us_populated_count = (df_forward["25_on_us"] != "").sum()
     aux_percentage = round(aux_populated_count / len(df_forward) * 100, 2) if len(df_forward) else 0
     log_check(
         "Auxiliary ON_US Population",
         "INFO",
-        f"{aux_populated_count:,} records ({aux_percentage}%) have Auxiliary ON_US populated",
-        "Review if auxiliary ON_US usage aligns with expected check numbering conventions.",
+        (
+            f"RT25 records considered: {len(df_forward):,}\n"
+            f"AUX ON_US populated: {aux_populated_count:,} ({aux_percentage}%)\n"
+            f"ON_US populated: {on_us_populated_count:,} "
+            f"({round(on_us_populated_count / len(df_forward) * 100, 2) if len(df_forward) else 0}%)"
+        ),
+        "Percentages are based on RT25 records only (not total physical X9 records).",
+    )
+    micr_both_populated = ((df_forward["25_auxiliary_on_us"] != "") & (df_forward["25_on_us"] != "")).sum()
+    micr_aux_only = ((df_forward["25_auxiliary_on_us"] != "") & (df_forward["25_on_us"] == "")).sum()
+    micr_onus_only = ((df_forward["25_auxiliary_on_us"] == "") & (df_forward["25_on_us"] != "")).sum()
+    micr_neither = ((df_forward["25_auxiliary_on_us"] == "") & (df_forward["25_on_us"] == "")).sum()
+    log_check(
+        "MICR Source Mix (ON_US vs AUX ON_US)",
+        "INFO",
+        (
+            f"Both ON_US and AUX ON_US populated: {micr_both_populated:,}\n"
+            f"AUX ON_US only (business-account style): {micr_aux_only:,}\n"
+            f"ON_US only (personal-account style): {micr_onus_only:,}\n"
+            f"Neither populated: {micr_neither:,}"
+        ),
+        "Use this mix to validate whether ON_US/AUX_ON_US behavior matches customer feed expectations.",
     )
 
     probable_non_check_mask = (
@@ -2661,6 +2682,29 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             )
             threshold = 10
             high_volume_duplicates = df_checknum_counts[df_checknum_counts["count"] > threshold]
+            df_duplicates["sequence_number"] = _normalize_text_series(
+                df_duplicates, "25_ece_institution_item_sequence_number"
+            )
+            df_duplicates["item_amount_dollars"] = (
+                pd.to_numeric(df_duplicates["25_item_amount"], errors="coerce") / 100
+            ).round(2)
+            sample_duplicate_rows = (
+                df_duplicates[
+                    [
+                        "filename",
+                        "payer_account",
+                        "check_number",
+                        "sequence_number",
+                        "item_amount_dollars",
+                        "20_bundle_business_date",
+                    ]
+                ]
+                .sort_values(
+                    by=["payer_account", "check_number", "filename", "sequence_number"],
+                    ascending=True,
+                )
+                .head(25)
+            )
             log_check(
                 "Duplicate Check Number Check (payer_account + check_number)",
                 "WARN",
@@ -2671,18 +2715,13 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                     f"Unique duplicate check combinations: {len(df_checknum_counts):,}\n\n"
                     "Top 20 duplicate checks (with sample sequence numbers/amounts/files):\n"
                     f"{df_checknum_counts.head(20).to_string(index=False)}\n\n"
+                    "Sample duplicate rows for investigation (filename/account/check/sequence):\n"
+                    f"{sample_duplicate_rows.to_string(index=False)}\n\n"
                     f"High volume duplicates (count > {threshold}): {len(high_volume_duplicates)}\n"
                     f"{high_volume_duplicates.to_string(index=False) if not high_volume_duplicates.empty else 'None'}"
                 ),
                 "Duplicate checks identified. High volume duplicates may indicate systematic issues.",
             )
-
-            df_duplicates["sequence_number"] = _normalize_text_series(
-                df_duplicates, "25_ece_institution_item_sequence_number"
-            )
-            df_duplicates["item_amount_dollars"] = (
-                pd.to_numeric(df_duplicates["25_item_amount"], errors="coerce") / 100
-            ).round(2)
             tracking_fields = [
                 "payer_account",
                 "check_number",
@@ -2698,12 +2737,71 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                 sep="\t",
                 index=False,
             )
+            log_check(
+                "Duplicate Check Investigation Artifact",
+                "INFO",
+                f"Detailed duplicate rows exported: duplicate_checks_detail_{current_time}.tsv",
+                "Use filename + payer_account + check_number + sequence_number to trace duplicate source.",
+            )
         else:
             log_check(
                 "Duplicate Check Number Check (payer_account + check_number)",
                 "PASS",
                 "No duplicate checks found.",
                 "No action required.",
+            )
+        onus_duplicate_pool = df_forward[df_forward["25_on_us"] != ""].copy()
+        onus_is_duplicated = onus_duplicate_pool.duplicated(subset=["25_on_us"], keep=False)
+        onus_duplicates = onus_duplicate_pool[onus_is_duplicated].copy()
+        if not onus_duplicates.empty:
+            onus_duplicates["sequence_number"] = _normalize_text_series(
+                onus_duplicates, "25_ece_institution_item_sequence_number"
+            )
+            onus_counts = (
+                onus_duplicates.groupby("25_on_us")
+                .agg(
+                    count=("25_on_us", "size"),
+                    sample_files=("filename", lambda values: " | ".join(_unique_non_empty(values, limit=3))),
+                    sample_sequences=(
+                        "25_ece_institution_item_sequence_number",
+                        lambda values: " | ".join(_unique_non_empty(values, limit=5)),
+                    ),
+                )
+                .reset_index()
+                .sort_values(by="count", ascending=False)
+            )
+            onus_tracking_fields = [
+                "filename",
+                "25_on_us",
+                "payer_account",
+                "check_number",
+                "sequence_number",
+                "25_auxiliary_on_us",
+                "25_item_amount",
+                "20_bundle_business_date",
+            ]
+            onus_duplicates[onus_tracking_fields].to_csv(
+                f"onus_duplicates_detail_{current_time}.tsv",
+                sep="\t",
+                index=False,
+            )
+            log_check(
+                "ON_US Duplicate Pattern Check (Deposit-Slip Lead)",
+                "WARN",
+                (
+                    f"Duplicate ON_US records: {len(onus_duplicates):,}\n"
+                    f"Unique duplicated ON_US values: {len(onus_counts):,}\n"
+                    f"Top duplicated ON_US values:\n{onus_counts.head(20).to_string(index=False)}\n\n"
+                    f"Detailed rows exported: onus_duplicates_detail_{current_time}.tsv"
+                ),
+                "Repeated ON_US values can indicate deposit-slip-like patterns; review with sequence and filename context.",
+            )
+        else:
+            log_check(
+                "ON_US Duplicate Pattern Check (Deposit-Slip Lead)",
+                "PASS",
+                "No duplicated ON_US values detected among non-blank ON_US records.",
+                "No ON_US duplication lead detected for deposit-slip investigation.",
             )
 
     settlement_col = "20_bundle_business_date"
