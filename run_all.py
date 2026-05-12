@@ -1,15 +1,25 @@
-import os
 import sys
+
+# NOTE: Keep the version guard above any imports that could use modern Python
+# syntax (e.g., f-strings) so we fail with a clear message instead of a
+# SyntaxError when the wrong interpreter is used.
+_MIN_PY = (3, 8)
+if sys.version_info < _MIN_PY:
+    sys.stderr.write(
+        "ERROR: This project requires Python >= {0}.{1}. "
+        "You are running Python {2}.{3}.\n"
+        "Fix: run `python3 run_all.py <config.ini>` (or install a newer Python).\n".format(
+            _MIN_PY[0],
+            _MIN_PY[1],
+            sys.version_info[0],
+            sys.version_info[1],
+        )
+    )
+    raise SystemExit(2)
+
+import os
 from datetime import datetime
 from time import perf_counter
-
-from aba_entropy import ABAEntropyAnalyzer
-from ach_mdv_validator import ACHMDVValidator
-from batch_data_check import BatchDateCompletenessAnalyzer
-from config import Config
-from logger_utils import LogManager
-import misc_functions
-from ai_runner import run_ai_summary
 
 
 def validate_file_extensions(data_path, logger=None):
@@ -42,34 +52,43 @@ def validate_file_extensions(data_path, logger=None):
         return True, None, []
 
     except Exception as e:
-        error_msg = f"Error checking file extensions: {e}"
+        error_msg = "Error checking file extensions: {0}".format(e)
         if logger:
             logger.error(error_msg)
         return False, error_msg, []
 
 
 def main():
+    # Delay imports so the version guard above runs first with older interpreters.
+    from aba_entropy import ABAEntropyAnalyzer
+    from ach_mdv_validator import ACHMDVValidator
+    from batch_data_check import BatchDateCompletenessAnalyzer
+    from config import Config
+    from logger_utils import LogManager
+    import misc_functions
+    from ai_runner import run_ai_summary
+
     if misc_functions.is_interactive():
         print("Interactive mode detected. Please run from command line.")
         return
 
     if len(sys.argv) != 2:
-        print("Usage: python run_all.py <config_file.ini>")
+        print("Usage: python3 run_all.py <config_file.ini>")
         sys.exit(1)
 
     config_file = sys.argv[1]
     if not os.path.isfile(config_file):
-        print(f"Config file not found: {config_file}")
+        print("Config file not found: {0}".format(config_file))
         sys.exit(1)
 
     try:
         config = Config(config_file)
     except Exception as e:
-        print(f"Failed to load config: {e}")
+        print("Failed to load config: {0}".format(e))
         sys.exit(1)
 
     if not os.path.isdir(config.data_path):
-        print(f"Data path does not exist: {config.data_path}")
+        print("Data path does not exist: {0}".format(config.data_path))
         sys.exit(1)
 
     if not config.is_folded:
@@ -80,7 +99,7 @@ def main():
         try:
             os.makedirs(config.log_path)
         except Exception as e:
-            print(f"Could not create log directory {config.log_path}: {e}")
+            print("Could not create log directory {0}: {1}".format(config.log_path, e))
             sys.exit(1)
 
     tenant_name = config.tenant_name.strip()
@@ -88,8 +107,10 @@ def main():
         print("Tenant name is blank")
         sys.exit(1)
 
-    logfile = (
-        f"{tenant_name}_{config.sid}_{datetime.now().strftime('%Y%m%d_%H%M')}.ACH.log"
+    logfile = "{0}_{1}_{2}.ACH.log".format(
+        tenant_name,
+        config.sid,
+        datetime.now().strftime("%Y%m%d_%H%M"),
     )
 
     log_manager, full_log_path = LogManager.setup(
@@ -125,18 +146,18 @@ def main():
         "historical_estimate": {},
     }
 
-    def _fmt_duration_s(s: float) -> str:
+    def _fmt_duration_s(s):
         try:
             s = float(s)
         except Exception:
             return "n/a"
         if s < 60:
-            return f"{s:.1f}s"
+            return "{0:.1f}s".format(s)
         if s < 3600:
-            return f"{s/60:.1f}m"
-        return f"{s/3600:.2f}h"
+            return "{0:.1f}m".format(s / 60)
+        return "{0:.2f}h".format(s / 3600)
 
-    def _sec(name: str):
+    def _sec(name):
         t0 = perf_counter()
 
         class _Sec:
@@ -163,7 +184,7 @@ def main():
             # Prefer sampling only the configured extension if present (keeps stats focused on ACH).
             ext = str(getattr(config, "extension", "ACH") or "ACH").strip()
             if ext and not ext.startswith("."):
-                ext = f".{ext}"
+                ext = ".{0}".format(ext)
             if ext:
                 all_files = [f for f in all_files if f.endswith(ext)]
             perf["dataset"]["files_total_matching_extension"] = int(len(all_files))
@@ -199,11 +220,15 @@ def main():
         logger.error("=" * 40)
         logger.error(error_msg)
         logger.error("")
-        logger.error(f"Found {len(invalid_files)} file(s) with incorrect extension:")
+        logger.error(
+            "Found {0} file(s) with incorrect extension:".format(len(invalid_files))
+        )
         for idx, filename in enumerate(invalid_files[:20], 1):
-            logger.error(f"  {idx}. {filename}")
+            logger.error("  {0}. {1}".format(idx, filename))
         if len(invalid_files) > 20:
-            logger.error(f"  ... and {len(invalid_files) - 20} more files")
+            logger.error(
+                "  ... and {0} more files".format(len(invalid_files) - 20)
+            )
         logger.error("")
         logger.error("=" * 40)
 
@@ -211,9 +236,9 @@ def main():
         print("*** FILE EXTENSION VALIDATION FAILED ***")
         print("=" * 40)
         print(error_msg)
-        print(f"\nFound {len(invalid_files)} file(s) with incorrect extension.")
+        print("\nFound {0} file(s) with incorrect extension.".format(len(invalid_files)))
         print("Please check the log file for details:")
-        print(f"  {full_log_path}")
+        print("  {0}".format(full_log_path))
         print("=" * 40)
     else:
         logger.info("File extension validation: PASSED (all files have .ACH extension)")
@@ -236,7 +261,7 @@ def main():
                 except Exception:
                     pass
     except Exception as e:
-        logger.critical(f"ACH RDV Validator crashed: {e}")
+        logger.critical("ACH RDV Validator crashed: {0}".format(e))
         logger.debug(str(e))
         workflow_report["sections"]["ach_mdv_validator"] = {
             "section": "ACH RDV Validation",
@@ -252,10 +277,12 @@ def main():
             if not ach_type:
                 ach_type = config.ach_type or "ODFI"
                 logger.warning(
-                    f"ABA analyzer returned no type; falling back to config value: {ach_type}"
+                    "ABA analyzer returned no type; falling back to config value: {0}".format(
+                        ach_type
+                    )
                 )
     except Exception as e:
-        logger.critical(f"ABAEntropyAnalyzer crashed: {e}")
+        logger.critical("ABAEntropyAnalyzer crashed: {0}".format(e))
         logger.debug(str(e))
         ach_type = config.ach_type or "ODFI"
         workflow_report["sections"]["aba_entropy"] = {
@@ -270,7 +297,7 @@ def main():
             section3 = batch_date_analyzer.analyze(ach_type, config.extension)
             workflow_report["sections"]["batch_data_check"] = section3
     except Exception as e:
-        logger.critical(f"BatchDateCompletenessAnalyzer crashed: {e}")
+        logger.critical("BatchDateCompletenessAnalyzer crashed: {0}".format(e))
         logger.debug(str(e))
         workflow_report["sections"]["batch_data_check"] = {
             "section": "Batch Date Completeness",
@@ -339,8 +366,10 @@ def main():
             }
             logger.info(
                 "Historical backfill estimate (based on observed throughput): "
-                f"{perf['historical_estimate']['estimated_wall_time_human']} "
-                f"with {workers} worker(s)"
+                "{0} with {1} worker(s)".format(
+                    perf["historical_estimate"]["estimated_wall_time_human"],
+                    workers,
+                )
             )
         elif hist_files > 0 and perf["run"].get("throughput_files_per_s"):
             fps = float(perf["run"]["throughput_files_per_s"] or 0.0)
@@ -357,8 +386,10 @@ def main():
                 }
                 logger.info(
                     "Historical backfill estimate (based on observed throughput): "
-                    f"{perf['historical_estimate']['estimated_wall_time_human']} "
-                    f"with {workers} worker(s)"
+                    "{0} with {1} worker(s)".format(
+                        perf["historical_estimate"]["estimated_wall_time_human"],
+                        workers,
+                    )
                 )
         else:
             perf["historical_estimate"] = {
@@ -389,10 +420,10 @@ def main():
                 timeout_s=int(getattr(config, "ai_timeout_s", 180)),
             )
     except Exception as e:
-        logger.warning(f"AI summary generation skipped/failed: {e}")
+        logger.warning("AI summary generation skipped/failed: {0}".format(e))
 
-    print(f"\nDetails and logs have been saved to: {full_log_path}")
-    print(f"JSON summary saved to: {log_manager.jsonfile}")
+    print("\nDetails and logs have been saved to: {0}".format(full_log_path))
+    print("JSON summary saved to: {0}".format(log_manager.jsonfile))
 
 
 if __name__ == "__main__":
