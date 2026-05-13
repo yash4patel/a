@@ -122,6 +122,15 @@ def log_summary(section_name: str):
         remaining = len(names) - max_items
         return f"{'; '.join(names[:max_items])}; ... (+{remaining} more)"
 
+    def _render_one_line(status: str, label: str, max_items: int = 3) -> str:
+        names = section_names[status]
+        if not names:
+            return f"{label}: none."
+        if len(names) <= max_items:
+            return f"{label}: " + "; ".join(names) + "."
+        remaining = len(names) - max_items
+        return f"{label}: {'; '.join(names[:max_items])}; ... (+{remaining} more)."
+
     logger.info(f"========== {section_name} Summary ==========")
     logger.info(f"Total checks conducted : {len(section_history)}")
     logger.info(f"Passed : {section_counts['PASS']}")
@@ -132,6 +141,8 @@ def log_summary(section_name: str):
     logger.info(f"  - INFO checks: {_render_checks('INFO')}")
     logger.info(f"Failed : {section_counts['FAIL']}")
     logger.info(f"  - FAIL checks: {_render_checks('FAIL')}")
+    logger.info(f"One-line failed summary: {_render_one_line('FAIL', 'Failed checks')}")
+    logger.info(f"One-line passed summary: {_render_one_line('PASS', 'Worked/passed checks')}")
     logger.info("===========================================")
     logger.info("")
 
