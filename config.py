@@ -67,6 +67,10 @@ class Config:
         # Goal: avoid guessing/prompting by allowing explicit DATE/TIME extraction rules
         # similar to consortium model configuration and riskengine_control.esc substring logic.
         #
+        # Preferred: `filenameformat = GENERIC` (default ACH_<epoch-ms>_<dateTime>_*.ACH).
+        # If customers cannot include epoch, PSE should set `filenameformat` to a non-GENERIC
+        # value (e.g., CUSTOM) and provide substring/regex extraction keys below.
+        #
         # Modes:
         # - auto: existing analyzer-driven detection (regex patterns in metadata)
         # - substring: use 0-based slice ranges (end is exclusive), e.g. 18:24
@@ -75,6 +79,7 @@ class Config:
         # Notes:
         # - Extraction is applied to the basename by default (not full path).
         # - If strip_non_digits is True, non-digits are removed from extracted pieces.
+        self.filenameformat = conf.get("filenameformat", "").strip()
         self.filename_datetime_mode = conf.get("filename_datetime_mode", "auto").strip().lower()
         self.filename_datetime_strip_extension = conf.getboolean(
             "filename_datetime_strip_extension", True

@@ -206,7 +206,50 @@ class BatchDateCompletenessAnalyzer:
         Optional: config.ini-driven filename DATE/TIME extraction.
         Returns (parser_fn, description) or (None, None).
         """
+        filenameformat = str(getattr(self.config, "filenameformat", "") or "").strip().upper()
+
         mode = str(getattr(self.config, "filename_datetime_mode", "auto") or "auto").strip().lower()
+        # Preferred/standard format: ACH_<13-digit-epoch-ms>_<YYYYMMDDHHmmss or YYMMDDHHmmss>_*.ACH
+        if filenameformat == "GENERIC":
+            strip_ext = bool(getattr(self.config, "filename_datetime_strip_extension", True))
+            base = int(getattr(self.config, "filename_two_digit_year_base", 2000) or 2000)
+            ymax = int(getattr(self.config, "filename_two_digit_year_max", 50) or 50)
+            rx = re.compile(r"^ACH_(\d{13})_(\d{12}|\d{14})_")
+
+            def parser(filename):
+                name = os.path.basename(str(filename))
+                if strip_ext and "." in name:
+                    name = name.rsplit(".", 1)[0]
+                m = rx.search(name)
+                if not m:
+                    raise ValueError("filenameformat=GENERIC did not match expected pattern")
+                dt = m.group(2)
+                # YYYYMMDDHHMMSS (14) OR YYMMDDHHMMSS (12)
+                if len(dt) == 14:
+                    date_raw = dt[:8]
+                    time_raw = dt[8:14]
+                    y, mo, da = self._parse_date_digits(date_raw, base, ymax)
+                else:
+                    date_raw = dt[:6]
+                    time_raw = dt[6:12]
+                    y, mo, da = self._parse_date_digits(date_raw, base, ymax)
+                # Validate time; GENERIC does not require it for analysis but we validate for safety.
+                self._parse_time_digits(time_raw, suffix="")
+                return int(y), int(mo), int(da)
+
+            return parser, "filenameformat=GENERIC (ACH_<epoch-ms>_<dateTime>_...)"
+
+        # If PSE provides a filenameformat but it's not GENERIC, treat it as "custom" and require
+        # explicit substring/regex config (no guessing/prompting by default).
+        if filenameformat and filenameformat != "GENERIC" and mode in ("", "auto", "none"):
+            # Infer mode from provided keys to reduce config friction.
+            if str(getattr(self.config, "filename_date_slice", "") or "").strip():
+                mode = "substring"
+            elif str(getattr(self.config, "filename_datetime_regex", "") or "").strip():
+                mode = "regex"
+            else:
+                return None, None
+
         if mode in ("", "auto", "none"):
             return None, None
 
