@@ -15,6 +15,18 @@ _summary_cursor = 0
 _LOGGER_NAME = "X937_XML_Validator"
 
 
+def _compact_reason_text(text: str, max_len: int = 180) -> str:
+    """Return a single-line compact reason from details/guideline text."""
+    if text is None:
+        return "No details provided."
+    normalized = " ".join(str(text).strip().split())
+    if not normalized:
+        return "No details provided."
+    if len(normalized) <= max_len:
+        return normalized
+    return normalized[: max_len - 3] + "..."
+
+
 def setup_logging(log_filename: str):
     """Configure file logging with ACH-like format and reset counters."""
     global check_history, _summary_cursor
@@ -81,7 +93,14 @@ def log_check(check_name: str, status: str, details: str, guideline: str):
 
     check_results["TOTAL"] += 1
     check_results[normalized] += 1
-    check_history.append({"name": check_name, "status": normalized})
+    check_history.append(
+        {
+            "name": check_name,
+            "status": normalized,
+            "reason": _compact_reason_text(details),
+            "guideline": _compact_reason_text(guideline),
+        }
+    )
 
     logger.info(check_name)
     if normalized == "PASS":
@@ -106,12 +125,14 @@ def log_summary(section_name: str):
 
     section_counts = {"PASS": 0, "WARN": 0, "INFO": 0, "FAIL": 0}
     section_names = {"PASS": [], "WARN": [], "INFO": [], "FAIL": []}
+    section_entries = {"PASS": [], "WARN": [], "INFO": [], "FAIL": []}
     for entry in section_history:
         status = entry["status"]
         if status not in section_counts:
             continue
         section_counts[status] += 1
         section_names[status].append(entry["name"])
+        section_entries[status].append(entry)
 
     def _render_checks(status: str, max_items: int = 6) -> str:
         names = section_names[status]
@@ -131,6 +152,13 @@ def log_summary(section_name: str):
         remaining = len(names) - max_items
         return f"{label}: {'; '.join(names[:max_items])}; ... (+{remaining} more)."
 
+    def _render_reason_line(status: str, label: str) -> str:
+        entries = section_entries[status]
+        if not entries:
+            return f"{label}: none."
+        first = entries[0]
+        return f"{label}: {first['name']} -> {first.get('reason', 'No details provided.')}"
+
     logger.info(f"========== {section_name} Summary ==========")
     logger.info(f"Total checks conducted : {len(section_history)}")
     logger.info(f"Passed : {section_counts['PASS']}")
@@ -143,6 +171,8 @@ def log_summary(section_name: str):
     logger.info(f"  - FAIL checks: {_render_checks('FAIL')}")
     logger.info(f"One-line failed summary: {_render_one_line('FAIL', 'Failed checks')}")
     logger.info(f"One-line passed summary: {_render_one_line('PASS', 'Worked/passed checks')}")
+    logger.info(f"Pass reason (why it passed): {_render_reason_line('PASS', 'PASS reason')}")
+    logger.info(f"Fail reason (why it failed): {_render_reason_line('FAIL', 'FAIL reason')}")
     logger.info("===========================================")
     logger.info("")
 
