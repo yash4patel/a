@@ -62,6 +62,43 @@ class Config:
         self.ach_type = conf.get("ach_type", "")
         self.is_folded = conf.getboolean("is_folded", True)
 
+        # Filename date/time extraction policy (for batch date completeness).
+        #
+        # Goal: avoid guessing/prompting by allowing explicit DATE/TIME extraction rules
+        # similar to consortium model configuration and riskengine_control.esc substring logic.
+        #
+        # Modes:
+        # - auto: existing analyzer-driven detection (regex patterns in metadata)
+        # - substring: use 0-based slice ranges (end is exclusive), e.g. 18:24
+        # - regex: use a regex with named groups OR a single date/time group
+        #
+        # Notes:
+        # - Extraction is applied to the basename by default (not full path).
+        # - If strip_non_digits is True, non-digits are removed from extracted pieces.
+        self.filename_datetime_mode = conf.get("filename_datetime_mode", "auto").strip().lower()
+        self.filename_datetime_strip_extension = conf.getboolean(
+            "filename_datetime_strip_extension", True
+        )
+        self.filename_datetime_strip_non_digits = conf.getboolean(
+            "filename_datetime_strip_non_digits", True
+        )
+        # substring mode
+        self.filename_date_slice = conf.get("filename_date_slice", "").strip()
+        self.filename_time_slice = conf.get("filename_time_slice", "").strip()
+        self.filename_time_suffix = conf.get("filename_time_suffix", "").strip()
+        # regex mode
+        self.filename_datetime_regex = conf.get("filename_datetime_regex", "").strip()
+
+        # Two-digit year handling when a 6-digit date is extracted (YYMMDD).
+        self.filename_two_digit_year_base = conf.getint("filename_two_digit_year_base", 2000)
+        self.filename_two_digit_year_max = conf.getint("filename_two_digit_year_max", 50)
+
+        # If True and no configured rule works, allow interactive prompting (legacy behavior).
+        # Default False to ensure non-interactive consistency.
+        self.allow_manual_filename_date_prompt = conf.getboolean(
+            "allow_manual_filename_date_prompt", False
+        )
+
         # Optional: Generate AI/agent summary from the combined report JSON.
         # This is designed for on-prem Ollama usage; can also run in deterministic mode without any LLM calls.
         self.ai_summary_enabled = conf.getboolean("ai_summary_enabled", False)

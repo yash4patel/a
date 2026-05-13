@@ -133,6 +133,173 @@ class BatchDateCompletenessAnalyzer:
             cur = cur.get(p)
         return cur if cur is not None else default
 
+    def _parse_slice(self, slice_text):
+        """
+        Parse a 0-based slice string like "18:24" into (start, end).
+        End is exclusive, matching Python slicing and JS substring semantics.
+        """
+        if not slice_text or not isinstance(slice_text, str):
+            return None
+        raw = slice_text.strip()
+        if not raw:
+            return None
+        # Allow "18:24" or "18,24"
+        sep = ":" if ":" in raw else ("," if "," in raw else None)
+        if not sep:
+            return None
+        parts = [p.strip() for p in raw.split(sep, 1)]
+        if len(parts) != 2:
+            return None
+        try:
+            start = int(parts[0])
+            end = int(parts[1])
+        except Exception:
+            return None
+        if end <= start:
+            return None
+        return start, end
+
+    def _parse_date_digits(self, digits, two_digit_base, two_digit_max):
+        if digits is None:
+            raise ValueError("date is missing")
+        d = str(digits)
+        d = re.sub(r"\D", "", d)
+        if len(d) >= 8 and d[:4].isdigit():
+            yyyy = int(d[:4])
+            if 1900 <= yyyy <= 2099:
+                y = yyyy
+                m = int(d[4:6])
+                day = int(d[6:8])
+                date(y, m, day)
+                return y, m, day
+        if len(d) >= 6:
+            yy = int(d[:2])
+            m = int(d[2:4])
+            day = int(d[4:6])
+            # Pivot: yy <= max => base+yy else (base-100)+yy
+            base = int(two_digit_base)
+            pivot = int(two_digit_max)
+            y = base + yy if yy <= pivot else (base - 100) + yy
+            date(y, m, day)
+            return y, m, day
+        raise ValueError("date digits not parseable: {0}".format(digits))
+
+    def _parse_time_digits(self, digits, suffix=""):
+        if digits is None:
+            raise ValueError("time is missing")
+        t = str(digits)
+        t = re.sub(r"\D", "", t)
+        if suffix:
+            t = "{0}{1}".format(t, re.sub(r"\D", "", str(suffix)))
+        if len(t) < 4:
+            raise ValueError("time digits not parseable: {0}".format(digits))
+        # Validate HHMMSS (or HHMM + optional suffix)
+        hh = int(t[0:2])
+        mm = int(t[2:4])
+        ss = int(t[4:6]) if len(t) >= 6 else 0
+        if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+            raise ValueError("invalid time: {0}".format(t))
+        return t
+
+    def _get_configured_filename_date_parser(self):
+        """
+        Optional: config.ini-driven filename DATE/TIME extraction.
+        Returns (parser_fn, description) or (None, None).
+        """
+        mode = str(getattr(self.config, "filename_datetime_mode", "auto") or "auto").strip().lower()
+        if mode in ("", "auto", "none"):
+            return None, None
+
+        strip_ext = bool(getattr(self.config, "filename_datetime_strip_extension", True))
+        strip_non_digits = bool(getattr(self.config, "filename_datetime_strip_non_digits", True))
+        base = int(getattr(self.config, "filename_two_digit_year_base", 2000) or 2000)
+        ymax = int(getattr(self.config, "filename_two_digit_year_max", 50) or 50)
+
+        if mode == "substring":
+            date_sl = self._parse_slice(getattr(self.config, "filename_date_slice", "") or "")
+            time_sl = self._parse_slice(getattr(self.config, "filename_time_slice", "") or "")
+            time_suffix = str(getattr(self.config, "filename_time_suffix", "") or "")
+            if not date_sl:
+                return None, None
+
+            def parser(filename):
+                name = os.path.basename(str(filename))
+                if strip_ext and "." in name:
+                    name = name.rsplit(".", 1)[0]
+                ds, de = date_sl
+                date_raw = name[ds:de]
+                if strip_non_digits:
+                    date_raw = re.sub(r"\D", "", str(date_raw))
+                y, m, d = self._parse_date_digits(date_raw, base, ymax)
+                if time_sl:
+                    ts, te = time_sl
+                    time_raw = name[ts:te]
+                    if strip_non_digits:
+                        time_raw = re.sub(r"\D", "", str(time_raw))
+                    self._parse_time_digits(time_raw, suffix=time_suffix)
+                return y, m, d
+
+            desc = "substring date={0} time={1}".format(
+                getattr(self.config, "filename_date_slice", ""),
+                getattr(self.config, "filename_time_slice", "") or "(none)",
+            )
+            return parser, desc
+
+        if mode == "regex":
+            regex = str(getattr(self.config, "filename_datetime_regex", "") or "").strip()
+            if not regex:
+                return None, None
+            try:
+                rx = re.compile(regex)
+            except Exception as e:
+                self.logger.error("Invalid filename_datetime_regex: {0}".format(e))
+                return None, None
+
+            time_suffix = str(getattr(self.config, "filename_time_suffix", "") or "")
+
+            def parser(filename):
+                name = os.path.basename(str(filename))
+                if strip_ext and "." in name:
+                    name = name.rsplit(".", 1)[0]
+                mobj = rx.search(name)
+                if not mobj:
+                    raise ValueError("regex did not match filename")
+                gd = mobj.groupdict() or {}
+                if "date" in gd and gd.get("date") is not None:
+                    date_raw = gd.get("date")
+                    if strip_non_digits:
+                        date_raw = re.sub(r"\D", "", str(date_raw))
+                    y, mo, da = self._parse_date_digits(date_raw, base, ymax)
+                else:
+                    y_raw = gd.get("year") or gd.get("yyyy") or gd.get("y")
+                    m_raw = gd.get("month") or gd.get("mm") or gd.get("m")
+                    d_raw = gd.get("day") or gd.get("dd") or gd.get("d")
+                    if y_raw is None or m_raw is None or d_raw is None:
+                        raise ValueError("regex must provide date group(s)")
+                    y_str = re.sub(r"\D", "", str(y_raw))
+                    if len(y_str) == 2:
+                        yy = int(y_str)
+                        y = base + yy if yy <= ymax else (base - 100) + yy
+                    else:
+                        y = int(y_str)
+                    mo = int(re.sub(r"\D", "", str(m_raw)))
+                    da = int(re.sub(r"\D", "", str(d_raw)))
+                    date(y, mo, da)
+                    y, mo, da = y, mo, da
+
+                if "time" in gd and gd.get("time") is not None:
+                    time_raw = gd.get("time")
+                    if strip_non_digits:
+                        time_raw = re.sub(r"\D", "", str(time_raw))
+                    self._parse_time_digits(time_raw, suffix=time_suffix)
+                return int(y), int(mo), int(da)
+
+            desc = "regex {0}".format(regex)
+            return parser, desc
+
+        # Unknown mode => ignore (fallback to auto)
+        return None, None
+
     def extract_date_patterns(self, filename):
         """
         Extract all possible date patterns from a filename using regex.
@@ -477,17 +644,32 @@ class BatchDateCompletenessAnalyzer:
             print()
 
             try:
-                get_date = self.find_file_date_type(sample_files)
+                get_date, get_date_desc = self._get_configured_filename_date_parser()
+                if get_date:
+                    self.logger.info("Using configured filename date parser: {0}".format(get_date_desc))
+                else:
+                    get_date = self.find_file_date_type(sample_files)
 
                 if get_date is None:
-                    self.logger.warning("Auto-detection failed, requesting manual input")
-                    get_date = self.manual_date_input_fallback()
+                    allow_prompt = bool(
+                        getattr(self.config, "allow_manual_filename_date_prompt", False)
+                    )
+                    if allow_prompt:
+                        self.logger.warning(
+                            "Auto-detection failed, requesting manual input (allow_manual_filename_date_prompt=True)"
+                        )
+                        get_date = self.manual_date_input_fallback()
+                    else:
+                        get_date = None
 
                     if get_date is None:
-                        self.logger.error("User cancelled or invalid input")
+                        self.logger.error(
+                            "No filename date parser available. Configure substring/regex extraction in config.ini "
+                            "(filename_datetime_mode, filename_date_slice/filename_time_slice or filename_datetime_regex)."
+                        )
                         print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
                         report["status"] = "FAILED"
-                        report["reason"] = "Date format not detected / user cancelled"
+                        report["reason"] = "Date format not detected; configure filename_datetime_* in config.ini"
                         self.logger.info("")
                         self.logger.info("=" * 70)
                         self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
