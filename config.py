@@ -93,6 +93,15 @@ class Config:
         self.filename_time_suffix = conf.get("filename_time_suffix", "").strip()
         # regex mode
         self.filename_datetime_regex = conf.get("filename_datetime_regex", "").strip()
+        # JS-like substring expressions mode (preferred by some teams).
+        # Example:
+        #   filename_datetime_expr = var DATE = (FILENAME.substring(14,22)).toString(); var TIME = (FILENAME.substring(22,28)+'000').toString();
+        # You may also provide separate expressions:
+        #   filename_date_expr = (FILENAME.substring(0,10).replace(/-/g, '')).toString();
+        #   filename_time_expr = (FILENAME.substring(11,17)+'000').toString();
+        self.filename_datetime_expr = conf.get("filename_datetime_expr", "").strip()
+        self.filename_date_expr = conf.get("filename_date_expr", "").strip()
+        self.filename_time_expr = conf.get("filename_time_expr", "").strip()
 
         # Two-digit year handling when a 6-digit date is extracted (YYMMDD).
         self.filename_two_digit_year_base = conf.getint("filename_two_digit_year_base", 2000)

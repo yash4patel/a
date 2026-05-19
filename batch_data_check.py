@@ -201,11 +201,120 @@ class BatchDateCompletenessAnalyzer:
             raise ValueError("invalid time: {0}".format(t))
         return t
 
+    def _extract_js_like_substring_rule(self, expr, label_hint=None):
+        """
+        Parse a JS-like expression containing FILENAME.substring(a,b) and optional + '000' suffix.
+        Returns dict: {slice: (a,b), suffix: '000' or '', strip_non_digits: bool}
+        This is a parser only (no JS execution).
+        """
+        if not expr:
+            return None
+        s = str(expr)
+        # If label_hint is provided, try to find substring after that variable assignment.
+        # Otherwise just find the first substring().
+        target = s
+        if label_hint:
+            m = re.search(r"\b" + re.escape(label_hint) + r"\b\s*=", s, flags=re.IGNORECASE)
+            if m:
+                target = s[m.start() :]
+
+        m_sub = re.search(r"substring\(\s*(\d+)\s*,\s*(\d+)\s*\)", target, flags=re.IGNORECASE)
+        if not m_sub:
+            return None
+        a = int(m_sub.group(1))
+        b = int(m_sub.group(2))
+        if b <= a:
+            return None
+
+        # Suffix like + '000' or + \"000\"
+        suffix = ""
+        after = target[m_sub.end() :]
+        m_suf = re.search(r"\+\s*['\"](\d+)['\"]", after)
+        if m_suf:
+            suffix = m_suf.group(1)
+
+        # If expression includes a replace() that strips non-digits/separators, treat as strip_non_digits.
+        strip_non_digits = False
+        if re.search(r"\.replace\(\s*/[^)]*/g\s*,\s*['\"]{0,1}\s*['\"]{0,1}\s*\)", target):
+            strip_non_digits = True
+        if re.search(r"replace\(\s*/\\D/g", target):
+            strip_non_digits = True
+        if re.search(r"replace\(\s*/\[\^0-9\]/g", target):
+            strip_non_digits = True
+
+        return {"slice": (a, b), "suffix": suffix, "strip_non_digits": strip_non_digits}
+
+    def _get_js_like_filename_date_parser(self):
+        """
+        Optional: config.ini-driven JS-like substring rules.
+        Supports either a combined `filename_datetime_expr` or separate `filename_date_expr`/`filename_time_expr`.
+        """
+        combined = str(getattr(self.config, "filename_datetime_expr", "") or "").strip()
+        date_expr = str(getattr(self.config, "filename_date_expr", "") or "").strip()
+        time_expr = str(getattr(self.config, "filename_time_expr", "") or "").strip()
+
+        if not (combined or date_expr or time_expr):
+            return None, None
+
+        strip_ext = bool(getattr(self.config, "filename_datetime_strip_extension", True))
+        # default strip_non_digits can be overridden by presence of replace() in expr
+        default_strip = bool(getattr(self.config, "filename_datetime_strip_non_digits", True))
+        base = int(getattr(self.config, "filename_two_digit_year_base", 2000) or 2000)
+        ymax = int(getattr(self.config, "filename_two_digit_year_max", 50) or 50)
+
+        if combined:
+            date_rule = self._extract_js_like_substring_rule(combined, label_hint="DATE")
+            time_rule = self._extract_js_like_substring_rule(combined, label_hint="TIME")
+            # fallback: first substring is DATE, second is TIME
+            if not date_rule:
+                date_rule = self._extract_js_like_substring_rule(combined, label_hint=None)
+            if not time_rule:
+                # search after first match to find the second substring
+                first = re.search(r"substring\(\s*(\d+)\s*,\s*(\d+)\s*\)", combined, flags=re.IGNORECASE)
+                if first:
+                    tail = combined[first.end() :]
+                    time_rule = self._extract_js_like_substring_rule(tail, label_hint=None)
+        else:
+            date_rule = self._extract_js_like_substring_rule(date_expr, label_hint=None) if date_expr else None
+            time_rule = self._extract_js_like_substring_rule(time_expr, label_hint=None) if time_expr else None
+
+        if not date_rule or not date_rule.get("slice"):
+            return None, None
+
+        def parser(filename):
+            name = os.path.basename(str(filename))
+            if strip_ext and "." in name:
+                name = name.rsplit(".", 1)[0]
+
+            ds, de = date_rule["slice"]
+            date_raw = name[ds:de]
+            strip_date = default_strip or bool(date_rule.get("strip_non_digits"))
+            if strip_date:
+                date_raw = re.sub(r"\D", "", str(date_raw))
+            y, mo, da = self._parse_date_digits(date_raw, base, ymax)
+
+            if time_rule and time_rule.get("slice"):
+                ts, te = time_rule["slice"]
+                time_raw = name[ts:te]
+                strip_time = default_strip or bool(time_rule.get("strip_non_digits"))
+                if strip_time:
+                    time_raw = re.sub(r"\D", "", str(time_raw))
+                self._parse_time_digits(time_raw, suffix=str(time_rule.get("suffix") or ""))
+            return int(y), int(mo), int(da)
+
+        desc = "js-like substring rule(s) from config"
+        return parser, desc
+
     def _get_configured_filename_date_parser(self):
         """
         Optional: config.ini-driven filename DATE/TIME extraction.
         Returns (parser_fn, description) or (None, None).
         """
+        # Highest precedence: JS-like substring expressions (DATE/TIME) provided via config.ini.
+        js_parser, js_desc = self._get_js_like_filename_date_parser()
+        if js_parser:
+            return js_parser, js_desc
+
         filenameformat = str(getattr(self.config, "filenameformat", "") or "").strip().upper()
 
         mode = str(getattr(self.config, "filename_datetime_mode", "auto") or "auto").strip().lower()
