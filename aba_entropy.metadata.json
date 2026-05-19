@@ -1,0 +1,71 @@
+{
+  "section_name": "ABA Entropy",
+  "file_selection": {
+    "extension": null,
+    "include_filenames_regex": null,
+    "exclude_filenames_regex": null
+  },
+  "progress": {
+    "enabled": true,
+    "update_delta_percent": 5
+  },
+  "line_processing": {
+    "encoding": "ascii",
+    "decode_errors": "replace",
+    "record_type_position_0_based": 0,
+    "short_line_policy": "skip"
+  },
+  "metrics": [
+    {
+      "id": "type5_odfi",
+      "label": "ODFI (Type-5)",
+      "record_key": 5,
+      "field_slice_0_based": [81, 87],
+      "normalize": {
+        "strip": true,
+        "digits_only": true,
+        "skip_if_empty": true,
+        "min_len": null,
+        "max_len": null
+      }
+    },
+    {
+      "id": "type6_rdfi",
+      "label": "RDFI (Type-6)",
+      "record_key": 6,
+      "field_slice_0_based": [5, 12],
+      "normalize": {
+        "strip": true,
+        "digits_only": true,
+        "skip_if_empty": true,
+        "min_len": null,
+        "max_len": null
+      }
+    }
+  ],
+  "scoring": {
+    "method": "entropy",
+    "entropy_signed": true,
+    "minimum_total_per_metric": 1
+  },
+  "decision": {
+    "left_metric": "type5_odfi",
+    "operator": ">",
+    "right_metric": "type6_rdfi",
+    "on_equal": "if_false",
+    "on_missing_metric": "if_false",
+    "on_invalid_operator": "if_true",
+    "if_true": {
+      "ach_type": "ODFI",
+      "message": "This appears to be ODFI data."
+    },
+    "if_false": {
+      "ach_type": "RDFI",
+      "message": "This appears to be RDFI data."
+    }
+  },
+  "reporting": {
+    "top_n_values_per_metric": 10,
+    "include_value_samples": false
+  }
+}
