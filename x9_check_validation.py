@@ -894,7 +894,8 @@ def classify_transaction(row, our_aba_list):
         # DEPOSIT / ON_US / WITHDRAWAL. Both-external items are grouped as WITHDRAWAL.
         return "WITHDRAWAL"
     except Exception:
-        return "UNKNOWN"
+        # Keep output constrained to three direction types only.
+        return "WITHDRAWAL"
 
 
 def credit_debit_flag(row, our_aba_list):
@@ -2343,6 +2344,10 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     df_forward["payer_account"] = on_us_series.str.split("/").str[0].fillna("")
     df_forward["check_number"] = aux_on_us_series.where(aux_on_us_series != "", on_us_last_series)
     df_forward["TRANSACTION_TYPE"] = df_forward.apply(lambda row: classify_transaction(row, our_aba_list), axis=1)
+    allowed_direction_types = {"DEPOSIT", "ON_US", "WITHDRAWAL"}
+    df_forward["TRANSACTION_TYPE"] = df_forward["TRANSACTION_TYPE"].where(
+        df_forward["TRANSACTION_TYPE"].isin(allowed_direction_types), "WITHDRAWAL"
+    )
     df_forward["CR_DR_FLAG"] = df_forward.apply(lambda row: credit_debit_flag(row, our_aba_list), axis=1)
     df_forward["ITEM_AMOUNT_FLOAT"] = pd.to_numeric(df_forward["25_item_amount"], errors="coerce") / 100
     df_forward["onus_elements"] = on_us_series.apply(
