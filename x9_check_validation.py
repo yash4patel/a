@@ -2201,8 +2201,21 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     log_summary("File & Data Quality")
 
     return_records_present = any(r["return_records_present"] for r in structure_results) or not df_return.empty
+    xml_like_file_count = sum(
+        1 for path in x9_files if os.path.basename(path).lower().endswith(".xml")
+    )
     if df_forward.empty:
         if return_records_present:
+            log_check(
+                "Transaction Type Distribution Availability",
+                "INFO",
+                (
+                    "Skipped ON_US/DEPOSIT/WITHDRAWAL distribution because no valid RT25 forward records were available.\n"
+                    f"Input files scanned: {len(x9_files):,}\n"
+                    f"XML-like file names detected: {xml_like_file_count:,}"
+                ),
+                "Direction distribution requires valid RT25 records. This is expected for return-only runs.",
+            )
             log_check(
                 "Forward Record Availability",
                 "INFO",
@@ -2309,6 +2322,19 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
             print("\nX937 validation completed.")
             return
         else:
+            log_check(
+                "Transaction Type Distribution Availability",
+                "WARN",
+                (
+                    "Skipped ON_US/DEPOSIT/WITHDRAWAL distribution because no valid RT25 forward records were available.\n"
+                    f"Input files scanned: {len(x9_files):,}\n"
+                    f"XML-like file names detected: {xml_like_file_count:,}"
+                ),
+                (
+                    "Direction distribution requires valid RT25 records. "
+                    "If inputs are XML files, run XML validation mode; otherwise provide X9 files with 01/10/20/25 records."
+                ),
+            )
             log_check(
                 "Forward Record Availability",
                 "FAIL",
