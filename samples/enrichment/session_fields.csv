@@ -1,0 +1,4 @@
+TransactionId,Channel,UTCTimestamp,ImmutableUserID,IPAddress,SignOnId,UserAgentString
+3a65190d-3c01-46e2-05ef-403e11f59e0d,OLBRetail,1762135168,c654d961-d688-5d4c-a305-2ab67d785cee,135.315.218.31,3520006d-52be-4aa1-a70d-b95fd1e19209,Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)
+7b2c8e1f-4d12-57f3-16fg-514f22g60f1e,OLBRetail,1762135201,c654d961-d688-5d4c-a305-2ab67d785cee,135.315.218.31,3520006d-52be-4aa1-a70d-b95fd1e19209,Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)
+9c3d9f2a-5e23-68g4-27gh-625g33h71g2f,OLBRetail,1762135300,a111b222-c333-4d44-e555-f666a777b888,10.20.30.40,aaaa1111-bbbb-cccc-dddd-eeeeffff0000,Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)

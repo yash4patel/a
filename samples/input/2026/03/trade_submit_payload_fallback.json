@@ -1,0 +1,17 @@
+[
+  {
+    "TransactionId": "payload-only-trade-001",
+    "EventType": "TradeSubmit",
+    "Channel": "OLBRetail",
+    "payload": {
+      "timestamp": 1762135999,
+      "userId": "payload-user-001",
+      "clientIp": "192.0.2.10",
+      "sessionId": "payload-session-001",
+      "userAgent": "Mozilla/5.0 (payload-fallback)",
+      "symbol": "MSFT",
+      "side": "Sell",
+      "quantity": 5
+    }
+  }
+]

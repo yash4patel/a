@@ -1,0 +1,20 @@
+[GENERAL]
+tenant_name = QuestradeIncON-Retail_UAT_5044
+
+[INPUT]
+; riskengine_structured_input root (year folders underneath are fine)
+; Canada Host example:
+;   /mounts/customer-data-prod/QuestradeIncON-Retail_UAT_5044/riskengine_structured_input/2026
+structured_input_dir = ./samples/input
+
+; CSV shared by Questrade with session fields keyed by TransactionId
+; Columns: TransactionId,Channel,UTCTimestamp,ImmutableUserID,IPAddress,SignOnId,UserAgentString
+session_csv = ./samples/enrichment/session_fields.csv
+
+[OUTPUT]
+output_dir = ./samples/output
+log_dir = ./samples/output/logs
+
+[OPTIONS]
+; Event types that require RetailSessionData population
+target_events = TradeDelete,TradeEdit,TradeSubmit
