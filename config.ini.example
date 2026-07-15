@@ -1,0 +1,36 @@
+[INPUT]
+# Root of the structured input for the tenant, e.g. on tools-01:
+# mounts/customer-data-prod/QuestradeIncON-Retail_UAT_5044/riskengine_structured_input/2026
+input_dir = /path/to/QuestradeIncON-Retail_UAT_5044/riskengine_structured_input/2026
+# Comma-separated glob patterns (relative to input_dir, ** is recursive).
+input_glob = **/*
+# Customer-supplied CSV keyed by TransactionId:
+# TransactionId,Channel,UTCTimestamp,ImmutableUserID,IPAddress,SignOnId,UserAgentString
+csv_file = /path/to/questrade_session_data.csv
+
+[OUTPUT]
+output_dir = /path/to/output
+
+[GENERAL]
+tenant_name = QuestradeIncON-Retail_UAT_5044
+
+[OPTIONS]
+# inspect  - report only: where RetailSessionData sits, which fields are missing
+# dry-run  - full run, report every change that WOULD be made, no writes
+# apply    - write updated files
+mode = dry-run
+# Event types needing the backfill.
+affected_event_types = TradeDelete,TradeEdit,TradeSubmit
+# apply mode: overwrite input files (with .bak backups) instead of writing
+# fixed copies under <output_dir>/fixed/.
+in_place = false
+keep_backups = true
+# When a TransactionId is not in the CSV, extract values from the existing
+# payload (timestamp/userid/ip/session/useragent fields), mirroring how the
+# healthy reference events carry the same data.
+allow_payload_fallback = true
+# Optional inclusive date window on the event UTC timestamp (epoch seconds or
+# YYYY-MM-DD). The issue only affects new events; data shared covers
+# 20 Mar 2026 - 7 Jul 2026.
+date_from = 2026-03-20
+date_to = 2026-07-07
