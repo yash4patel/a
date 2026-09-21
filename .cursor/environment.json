@@ -1,0 +1,4 @@
+{
+  "name": "Python data validators",
+  "install": "bash .cursor/install.sh"
+}
