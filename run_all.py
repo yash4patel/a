@@ -411,13 +411,9 @@ def main():
         if getattr(config, "ai_summary_enabled", False):
             run_ai_summary(
                 report_json_path=log_manager.jsonfile,
-                base_url=getattr(config, "ollama_base_url", None),
-                model=getattr(config, "ollama_model", None),
-                dry_run=bool(getattr(config, "ai_summary_dry_run", True)),
                 allow_sensitive_evidence=bool(getattr(config, "ai_allow_sensitive_evidence", False)),
                 include_sanitized_samples=bool(getattr(config, "ai_include_sanitized_samples", False)),
                 max_samples=int(getattr(config, "ai_max_samples", 20)),
-                timeout_s=int(getattr(config, "ai_timeout_s", 180)),
             )
     except Exception as e:
         logger.warning("AI summary generation skipped/failed: {0}".format(e))

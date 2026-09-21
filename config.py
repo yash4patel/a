@@ -114,11 +114,9 @@ class Config:
         )
 
         # Optional: Generate AI/agent summary from the combined report JSON.
-        # This is designed for on-prem Ollama usage; can also run in deterministic mode without any LLM calls.
+        # Deterministic only (no LLM / no external model calls).
         self.ai_summary_enabled = conf.getboolean("ai_summary_enabled", False)
         self.ai_summary_dry_run = conf.getboolean("ai_summary_dry_run", True)
-        self.ollama_base_url = conf.get("ollama_base_url", "").strip()
-        self.ollama_model = conf.get("ollama_model", "").strip()
         self.ai_allow_sensitive_evidence = conf.getboolean(
             "ai_allow_sensitive_evidence", False
         )

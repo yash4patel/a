@@ -6,28 +6,24 @@ Run the workflow:
 python run_all.py config.sample.ini
 ```
 
-## Agent-based summary (on-prem / optional)
+## Agent-based summary (deterministic / optional)
 
-You can configure `run_all.py` to automatically generate a detailed, customer-ready summary (`*.ai_summary.md` + `*.ai_summary.json`) from the combined report JSON (`*.ACH.json`) using on-prem Ollama (optional) or deterministic mode (no LLM).
+You can configure `run_all.py` to automatically generate a detailed, customer-ready summary (`*.ai_summary.md` + `*.ai_summary.json`) from the combined report JSON (`*.ACH.json`) in deterministic mode (no external model calls).
 
 In `config.ini`, set:
 
 - `ai_summary_enabled = True`
-- `ai_summary_dry_run = True` (deterministic) **or** `False` (use Ollama)
-- `ollama_base_url = http://localhost:11434` and `ollama_model = <model>` if using Ollama
+- `ai_summary_dry_run = True` (kept for backward compatibility; summary generation is deterministic)
 
 You can still run the summarizer directly if desired:
 
 ```bash
-# Deterministic (no LLM calls)
-python ai_runner.py path/to/report.ACH.json --dry-run
-
-# LLM-assisted (Ollama). Base URL can be host or /api; tool normalizes to /api.
-python ai_runner.py path/to/report.ACH.json --ollama-url http://localhost:11434 --model llama3
+# Deterministic summary (no external model calls)
+python ai_runner.py path/to/report.ACH.json
 
 # Optional: include validator encoding-integrity sanitized samples
 # (raw previews are removed; filenames/line numbers only included if you also set --allow-sensitive-evidence)
-python ai_runner.py path/to/report.ACH.json --ollama-url http://localhost:11434 --model llama3 --include-sanitized-samples --max-samples 20
+python ai_runner.py path/to/report.ACH.json --include-sanitized-samples --max-samples 20
 ```
 
 This produces:

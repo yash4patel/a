@@ -1,14 +1,7 @@
 import json
 import os
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-
-
-@dataclass
-class OllamaConfig:
-    base_url: str
-    model: str
 
 
 def _read_json(path: str) -> Dict[str, Any]:
@@ -101,7 +94,7 @@ def _safe_extract_report_subset(
     max_samples: int = 10,
 ) -> Dict[str, Any]:
     """
-    Only pass derived/aggregated data to the LLM.
+    Generate a derived/aggregated subset for reporting.
     Avoid raw ACH lines. Even though the validator may include samples, those can contain sensitive content.
     """
     sections = report.get("sections") or {}
@@ -148,105 +141,9 @@ def _safe_extract_report_subset(
     }
     return subset
 
-
-def _normalize_ollama_base_url(s: str) -> str:
-    """
-    Accepts any of:
-    - https://host
-    - https://host/api
-    - https://host/api/generate
-    Normalizes to the API base URL that ends with /api.
-    """
-    u = (s or "").strip()
-    if not u:
-        return ""
-    u = u.rstrip("/")
-    if u.endswith("/api/generate"):
-        u = u[: -len("/generate")]
-    if not u.endswith("/api"):
-        u = u + "/api"
-    return u
-
-
-def _ollama_generate(cfg: OllamaConfig, prompt: str, timeout_s: int = 180) -> str:
-    """
-    Uses `ollama_python` if available (matches your reference snippet).
-    Falls back to raw HTTP if needed.
-    """
-    try:
-        from ollama_python.endpoints import GenerateAPI  # type: ignore
-
-        api = GenerateAPI(base_url=cfg.base_url, model=cfg.model)
-        result = api.generate(prompt=prompt, stream=False)
-        return getattr(result, "response", "") or ""
-    except Exception:
-        # Raw HTTP fallback
-        import urllib.request
-
-        payload = json.dumps({"model": cfg.model, "prompt": prompt, "stream": False}).encode("utf-8")
-        req = urllib.request.Request(
-            cfg.base_url.rstrip("/") + "/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-            return data.get("response", "")
-
-
-def _agent_prompts(report_subset: Dict[str, Any]) -> Dict[str, str]:
-    report_json = json.dumps(report_subset, indent=2, ensure_ascii=False)
-
-    system_guardrails = (
-        "You are analyzing outputs from deterministic ACH validation scripts.\n"
-        "Do NOT invent facts that are not in the JSON.\n"
-        "Do NOT request raw ACH file contents.\n"
-        "When you make a claim, cite the JSON path (e.g., sections.ach_mdv_validator.totals...).\n"
-        "Output must be concise and customer-friendly.\n"
-    )
-
-    prompts = {}
-
-    prompts["analyst"] = (
-        system_guardrails
-        + "\nTask: Summarize validation results and failures.\n"
-        + "Return JSON with keys: overall_status, key_findings[], metrics{}, evidence_paths[].\n"
-        + "Input JSON:\n"
-        + report_json
-    )
-
-    prompts["nacha_sme"] = (
-        system_guardrails
-        + "\nTask: Explain findings in NACHA terms (Type-7 addenda, returns/NOCs, SEC code alignment).\n"
-        + "Return Markdown bullets with: What it means, Why it matters, Evidence.\n"
-        + "Input JSON:\n"
-        + report_json
-    )
-
-    prompts["remediation"] = (
-        system_guardrails
-        + "\nTask: Provide remediation steps for customer.\n"
-        + "Return JSON with keys: priorities[], rerun_steps[], customer_questions[].\n"
-        + "Input JSON:\n"
-        + report_json
-    )
-
-    prompts["report_writer"] = (
-        system_guardrails
-        + "\nTask: Produce a customer-ready report.\n"
-        + "Return Markdown with headings: Executive Summary, Key Metrics, Findings, Evidence, Next Steps.\n"
-        + "Input JSON:\n"
-        + report_json
-    )
-
-    return prompts
-
-
 def _deterministic_markdown(report: Dict[str, Any]) -> str:
     """
-    Produce a detailed summary without any model calls.
-    This is used for --dry-run/--no-llm and as a fallback if Ollama is unreachable.
+    Produce a detailed summary without any external model calls.
     """
     sections = report.get("sections") or {}
     ach = sections.get("ach_mdv_validator") or {}
@@ -353,7 +250,7 @@ def _deterministic_markdown(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("- Fix upstream encoding/special-byte injection before RiskEngine ingestion if encoding integrity is flagged.")
     lines.append("- Re-run `python run_all.py <config.ini>` to regenerate `.ACH.log` + `.ACH.json`.")
-    lines.append("- Generate this report from the combined JSON: `python ai_runner.py <report.ACH.json> --dry-run` (deterministic) or configure Ollama for LLM-assisted write-up.")
+    lines.append("- Generate this report from the combined JSON: `python ai_runner.py <report.ACH.json>`.")
     lines.append("")
 
     return "\n".join(lines)
@@ -363,13 +260,9 @@ def run_ai_summary(
     *,
     report_json_path: str,
     out_base_path: Optional[str] = None,
-    base_url: Optional[str] = None,
-    model: Optional[str] = None,
-    dry_run: bool = False,
     allow_sensitive_evidence: bool = False,
     include_sanitized_samples: bool = False,
     max_samples: int = 10,
-    timeout_s: int = 180,
 ) -> Tuple[str, str]:
     """
     Generates two files next to the combined report JSON:
@@ -385,11 +278,6 @@ def run_ai_summary(
         max_samples=max_samples,
     )
 
-    cfg = OllamaConfig(
-        base_url=_normalize_ollama_base_url(base_url or os.environ.get("OLLAMA_BASE_URL", "").strip()),
-        model=model or os.environ.get("OLLAMA_MODEL", "").strip(),
-    )
-
     if out_base_path:
         base = out_base_path
     else:
@@ -400,97 +288,16 @@ def run_ai_summary(
     out_json = base + ".ai_summary.json"
     out_md = base + ".ai_summary.md"
 
-    prompts = _agent_prompts(subset)
-
     started = datetime.now().isoformat(timespec="seconds")
-    llm_error: Optional[str] = None
-    deterministic_md = _deterministic_markdown(report)
-
-    if dry_run:
-        analyst_raw = json.dumps(
-            {
-                "overall_status": "DRY_RUN",
-                "key_findings": ["LLM calls disabled (--dry-run/--no-llm)."],
-                "metrics": {},
-                "evidence_paths": [],
-            }
-        )
-        nacha_raw = "- Dry run (no LLM).\n"
-        remediation_raw = json.dumps(
-            {
-                "priorities": ["Review deterministic report and address any FAILED sections."],
-                "rerun_steps": ["Re-run without --dry-run once Ollama is reachable."],
-                "customer_questions": [],
-            }
-        )
-        report_md = deterministic_md
-    else:
-        if not cfg.base_url or not cfg.model:
-            llm_error = "Missing OLLAMA base URL or model (set flags or env vars). Falling back to deterministic report."
-            analyst_raw = json.dumps(
-                {
-                    "overall_status": "LLM_UNAVAILABLE",
-                    "key_findings": [llm_error],
-                    "metrics": {},
-                    "evidence_paths": [],
-                }
-            )
-            nacha_raw = "- LLM unavailable; see deterministic report.\n"
-            remediation_raw = json.dumps(
-                {
-                    "priorities": ["Configure local/on-prem Ollama if LLM summarization is desired."],
-                    "rerun_steps": ["Set OLLAMA_BASE_URL and OLLAMA_MODEL, then re-run ai_runner."],
-                    "customer_questions": [],
-                }
-            )
-            report_md = deterministic_md
-        else:
-            try:
-                analyst_raw = _ollama_generate(cfg, prompts["analyst"], timeout_s=timeout_s)
-                nacha_raw = _ollama_generate(cfg, prompts["nacha_sme"], timeout_s=timeout_s)
-                remediation_raw = _ollama_generate(cfg, prompts["remediation"], timeout_s=timeout_s)
-                report_md = _ollama_generate(cfg, prompts["report_writer"], timeout_s=timeout_s) or ""
-                if not report_md.strip():
-                    report_md = deterministic_md
-            except Exception as e:
-                llm_error = f"LLM call failed ({type(e).__name__}): {e}. Falling back to deterministic report."
-                analyst_raw = json.dumps(
-                    {
-                        "overall_status": "LLM_UNAVAILABLE",
-                        "key_findings": [llm_error],
-                        "metrics": {},
-                        "evidence_paths": [],
-                    }
-                )
-                nacha_raw = "- LLM call failed; see deterministic report.\n"
-                remediation_raw = json.dumps(
-                    {
-                        "priorities": ["Use deterministic report for remediation until LLM endpoint is available."],
-                        "rerun_steps": ["Verify DNS/network access to Ollama and re-run ai_runner."],
-                        "customer_questions": [],
-                    }
-                )
-                report_md = deterministic_md
+    report_md = _deterministic_markdown(report)
     finished = datetime.now().isoformat(timespec="seconds")
-
-    # Try to parse the structured agent outputs if they are JSON
-    def _maybe_json(s: str) -> Any:
-        try:
-            return json.loads(s)
-        except Exception:
-            return {"raw": s}
 
     ai_payload = {
         "ai_summary_version": 1,
-        "model": {"base_url": cfg.base_url, "model": cfg.model, "dry_run": bool(dry_run)},
+        "mode": "deterministic",
         "timestamps": {"started_at": started, "finished_at": finished},
         "inputs": {"report_json_path": report_json_path},
-        "llm_error": llm_error,
-        "analysis": {
-            "analyst": _maybe_json(analyst_raw),
-            "nacha_sme": {"markdown": nacha_raw},
-            "remediation": _maybe_json(remediation_raw),
-        },
+        "report_subset": subset,
     }
 
     _write_json(out_json, ai_payload)
@@ -503,31 +310,22 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser()
     ap.add_argument("report_json_path", help="Path to combined *.ACH.json report")
-    ap.add_argument("--base-url", default=None, help="Ollama base URL (e.g. https://host/api)")
-    ap.add_argument("--ollama-url", default=None, help="Alias for --base-url")
-    ap.add_argument("--model", default=None)
     ap.add_argument("--out-base", default=None, help="Output base path without extension")
-    ap.add_argument("--dry-run", "--no-llm", action="store_true", help="Write outputs without calling the LLM")
-    ap.add_argument("--allow-sensitive-evidence", action="store_true", help="Allow filenames/line numbers in LLM input (NOT recommended)")
+    ap.add_argument("--allow-sensitive-evidence", action="store_true", help="Allow filenames/line numbers in report output (NOT recommended)")
     ap.add_argument(
         "--include-sanitized-samples",
         action="store_true",
-        help="Include validator 'encoding_integrity.samples' after removing raw previews (still derived; may include filenames/line numbers if --allow-sensitive-evidence is set).",
+        help="Include validator 'encoding_integrity.samples' after removing raw previews (may include filenames/line numbers if --allow-sensitive-evidence is set).",
     )
-    ap.add_argument("--max-samples", type=int, default=10, help="Max sanitized samples to include in LLM input")
-    ap.add_argument("--timeout-s", type=int, default=180, help="HTTP timeout seconds for Ollama requests")
+    ap.add_argument("--max-samples", type=int, default=10, help="Max sanitized samples to include in report output")
     args = ap.parse_args()
 
     j, m = run_ai_summary(
         report_json_path=args.report_json_path,
         out_base_path=args.out_base,
-        base_url=args.base_url or args.ollama_url,
-        model=args.model,
-        dry_run=bool(args.dry_run),
         allow_sensitive_evidence=bool(args.allow_sensitive_evidence),
         include_sanitized_samples=bool(args.include_sanitized_samples),
         max_samples=int(args.max_samples),
-        timeout_s=int(args.timeout_s),
     )
     print(j)
     print(m)
