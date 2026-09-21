@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local artifacts
+tmp_ai/
+log/
+*.log
+*.ai_summary.md
+*.ai_summary.json
+.smoke/
+.smoke_mdv/
+.smoke_rc/
+
+# Only ignore generated workflow JSON, not all JSON in the repo
+*.ACH.json
+
+# Cloud-agent smoke test artifacts
+.smoke/
+

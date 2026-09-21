@@ -1,0 +1,1244 @@
+import json
+import os
+import re
+import traceback
+from copy import deepcopy
+from datetime import date, timedelta
+
+import folder_tools
+
+
+class BatchDateCompletenessAnalyzer:
+    """
+    Date completeness check. Minimal console output: only interactive date detection prints plus final PASS/FAIL.
+    All details (errors, warnings, info) go to the log file.
+    """
+
+    def __init__(self, config, log_manager):
+        self.config = config
+        self.log = log_manager
+        self.logger = log_manager.logger
+        self.metadata = self._load_metadata()
+
+    def _deep_merge_dicts(self, base, override):
+        """
+        Deep-merge JSON-shaped dicts (override wins).
+        Lists are replaced (not merged).
+        """
+        if not isinstance(base, dict) or not isinstance(override, dict):
+            return deepcopy(override)
+        merged = deepcopy(base)
+        for k, v in override.items():
+            if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+                merged[k] = self._deep_merge_dicts(merged[k], v)
+            else:
+                merged[k] = deepcopy(v)
+        return merged
+
+    def _load_metadata(self):
+        meta = self._build_default_metadata()
+        override = getattr(self.config, "batch_data_metadata", None)
+        if isinstance(override, dict) and override:
+            meta = self._deep_merge_dicts(meta, override)
+        return meta
+
+    def _build_default_metadata(self):
+        # JSON-shaped metadata object (in-code) that drives runtime behavior.
+        # This mirrors the example schema you shared and can be overridden via config/callsite.
+        return {
+            "section_name": "Batch Date Completeness",
+            "defaults": {"ach_type": "ODFI", "extension": "ACH", "record_type_to_count": 5},
+            "date_detection": {
+                "sample_size": 10,
+                "preview_count": 3,
+                "validation_sample_count": 3,
+                "strip_extension": True,
+                "preferred_format": None,
+                "allow_other_detected_formats_as_fallback": True,
+            },
+            "date_formats": [
+                # Prefer explicit date+time tokens (prevents accidentally matching YYMMDD inside epoch-like numbers).
+                {
+                    "name": "YYMMDDHHMMSS",
+                    "regex": r"(?<!\d)(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])([01]\d|2[0-3])([0-5]\d)([0-5]\d)(?!\d)",
+                    "group_order": ["year", "month", "day"],
+                    "two_digit_year": {"base": 2000, "min": 0, "max": 50},
+                },
+                {
+                    "name": "YYYYMMDDHHMMSS",
+                    "regex": r"(?<!\d)((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])([01]\d|2[0-3])([0-5]\d)([0-5]\d)(?!\d)",
+                    "group_order": ["year", "month", "day"],
+                },
+                {
+                    "name": "YYYYMMDD",
+                    "regex": r"(?<!\d)((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)",
+                    "group_order": ["year", "month", "day"],
+                },
+                {
+                    "name": "YYMMDD",
+                    "regex": r"(?<!\d)(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)",
+                    "group_order": ["year", "month", "day"],
+                    "two_digit_year": {"base": 2000, "min": 0, "max": 50},
+                },
+                {
+                    "name": "YYYY-MM-DD",
+                    "regex": r"(?<!\d)((?:19|20)\d{2})[-_/](0[1-9]|1[0-2])[-_/](0[1-9]|[12]\d|3[01])(?!\d)",
+                    "group_order": ["year", "month", "day"],
+                },
+                {
+                    "name": "DDMMYYYY",
+                    "regex": r"(?<!\d)(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])((?:19|20)\d{2})(?!\d)",
+                    "group_order": ["day", "month", "year"],
+                },
+                {
+                    "name": "MMDDYYYY",
+                    "regex": r"(?<!\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])((?:19|20)\d{2})(?!\d)",
+                    "group_order": ["month", "day", "year"],
+                },
+            ],
+            "ach_type_rules": {
+                "ODFI": {
+                    "required_days": 90,
+                    "requirement_label": "3 MONTHS (90 DAYS) OF DATA",
+                },
+                "RDFI": {
+                    "required_days": 180,
+                    "requirement_label": "6 MONTHS (180 DAYS) OF DATA",
+                },
+            },
+            "record_detection": {
+                "default_record_type": 5,
+                "encoding": "ascii",
+                "decode_errors": "replace",
+                "auto_switch_if_missing": True,
+                "fallback_order": [6, "first_available"],
+            },
+            "date_range": {"count_mode": "inclusive", "fill_missing_dates": True},
+            "calendar": {
+                "exclude_weekends": True,
+                "holiday_calendar": "USFederalHolidayCalendar",
+            },
+            "anomaly_rules": {
+                "low_volume_ratio": 0.1,
+                "high_volume_ratio": 2.0,
+                "zero_reference_strategy": "non_zero_median",
+            },
+        }
+
+    def _meta(self, *path, default=None):
+        cur = self.metadata
+        for p in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(p)
+        return cur if cur is not None else default
+
+    def _parse_slice(self, slice_text):
+        """
+        Parse a 0-based slice string like "18:24" into (start, end).
+        End is exclusive, matching Python slicing and JS substring semantics.
+        """
+        if not slice_text or not isinstance(slice_text, str):
+            return None
+        raw = slice_text.strip()
+        if not raw:
+            return None
+        # Allow "18:24" or "18,24"
+        sep = ":" if ":" in raw else ("," if "," in raw else None)
+        if not sep:
+            return None
+        parts = [p.strip() for p in raw.split(sep, 1)]
+        if len(parts) != 2:
+            return None
+        try:
+            start = int(parts[0])
+            end = int(parts[1])
+        except Exception:
+            return None
+        if end <= start:
+            return None
+        return start, end
+
+    def _parse_date_digits(self, digits, two_digit_base, two_digit_max):
+        if digits is None:
+            raise ValueError("date is missing")
+        d = str(digits)
+        d = re.sub(r"\D", "", d)
+        if len(d) >= 8 and d[:4].isdigit():
+            yyyy = int(d[:4])
+            if 1900 <= yyyy <= 2099:
+                y = yyyy
+                m = int(d[4:6])
+                day = int(d[6:8])
+                date(y, m, day)
+                return y, m, day
+        if len(d) >= 6:
+            yy = int(d[:2])
+            m = int(d[2:4])
+            day = int(d[4:6])
+            # Pivot: yy <= max => base+yy else (base-100)+yy
+            base = int(two_digit_base)
+            pivot = int(two_digit_max)
+            y = base + yy if yy <= pivot else (base - 100) + yy
+            date(y, m, day)
+            return y, m, day
+        raise ValueError("date digits not parseable: {0}".format(digits))
+
+    def _parse_time_digits(self, digits, suffix=""):
+        if digits is None:
+            raise ValueError("time is missing")
+        t = str(digits)
+        t = re.sub(r"\D", "", t)
+        if suffix:
+            t = "{0}{1}".format(t, re.sub(r"\D", "", str(suffix)))
+        if len(t) < 4:
+            raise ValueError("time digits not parseable: {0}".format(digits))
+        # Validate HHMMSS (or HHMM + optional suffix)
+        hh = int(t[0:2])
+        mm = int(t[2:4])
+        ss = int(t[4:6]) if len(t) >= 6 else 0
+        if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+            raise ValueError("invalid time: {0}".format(t))
+        return t
+
+    def _extract_js_like_substring_rule(self, expr, label_hint=None):
+        """
+        Parse a JS-like expression containing FILENAME.substring(a,b) and optional + '000' suffix.
+        Returns dict: {slice: (a,b), suffix: '000' or '', strip_non_digits: bool}
+        This is a parser only (no JS execution).
+        """
+        if not expr:
+            return None
+        s = str(expr)
+        # If label_hint is provided, try to find substring after that variable assignment.
+        # Otherwise just find the first substring().
+        target = s
+        if label_hint:
+            m = re.search(r"\b" + re.escape(label_hint) + r"\b\s*=", s, flags=re.IGNORECASE)
+            if m:
+                target = s[m.start() :]
+
+        m_sub = re.search(r"substring\(\s*(\d+)\s*,\s*(\d+)\s*\)", target, flags=re.IGNORECASE)
+        if not m_sub:
+            return None
+        a = int(m_sub.group(1))
+        b = int(m_sub.group(2))
+        if b <= a:
+            return None
+
+        # Suffix like + '000' or + \"000\"
+        suffix = ""
+        after = target[m_sub.end() :]
+        m_suf = re.search(r"\+\s*['\"](\d+)['\"]", after)
+        if m_suf:
+            suffix = m_suf.group(1)
+
+        # If expression includes a replace() that strips non-digits/separators, treat as strip_non_digits.
+        strip_non_digits = False
+        if re.search(r"\.replace\(\s*/[^)]*/g\s*,\s*['\"]{0,1}\s*['\"]{0,1}\s*\)", target):
+            strip_non_digits = True
+        if re.search(r"replace\(\s*/\\D/g", target):
+            strip_non_digits = True
+        if re.search(r"replace\(\s*/\[\^0-9\]/g", target):
+            strip_non_digits = True
+
+        return {"slice": (a, b), "suffix": suffix, "strip_non_digits": strip_non_digits}
+
+    def _get_js_like_filename_date_parser(self):
+        """
+        Optional: config.ini-driven JS-like substring rules.
+        Supports either a combined `filename_datetime_expr` or separate `filename_date_expr`/`filename_time_expr`.
+        """
+        combined = str(getattr(self.config, "filename_datetime_expr", "") or "").strip()
+        date_expr = str(getattr(self.config, "filename_date_expr", "") or "").strip()
+        time_expr = str(getattr(self.config, "filename_time_expr", "") or "").strip()
+
+        if not (combined or date_expr or time_expr):
+            return None, None
+
+        strip_ext = bool(getattr(self.config, "filename_datetime_strip_extension", True))
+        # default strip_non_digits can be overridden by presence of replace() in expr
+        default_strip = bool(getattr(self.config, "filename_datetime_strip_non_digits", True))
+        base = int(getattr(self.config, "filename_two_digit_year_base", 2000) or 2000)
+        ymax = int(getattr(self.config, "filename_two_digit_year_max", 50) or 50)
+
+        if combined:
+            date_rule = self._extract_js_like_substring_rule(combined, label_hint="DATE")
+            time_rule = self._extract_js_like_substring_rule(combined, label_hint="TIME")
+            # fallback: first substring is DATE, second is TIME
+            if not date_rule:
+                date_rule = self._extract_js_like_substring_rule(combined, label_hint=None)
+            if not time_rule:
+                # search after first match to find the second substring
+                first = re.search(r"substring\(\s*(\d+)\s*,\s*(\d+)\s*\)", combined, flags=re.IGNORECASE)
+                if first:
+                    tail = combined[first.end() :]
+                    time_rule = self._extract_js_like_substring_rule(tail, label_hint=None)
+        else:
+            date_rule = self._extract_js_like_substring_rule(date_expr, label_hint=None) if date_expr else None
+            time_rule = self._extract_js_like_substring_rule(time_expr, label_hint=None) if time_expr else None
+
+        if not date_rule or not date_rule.get("slice"):
+            return None, None
+
+        def parser(filename):
+            name = os.path.basename(str(filename))
+            if strip_ext and "." in name:
+                name = name.rsplit(".", 1)[0]
+
+            ds, de = date_rule["slice"]
+            date_raw = name[ds:de]
+            strip_date = default_strip or bool(date_rule.get("strip_non_digits"))
+            if strip_date:
+                date_raw = re.sub(r"\D", "", str(date_raw))
+            y, mo, da = self._parse_date_digits(date_raw, base, ymax)
+
+            if time_rule and time_rule.get("slice"):
+                ts, te = time_rule["slice"]
+                time_raw = name[ts:te]
+                strip_time = default_strip or bool(time_rule.get("strip_non_digits"))
+                if strip_time:
+                    time_raw = re.sub(r"\D", "", str(time_raw))
+                self._parse_time_digits(time_raw, suffix=str(time_rule.get("suffix") or ""))
+            return int(y), int(mo), int(da)
+
+        desc = "js-like substring rule(s) from config"
+        return parser, desc
+
+    def _get_configured_filename_date_parser(self):
+        """
+        Optional: config.ini-driven filename DATE/TIME extraction.
+        Returns (parser_fn, description) or (None, None).
+        """
+        # Highest precedence: JS-like substring expressions (DATE/TIME) provided via config.ini.
+        js_parser, js_desc = self._get_js_like_filename_date_parser()
+        if js_parser:
+            return js_parser, js_desc
+
+        filenameformat = str(getattr(self.config, "filenameformat", "") or "").strip().upper()
+
+        mode = str(getattr(self.config, "filename_datetime_mode", "auto") or "auto").strip().lower()
+        # Preferred/standard format: ACH_<13-digit-epoch-ms>_<YYYYMMDDHHmmss or YYMMDDHHmmss>_*.ACH
+        if filenameformat == "GENERIC":
+            strip_ext = bool(getattr(self.config, "filename_datetime_strip_extension", True))
+            base = int(getattr(self.config, "filename_two_digit_year_base", 2000) or 2000)
+            ymax = int(getattr(self.config, "filename_two_digit_year_max", 50) or 50)
+            rx = re.compile(r"^ACH_(\d{13})_(\d{12}|\d{14})_")
+
+            def parser(filename):
+                name = os.path.basename(str(filename))
+                if strip_ext and "." in name:
+                    name = name.rsplit(".", 1)[0]
+                m = rx.search(name)
+                if not m:
+                    raise ValueError("filenameformat=GENERIC did not match expected pattern")
+                dt = m.group(2)
+                # YYYYMMDDHHMMSS (14) OR YYMMDDHHMMSS (12)
+                if len(dt) == 14:
+                    date_raw = dt[:8]
+                    time_raw = dt[8:14]
+                    y, mo, da = self._parse_date_digits(date_raw, base, ymax)
+                else:
+                    date_raw = dt[:6]
+                    time_raw = dt[6:12]
+                    y, mo, da = self._parse_date_digits(date_raw, base, ymax)
+                # Validate time; GENERIC does not require it for analysis but we validate for safety.
+                self._parse_time_digits(time_raw, suffix="")
+                return int(y), int(mo), int(da)
+
+            return parser, "filenameformat=GENERIC (ACH_<epoch-ms>_<dateTime>_...)"
+
+        # If PSE provides a filenameformat but it's not GENERIC, treat it as "custom" and require
+        # explicit substring/regex config (no guessing/prompting by default).
+        if filenameformat and filenameformat != "GENERIC" and mode in ("", "auto", "none"):
+            # Infer mode from provided keys to reduce config friction.
+            if str(getattr(self.config, "filename_date_slice", "") or "").strip():
+                mode = "substring"
+            elif str(getattr(self.config, "filename_datetime_regex", "") or "").strip():
+                mode = "regex"
+            else:
+                return None, None
+
+        if mode in ("", "auto", "none"):
+            return None, None
+
+        strip_ext = bool(getattr(self.config, "filename_datetime_strip_extension", True))
+        strip_non_digits = bool(getattr(self.config, "filename_datetime_strip_non_digits", True))
+        base = int(getattr(self.config, "filename_two_digit_year_base", 2000) or 2000)
+        ymax = int(getattr(self.config, "filename_two_digit_year_max", 50) or 50)
+
+        if mode == "substring":
+            date_sl = self._parse_slice(getattr(self.config, "filename_date_slice", "") or "")
+            time_sl = self._parse_slice(getattr(self.config, "filename_time_slice", "") or "")
+            time_suffix = str(getattr(self.config, "filename_time_suffix", "") or "")
+            if not date_sl:
+                return None, None
+
+            def parser(filename):
+                name = os.path.basename(str(filename))
+                if strip_ext and "." in name:
+                    name = name.rsplit(".", 1)[0]
+                ds, de = date_sl
+                date_raw = name[ds:de]
+                if strip_non_digits:
+                    date_raw = re.sub(r"\D", "", str(date_raw))
+                y, m, d = self._parse_date_digits(date_raw, base, ymax)
+                if time_sl:
+                    ts, te = time_sl
+                    time_raw = name[ts:te]
+                    if strip_non_digits:
+                        time_raw = re.sub(r"\D", "", str(time_raw))
+                    self._parse_time_digits(time_raw, suffix=time_suffix)
+                return y, m, d
+
+            desc = "substring date={0} time={1}".format(
+                getattr(self.config, "filename_date_slice", ""),
+                getattr(self.config, "filename_time_slice", "") or "(none)",
+            )
+            return parser, desc
+
+        if mode == "regex":
+            regex = str(getattr(self.config, "filename_datetime_regex", "") or "").strip()
+            if not regex:
+                return None, None
+            try:
+                rx = re.compile(regex)
+            except Exception as e:
+                self.logger.error("Invalid filename_datetime_regex: {0}".format(e))
+                return None, None
+
+            time_suffix = str(getattr(self.config, "filename_time_suffix", "") or "")
+
+            def parser(filename):
+                name = os.path.basename(str(filename))
+                if strip_ext and "." in name:
+                    name = name.rsplit(".", 1)[0]
+                mobj = rx.search(name)
+                if not mobj:
+                    raise ValueError("regex did not match filename")
+                gd = mobj.groupdict() or {}
+                if "date" in gd and gd.get("date") is not None:
+                    date_raw = gd.get("date")
+                    if strip_non_digits:
+                        date_raw = re.sub(r"\D", "", str(date_raw))
+                    y, mo, da = self._parse_date_digits(date_raw, base, ymax)
+                else:
+                    y_raw = gd.get("year") or gd.get("yyyy") or gd.get("y")
+                    m_raw = gd.get("month") or gd.get("mm") or gd.get("m")
+                    d_raw = gd.get("day") or gd.get("dd") or gd.get("d")
+                    if y_raw is None or m_raw is None or d_raw is None:
+                        raise ValueError("regex must provide date group(s)")
+                    y_str = re.sub(r"\D", "", str(y_raw))
+                    if len(y_str) == 2:
+                        yy = int(y_str)
+                        y = base + yy if yy <= ymax else (base - 100) + yy
+                    else:
+                        y = int(y_str)
+                    mo = int(re.sub(r"\D", "", str(m_raw)))
+                    da = int(re.sub(r"\D", "", str(d_raw)))
+                    date(y, mo, da)
+                    y, mo, da = y, mo, da
+
+                if "time" in gd and gd.get("time") is not None:
+                    time_raw = gd.get("time")
+                    if strip_non_digits:
+                        time_raw = re.sub(r"\D", "", str(time_raw))
+                    self._parse_time_digits(time_raw, suffix=time_suffix)
+                return int(y), int(mo), int(da)
+
+            desc = "regex {0}".format(regex)
+            return parser, desc
+
+        # Unknown mode => ignore (fallback to auto)
+        return None, None
+
+    def extract_date_patterns(self, filename):
+        """
+        Extract all possible date patterns from a filename using regex.
+        Returns list of (pattern_type, year, month, day) tuples.
+        """
+        possible_dates = []
+        strip_ext = bool(self._meta("date_detection", "strip_extension", default=True))
+        name = filename.rsplit(".", 1)[0] if strip_ext else filename
+
+        date_formats = self._meta("date_formats", default=[])
+        if not isinstance(date_formats, list):
+            date_formats = []
+
+        for fmt in date_formats:
+            if not isinstance(fmt, dict):
+                continue
+            name_key = str(fmt.get("name") or "").strip()
+            regex = fmt.get("regex")
+            group_order = fmt.get("group_order")
+            if not name_key or not regex or not isinstance(group_order, list):
+                continue
+
+            matches = re.findall(regex, name)
+            for match in matches:
+                try:
+                    groups = list(match) if isinstance(match, (list, tuple)) else [match]
+                    parts = {}
+                    for idx, label in enumerate(group_order):
+                        parts[label] = int(groups[idx])
+
+                    # Handle two-digit year rule if configured
+                    if "two_digit_year" in fmt and "year" in parts:
+                        td = fmt.get("two_digit_year") or {}
+                        base = int(td.get("base", 2000))
+                        ymin = int(td.get("min", 0))
+                        ymax = int(td.get("max", 50))
+                        yy = int(parts["year"])
+                        if ymin <= yy <= ymax:
+                            parts["year"] = base + yy
+                        else:
+                            # outside allowed range => skip this match
+                            continue
+
+                    y = int(parts.get("year"))
+                    m = int(parts.get("month"))
+                    d = int(parts.get("day"))
+                    date(y, m, d)  # validate
+                    possible_dates.append((name_key, y, m, d))
+                except Exception:
+                    continue
+
+        return possible_dates
+
+    def find_file_date_type(self, sample_filenames):
+        """
+        Auto-detect date format from sample filenames using pattern matching.
+        Returns a parser function that works for the detected format.
+        """
+        all_patterns = {}
+
+        for fname in sample_filenames:
+            possible_dates = self.extract_date_patterns(fname)
+
+            for pattern_type, year, month, day in possible_dates:
+                if pattern_type not in all_patterns:
+                    all_patterns[pattern_type] = []
+                all_patterns[pattern_type].append((fname, year, month, day))
+
+        preferred = self._meta("date_detection", "preferred_format", default=None)
+        allow_fallback = bool(
+            self._meta(
+                "date_detection",
+                "allow_other_detected_formats_as_fallback",
+                default=True,
+            )
+        )
+        best_pattern = None
+        best_count = 0
+
+        # If preferred format is explicitly set and detected, choose it.
+        if preferred and preferred in all_patterns:
+            best_pattern = preferred
+            best_count = len(set(m[0] for m in all_patterns.get(preferred, [])))
+        else:
+            preferred = None
+        for pattern_type, matches in all_patterns.items():
+            unique_files = len(set(m[0] for m in matches))
+            if unique_files > best_count:
+                best_count = unique_files
+                best_pattern = pattern_type
+
+        if best_pattern is None or best_count == 0:
+            self.logger.error("Could not detect any date pattern in sample files")
+            return None
+
+        self.logger.info(f"Auto-detected date format: {best_pattern}")
+        self.logger.info(
+            f"Pattern found in {best_count}/{len(sample_filenames)} sample files"
+        )
+
+        def generic_parser(filename):
+            dates = self.extract_date_patterns(filename)
+
+            for pattern_type, year, month, day in dates:
+                if pattern_type == best_pattern:
+                    return year, month, day
+
+            if allow_fallback and dates:
+                return dates[0][1], dates[0][2], dates[0][3]
+
+            raise ValueError(f"No date found matching pattern {best_pattern}")
+
+        return generic_parser
+
+    def manual_date_input_fallback(self):
+        """
+        Fallback method: Ask user to provide date format manually.
+        Returns a custom parser function based on user input.
+        """
+        print("\n" + "=" * 60)
+        print("UNABLE TO AUTO-DETECT DATE FORMAT")
+        print("=" * 60)
+        print("\nPlease specify the date format in your filenames.")
+        print("\nExamples:")
+        print("  1. YYYYMMDD (e.g., 20260109)")
+        print("  2. YYMMDD (e.g., 260109)")
+        print("  3. DDMMYYYY (e.g., 09012026)")
+        print("  4. MMDDYYYY (e.g., 01092026)")
+        print("  5. Custom regex pattern")
+        print("  6. Exit analysis")
+
+        choice = input("\nEnter your choice (1-6): ").strip()
+
+        if choice == "1":
+            pattern = input(
+                "Enter regex to capture YYYYMMDD (or press Enter for auto): "
+            ).strip()
+            if not pattern:
+                pattern = r"((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])"
+
+            def parser(filename):
+                match = re.search(pattern, filename)
+                if match:
+                    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+                raise ValueError("Pattern not found")
+
+            return parser
+
+        elif choice == "2":
+            pattern = input(
+                "Enter regex to capture YYMMDD (or press Enter for auto): "
+            ).strip()
+            if not pattern:
+                pattern = r"(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])"
+
+            def parser(filename):
+                match = re.search(pattern, filename)
+                if match:
+                    year = 2000 + int(match.group(1))
+                    return year, int(match.group(2)), int(match.group(3))
+                raise ValueError("Pattern not found")
+
+            return parser
+
+        elif choice == "3":
+
+            def parser(filename):
+                match = re.search(
+                    r"(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])((?:19|20)\d{2})",
+                    filename,
+                )
+                if match:
+                    return int(match.group(3)), int(match.group(2)), int(match.group(1))
+                raise ValueError("Pattern not found")
+
+            return parser
+
+        elif choice == "4":
+
+            def parser(filename):
+                match = re.search(
+                    r"(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])((?:19|20)\d{2})",
+                    filename,
+                )
+                if match:
+                    return int(match.group(3)), int(match.group(1)), int(match.group(2))
+                raise ValueError("Pattern not found")
+
+            return parser
+
+        elif choice == "5":
+            print("\nEnter a Python regex with 3 capture groups: (year), (month), (day)")
+            print(r"Example: r'ACH_(\d{4})(\d{2})(\d{2})'")
+            pattern = input("Regex pattern: ").strip()
+
+            def parser(filename):
+                match = re.search(pattern, filename)
+                if match and len(match.groups()) == 3:
+                    year = int(match.group(1))
+                    month = int(match.group(2))
+                    day = int(match.group(3))
+                    if year < 100:
+                        year = 2000 + year
+                    return year, month, day
+                raise ValueError("Pattern not found or incorrect groups")
+
+            return parser
+
+        else:
+            return None
+
+    def count_record_types(self, file_path):
+        """
+        Count all record types in an ACH file.
+        """
+        record_counts = {}
+        encoding = str(self._meta("record_detection", "encoding", default="ascii") or "ascii")
+        decode_errors = str(
+            self._meta("record_detection", "decode_errors", default="replace") or "replace"
+        )
+        try:
+            with open(file_path, "rb") as f:
+                for line_bytes in f:
+                    try:
+                        first = line_bytes[:1].decode(encoding, decode_errors)
+                        if first and first.isdigit():
+                            key = int(first)
+                            record_counts[key] = record_counts.get(key, 0) + 1
+                    except Exception:
+                        continue
+        except Exception as e:
+            self.logger.error(f"Error reading file {file_path}: {e}")
+
+        return record_counts
+
+    def analyze(self, ach_type=None, extension=None, record_type_to_count=None):
+        """
+        Analyze ACH batch date completeness.
+        Parameters:
+        - ach_type: "ODFI" or "RDFI" (determines required days)
+        - extension: File extension to filter (default "ACH")
+        - record_type_to_count: Which record type to count (default 5)
+        """
+        ach_type = (ach_type or self._meta("defaults", "ach_type", default="ODFI") or "ODFI").strip()
+        extension = (extension or self._meta("defaults", "extension", default="ACH") or "ACH").strip()
+        if record_type_to_count is None:
+            record_type_to_count = self._meta(
+                "record_detection",
+                "default_record_type",
+                default=self._meta("defaults", "record_type_to_count", default=5),
+            )
+        report = {
+            "section": "Batch Date Completeness",
+            "status": "UNKNOWN",
+            "ach_type": ach_type,
+            "extension": extension,
+            "record_type_to_count": int(record_type_to_count),
+        }
+
+        try:
+            self.logger.info("")
+            self.logger.info("=" * 70)
+            self.logger.info("=== STARTING SECTION 3 BATCH DATE COMPLETENESS ANALYSIS ===")
+            self.logger.info("=" * 70)
+            self.logger.info(f"ACH Type Detected: {ach_type}")
+            self.logger.info(f"Processing file extension: {extension}")
+            # Config scalar override (only if explicitly set in config.ini).
+            try:
+                if bool(getattr(self.config, "batch_record_type_to_count_is_set", False)):
+                    record_type_to_count = int(
+                        getattr(self.config, "batch_record_type_to_count", record_type_to_count)
+                    )
+            except Exception:
+                pass
+            self.logger.info(f"Counting record type: {record_type_to_count}")
+
+            mypath = self.config.data_path
+            fileNames = folder_tools.get_filenames(mypath, extension=extension)
+            self.logger.info(f"Total files found: {len(fileNames)} in path: {mypath}")
+
+            if len(fileNames) == 0:
+                self.logger.error("No files found to analyze")
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = "No files found"
+                self.logger.info("")
+                self.logger.info("=" * 70)
+                self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+                self.logger.info("=" * 70)
+                self.logger.info("")
+                return report
+
+            rules = self._meta("ach_type_rules", ach_type, default={}) or {}
+            try:
+                needed_days = int(rules.get("required_days"))
+            except Exception:
+                needed_days = 180 if ach_type == "RDFI" else 90
+
+            # Config scalar override (only if explicitly set in config.ini).
+            try:
+                if ach_type == "RDFI" and bool(
+                    getattr(self.config, "batch_needed_days_rdfi_is_set", False)
+                ):
+                    needed_days = int(getattr(self.config, "batch_needed_days_rdfi", needed_days))
+                elif ach_type == "ODFI" and bool(
+                    getattr(self.config, "batch_needed_days_odfi_is_set", False)
+                ):
+                    needed_days = int(getattr(self.config, "batch_needed_days_odfi", needed_days))
+            except Exception:
+                pass
+
+            if ach_type not in ("ODFI", "RDFI"):
+                msg = f"[CRITICAL] Invalid ach_type: {ach_type}"
+                self.logger.critical(msg)
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = f"Invalid ach_type: {ach_type}"
+                self.logger.info("")
+                self.logger.info("=" * 70)
+                self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+                self.logger.info("=" * 70)
+                self.logger.info("")
+                return report
+
+            print("Will try and figure out the file date format...\n")
+
+            try:
+                sample_size = int(self._meta("date_detection", "sample_size", default=10))
+            except Exception:
+                sample_size = 10
+            sample_size = min(max(sample_size, 1), len(fileNames))
+            sample_files = fileNames[:sample_size]
+
+            print("Sample filenames:")
+            try:
+                preview_count = int(self._meta("date_detection", "preview_count", default=3))
+            except Exception:
+                preview_count = 3
+            preview_count = max(preview_count, 1)
+            for i, fname in enumerate(sample_files[:preview_count], 1):
+                print(f"  {i}. {fname}")
+            print()
+
+            try:
+                get_date, get_date_desc = self._get_configured_filename_date_parser()
+                if get_date:
+                    self.logger.info("Using configured filename date parser: {0}".format(get_date_desc))
+                else:
+                    get_date = self.find_file_date_type(sample_files)
+
+                if get_date is None:
+                    allow_prompt = bool(
+                        getattr(self.config, "allow_manual_filename_date_prompt", False)
+                    )
+                    if allow_prompt:
+                        self.logger.warning(
+                            "Auto-detection failed, requesting manual input (allow_manual_filename_date_prompt=True)"
+                        )
+                        get_date = self.manual_date_input_fallback()
+                    else:
+                        get_date = None
+
+                    if get_date is None:
+                        self.logger.error(
+                            "No filename date parser available. Configure substring/regex extraction in config.ini "
+                            "(filename_datetime_mode, filename_date_slice/filename_time_slice or filename_datetime_regex)."
+                        )
+                        print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                        report["status"] = "FAILED"
+                        report["reason"] = "Date format not detected; configure filename_datetime_* in config.ini"
+                        self.logger.info("")
+                        self.logger.info("=" * 70)
+                        self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+                        self.logger.info("=" * 70)
+                        self.logger.info("")
+                        return report
+
+                print("\nValidating date parser on sample files...")
+                try:
+                    validation_sample_count = int(
+                        self._meta("date_detection", "validation_sample_count", default=3)
+                    )
+                except Exception:
+                    validation_sample_count = 3
+                validation_sample_count = max(validation_sample_count, 1)
+                test_success = 0
+                for fname in sample_files[:validation_sample_count]:
+                    try:
+                        year, month, day = get_date(fname)
+                        test_date = date(year, month, day)
+                        print(f"{fname} -> {test_date}")
+                        test_success += 1
+                    except Exception as e:
+                        print(f"{fname} -> Failed: {e}")
+
+                if test_success == 0:
+                    self.logger.error("Date parser validation failed on all samples")
+                    print("\n*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                    report["status"] = "FAILED"
+                    report["reason"] = "Date parser validation failed on samples"
+                    self.logger.info("")
+                    self.logger.info("=" * 70)
+                    self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+                    self.logger.info("=" * 70)
+                    self.logger.info("")
+                    return report
+
+                print(f"\nDate parser validated ({test_success}/{min(validation_sample_count, len(sample_files))} successful)\n")
+
+            except Exception as e:
+                self.logger.critical(f"Date detection failed: {e}")
+                self.logger.debug(traceback.format_exc())
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = f"Date detection failed: {e}"
+                self.logger.info("")
+                self.logger.info("=" * 70)
+                self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+                self.logger.info("=" * 70)
+                self.logger.info("")
+                return report
+
+            if len(fileNames) > 0:
+                first_file_path = os.path.join(mypath, fileNames[0])
+                sample_records = self.count_record_types(first_file_path)
+                self.logger.info(f"Record types found in first file: {sample_records}")
+
+                if record_type_to_count not in sample_records:
+                    self.logger.warning(
+                        f"Type-{record_type_to_count} records not found in sample file"
+                    )
+                    auto_switch = bool(
+                        self._meta("record_detection", "auto_switch_if_missing", default=True)
+                    )
+                    if auto_switch and sample_records:
+                        available = sorted(sample_records.keys())
+                        self.logger.warning(f"Available record types: {available}")
+                        fallback_order = self._meta(
+                            "record_detection", "fallback_order", default=[6, "first_available"]
+                        )
+                        if not isinstance(fallback_order, list):
+                            fallback_order = [6, "first_available"]
+                        chosen = None
+                        for fb in fallback_order:
+                            if isinstance(fb, int) and fb in sample_records:
+                                chosen = fb
+                                break
+                            if isinstance(fb, str) and fb == "first_available" and available:
+                                chosen = available[0]
+                                break
+                        if chosen is not None:
+                            record_type_to_count = int(chosen)
+                            self.logger.info(f"Auto-switching to Type-{record_type_to_count} records")
+
+            date_counts = {}
+            total_files = len(fileNames)
+            next_update = self.config.update_delta
+            successfully_parsed = 0
+            failed_to_parse = 0
+            files_with_records = 0
+            files_without_records = 0
+
+            for file_counter, fname in enumerate(fileNames, 1):
+                progress = round(100 * file_counter / max(1, total_files))
+                if bool(getattr(self.config, "show_progress", False)) and progress >= next_update:
+                    self.logger.info(f"Batch-Date Completeness {next_update}% done")
+                    next_update += self.config.update_delta
+
+                try:
+                    year, month, day = get_date(fname)
+                    file_date = date(year, month, day)
+                    successfully_parsed += 1
+                except Exception as e:
+                    self.logger.error(f"[Date Parse Error] File={fname}, Reason={e}")
+                    self.logger.debug(traceback.format_exc())
+                    failed_to_parse += 1
+                    continue
+
+                try:
+                    with open(os.path.join(mypath, fname), "rb") as f:
+                        found_record = False
+                        encoding = str(
+                            self._meta("record_detection", "encoding", default="ascii") or "ascii"
+                        )
+                        decode_errors = str(
+                            self._meta("record_detection", "decode_errors", default="replace")
+                            or "replace"
+                        )
+                        for line_bytes in f:
+                            try:
+                                first = line_bytes[:1].decode(encoding, decode_errors)
+                                if not first or not first.isdigit():
+                                    continue
+                                key = int(first)
+                                if key == record_type_to_count:
+                                    found_record = True
+                                    date_counts[file_date] = (
+                                        date_counts.get(file_date, 0) + 1
+                                    )
+                            except Exception:
+                                continue
+
+                        if found_record:
+                            files_with_records += 1
+                        else:
+                            files_without_records += 1
+                            self.logger.warning(
+                                f"[No Type-{record_type_to_count} Records] File: {fname}"
+                            )
+
+                except Exception as e:
+                    self.logger.error(f"[File Read Error] File={fname}, Reason={e}")
+                    self.logger.debug(traceback.format_exc())
+                    continue
+
+            self.logger.info(
+                f"Date parsing summary: {successfully_parsed} successful, {failed_to_parse} failed"
+            )
+            self.logger.info(
+                f"Record counting summary: {files_with_records} files with Type-{record_type_to_count} records, {files_without_records} without"
+            )
+
+            if failed_to_parse > 0:
+                failure_rate = (failed_to_parse / total_files) * 100
+                self.logger.warning(f"Date parsing failure rate: {failure_rate:.1f}%")
+
+            if not date_counts:
+                self.logger.error("No valid date entries found from ACH files.")
+                self.logger.error("Diagnostic Information:")
+                self.logger.error(f"  - Total files processed: {total_files}")
+                self.logger.error(f"  - Successfully parsed dates: {successfully_parsed}")
+                self.logger.error(
+                    f"  - Files with Type-{record_type_to_count} records: {files_with_records}"
+                )
+                self.logger.error(
+                    f"  - Files without Type-{record_type_to_count} records: {files_without_records}"
+                )
+                self.logger.error("")
+                self.logger.error("Possible reasons:")
+                self.logger.error(
+                    f"  1. No files contain Type-{record_type_to_count} records"
+                )
+                self.logger.error("  2. Files are corrupted or in unexpected format")
+                self.logger.error("  3. Wrong record type being counted")
+                self.logger.error("")
+                self.logger.error(
+                    "Suggestion: Check a sample file manually to verify record types present"
+                )
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = "No valid date entries found from ACH files"
+                self.logger.info("")
+                self.logger.info("=" * 70)
+                self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+                self.logger.info("=" * 70)
+                self.logger.info("")
+                return report
+
+            theMin = min(date_counts.keys())
+            theMax = max(date_counts.keys())
+            date_range_days = (theMax - theMin).days
+            self.logger.info(
+                f"Date range detected: {theMin} -> {theMax} ({date_range_days} days)"
+            )
+            report["date_range"] = {
+                "min": str(theMin),
+                "max": str(theMax),
+                "days": int(date_range_days),
+            }
+            report["parsing"] = {
+                "successfully_parsed": int(successfully_parsed),
+                "failed_to_parse": int(failed_to_parse),
+                "files_with_records": int(files_with_records),
+                "files_without_records": int(files_without_records),
+                "record_type_counted": int(record_type_to_count),
+            }
+
+            requirement_label = str(rules.get("requirement_label") or "").strip()
+            if ach_type == "RDFI" and date_range_days < needed_days:
+                self.logger.error("")
+                self.logger.error("=" * 70)
+                self.logger.error(
+                    f"*** DATA REQUIREMENT NOT SATISFIED FOR {ach_type} MODEL BUILD ***"
+                )
+                if requirement_label:
+                    self.logger.error(f"*** {ach_type} REQUIRES {requirement_label} ***")
+                else:
+                    self.logger.error(f"*** {ach_type} REQUIRES {needed_days} DAYS OF DATA ***")
+                self.logger.error(
+                    f"*** CURRENT DATA RANGE: {date_range_days} DAYS ({date_range_days/30:.1f} MONTHS) ***"
+                )
+                self.logger.error("=" * 70)
+                self.logger.error("")
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                print(f"*** DATA REQUIREMENT NOT SATISFIED FOR {ach_type} MODEL BUILD ***")
+                if requirement_label:
+                    print(f"*** {ach_type} REQUIRES {requirement_label} ***")
+                else:
+                    print(f"*** {ach_type} REQUIRES {needed_days} DAYS OF DATA ***")
+                print(
+                    f"*** CURRENT DATA RANGE: {date_range_days} DAYS ({date_range_days/30:.1f} MONTHS) ***"
+                )
+                self.logger.info("")
+                self.logger.info("=" * 70)
+                self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+                self.logger.info("=" * 70)
+                self.logger.info("")
+                report["status"] = "FAILED"
+                report["reason"] = f"Data range {date_range_days} < required {needed_days} days for {ach_type}"
+                return report
+            elif ach_type == "ODFI" and date_range_days < needed_days:
+                self.logger.error("")
+                self.logger.error("=" * 70)
+                self.logger.error(
+                    f"*** DATA REQUIREMENT NOT SATISFIED FOR {ach_type} MODEL BUILD ***"
+                )
+                if requirement_label:
+                    self.logger.error(f"*** {ach_type} REQUIRES {requirement_label} ***")
+                else:
+                    self.logger.error(f"*** {ach_type} REQUIRES {needed_days} DAYS OF DATA ***")
+                self.logger.error(
+                    f"*** CURRENT DATA RANGE: {date_range_days} DAYS ({date_range_days/30:.1f} MONTHS) ***"
+                )
+                self.logger.error("=" * 70)
+                self.logger.error("")
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                print(f"*** DATA REQUIREMENT NOT SATISFIED FOR {ach_type} MODEL BUILD ***")
+                if requirement_label:
+                    print(f"*** {ach_type} REQUIRES {requirement_label} ***")
+                else:
+                    print(f"*** {ach_type} REQUIRES {needed_days} DAYS OF DATA ***")
+                print(
+                    f"*** CURRENT DATA RANGE: {date_range_days} DAYS ({date_range_days/30:.1f} MONTHS) ***"
+                )
+                self.logger.info("")
+                self.logger.info("=" * 70)
+                self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+                self.logger.info("=" * 70)
+                self.logger.info("")
+                report["status"] = "FAILED"
+                report["reason"] = f"Data range {date_range_days} < required {needed_days} days for {ach_type}"
+                return report
+
+            fill_missing = bool(self._meta("date_range", "fill_missing_dates", default=True))
+            count_mode = str(self._meta("date_range", "count_mode", default="inclusive") or "inclusive")
+            if fill_missing:
+                cur = theMin
+                while cur <= theMax if count_mode == "inclusive" else cur < theMax:
+                    date_counts.setdefault(cur, 0)
+                    cur += timedelta(days=1)
+
+            try:
+                import pandas as pd  # type: ignore
+                from pandas.tseries.holiday import USFederalHolidayCalendar  # type: ignore
+            except Exception as e:
+                self.logger.critical(f"Missing dependency for batch analysis: {e}")
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = f"Missing dependency: {e}"
+                return report
+
+            df_batches = pd.DataFrame(list(date_counts.items()), columns=["Date", "DateValue"])
+            df_batches["Date"] = pd.to_datetime(df_batches["Date"], errors="coerce")
+            exclude_weekends = bool(self._meta("calendar", "exclude_weekends", default=True))
+            if exclude_weekends:
+                df_batches = df_batches[df_batches["Date"].dt.weekday < 5]
+
+            holiday_calendar = self._meta(
+                "calendar", "holiday_calendar", default="USFederalHolidayCalendar"
+            )
+            if holiday_calendar:
+                holidays = []
+                if str(holiday_calendar) == "USFederalHolidayCalendar":
+                    cal = USFederalHolidayCalendar()
+                    holidays = cal.holidays(start=theMin, end=theMax).to_pydatetime()
+                else:
+                    self.logger.warning(
+                        f"Unknown holiday_calendar '{holiday_calendar}', skipping holiday filter."
+                    )
+                if holidays:
+                    self.logger.info(
+                        f"Excluding {len(holidays)} holidays from analysis ({holiday_calendar})."
+                    )
+                    df_batches = df_batches[~df_batches["Date"].isin(holidays)]
+            df_batches.reset_index(drop=True, inplace=True)
+
+            if len(df_batches) == 0:
+                self.logger.error("No business days found after filtering weekends/holidays")
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                report["status"] = "FAILED"
+                report["reason"] = "No business days found after filtering weekends/holidays"
+                self.logger.info("")
+                self.logger.info("=" * 70)
+                self.logger.info("=== FINISHED SECTION 3 BATCH DATE COMPLETENESS ANALYSIS ===")
+                self.logger.info("=" * 70)
+                self.logger.info("")
+                return report
+
+            median = df_batches["DateValue"].median()
+            reference = median
+            zero_strategy = str(
+                self._meta("anomaly_rules", "zero_reference_strategy", default="non_zero_median")
+                or "non_zero_median"
+            )
+            if (reference is None) or (float(reference) == 0.0 and zero_strategy == "non_zero_median"):
+                non_zero = df_batches[df_batches["DateValue"] > 0]["DateValue"]
+                if len(non_zero) > 0:
+                    reference = non_zero.median()
+
+            try:
+                low_ratio = float(self._meta("anomaly_rules", "low_volume_ratio", default=0.1))
+            except Exception:
+                low_ratio = 0.1
+            try:
+                high_ratio = float(self._meta("anomaly_rules", "high_volume_ratio", default=2.0))
+            except Exception:
+                high_ratio = 2.0
+
+            self.logger.info(f"Median batch count per day (post filters): {median}")
+            self.logger.info(
+                f"Anomaly baseline reference: {reference} (strategy={zero_strategy}, low_ratio={low_ratio}, high_ratio={high_ratio})"
+            )
+
+            # Compute thresholds from reference; if reference is 0, this will only flag >0 as high volume.
+            try:
+                ref = float(reference) if reference is not None else 0.0
+            except Exception:
+                ref = 0.0
+            low_thresh = ref * low_ratio
+            high_thresh = ref * high_ratio
+
+            too_small = df_batches["DateValue"] < low_thresh
+            too_big = df_batches["DateValue"] > high_thresh
+
+            missing_days = int(too_small.sum())
+            overloaded_days = int(too_big.sum())
+
+            if missing_days > 0:
+                self.logger.warning(
+                    f"{missing_days} business days with unusually low volume detected."
+                )
+                self.logger.warning(df_batches[too_small].to_string())
+
+            if overloaded_days > 0:
+                self.logger.warning(
+                    f"{overloaded_days} business days with unusually high volume detected."
+                )
+                self.logger.warning(df_batches[too_big].to_string())
+
+            self.logger.info("")
+            if (missing_days == 0) and (overloaded_days == 0):
+                print("*** BATCH DATE COMPLETENESS: TEST PASSED ***")
+                self.logger.info("*** TEST PASSED ***")
+                report["status"] = "PASSED"
+            else:
+                print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+                self.logger.info("*** TEST FAILED ***")
+                report["status"] = "FAILED"
+
+            report["volume_anomalies"] = {
+                "median": float(median) if median is not None else None,
+                "reference": float(reference) if reference is not None else None,
+                "low_volume_ratio": float(low_ratio),
+                "high_volume_ratio": float(high_ratio),
+                "low_threshold": float(low_thresh),
+                "high_threshold": float(high_thresh),
+                "missing_days_low_volume": int(missing_days),
+                "overloaded_days_high_volume": int(overloaded_days),
+            }
+
+            self.logger.info("")
+            self.logger.info("=" * 70)
+            self.logger.info("=== FINISHED SECTION 3 BATCH DATE COMPLETENESS ANALYSIS ===")
+            self.logger.info("=" * 70)
+            self.logger.info("")
+            return report
+
+        except Exception as e:
+            self.logger.critical(f"BatchDateCompletenessAnalyzer crashed: {e}")
+            self.logger.debug(traceback.format_exc())
+            print("*** BATCH DATE COMPLETENESS: TEST FAILED ***")
+            report["status"] = "FAILED"
+            report["reason"] = f"Crash: {e}"
+            self.logger.info("")
+            self.logger.info("=" * 70)
+            self.logger.info("=== FINISHED BATCH DATE COMPLETENESS ANALYSIS ===")
+            self.logger.info("=" * 70)
+            self.logger.info("")
+            return report
+
