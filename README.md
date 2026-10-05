@@ -218,19 +218,36 @@ These include filename/account/check/sequence context for root-cause analysis.
 
 ---
 
-## 10) Modules used
+## 10) Libraries used in this code
 
-Standard library:
+### Third-party libraries (install via pip)
 
-- `codecs`, `configparser`, `datetime`, `glob`, `json`, `logging`, `os`, `re`, `sys`, `traceback`, `typing`, `warnings`
+- `pandas` - dataframe operations, grouping, aggregation, reporting
+- `chardet` - input encoding detection for X9 files (ASCII vs EBCDIC/CP500 scenarios)
+- `lxml` (`lxml.etree`) - XML parsing and XML tree handling
 
-Third-party:
+Install command:
 
-- `pandas`
-- `chardet`
-- `lxml`
+```bash
+pip install pandas chardet lxml
+```
 
-Local modules:
+### Python standard library modules used
+
+- `codecs`
+- `configparser`
+- `datetime`
+- `glob`
+- `json`
+- `logging`
+- `os`
+- `re`
+- `sys`
+- `traceback`
+- `typing`
+- `warnings`
+
+### Project/local modules
 
 - `log_manager`
 - `xml_standard`
