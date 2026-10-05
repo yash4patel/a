@@ -1618,12 +1618,16 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         enable_duplicate_check = config.getboolean("VALIDATION", "enable_duplicate_check")
         enable_sequence_check = config.getboolean("VALIDATION", "enable_sequence_check")
         enable_date_continuity = config.getboolean("VALIDATION", "enable_date_continuity")
+        enable_hierarchical_report = config.getboolean(
+            "VALIDATION", "enable_hierarchical_report", fallback=True
+        )
     except Exception:
         bad_record_threshold = 5.0
         allow_zero, allow_missing, onus_max = False, False, 3
         enable_outlier_detection, iqr_multiplier = True, 3.0
         enable_duplicate_check, enable_sequence_check = True, True
         enable_date_continuity = True
+        enable_hierarchical_report = True
 
     x9_files = [p for p in glob.glob(f"{x937_dir}/*") if os.path.isfile(p)]
     if not x9_files:
@@ -1686,14 +1690,15 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
                 "issues": [f"Unable to read file: {e}"],
                 "missing_26_details": [],
             }
-            hierarchical_reports.append(
-                build_hierarchical_file_report(
-                    file_name=os.path.basename(path),
-                    records=[],
-                    structure=unreadable_structure,
-                    syntax_errors=0,
+            if enable_hierarchical_report:
+                hierarchical_reports.append(
+                    build_hierarchical_file_report(
+                        file_name=os.path.basename(path),
+                        records=[],
+                        structure=unreadable_structure,
+                        syntax_errors=0,
+                    )
                 )
-            )
             invalid_file_rows.append(
                 {
                     "filename": os.path.basename(path),
@@ -1722,14 +1727,15 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
 
         structure = validate_x937_file_structure(records, os.path.basename(path))
         structure_results.append(structure)
-        hierarchical_reports.append(
-            build_hierarchical_file_report(
-                file_name=os.path.basename(path),
-                records=records,
-                structure=structure,
-                syntax_errors=syntax_errors,
+        if enable_hierarchical_report:
+            hierarchical_reports.append(
+                build_hierarchical_file_report(
+                    file_name=os.path.basename(path),
+                    records=records,
+                    structure=structure,
+                    syntax_errors=syntax_errors,
+                )
             )
-        )
         has_structure_errors = not structure["is_valid"]
         if syntax_errors == 0 and not has_structure_errors:
             valid_x9_files.append(path)
@@ -1822,18 +1828,19 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         )
 
     hierarchical_report_path = f"x937_hierarchical_report_{current_time}.json"
-    with open(hierarchical_report_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "files_scanned": file_count,
-                "files_valid_for_processing": len(valid_x9_files),
-                "files_invalid": len(invalid_file_rows),
-                "files": hierarchical_reports,
-            },
-            f,
-            indent=2,
-        )
+    if enable_hierarchical_report:
+        with open(hierarchical_report_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "files_scanned": file_count,
+                    "files_valid_for_processing": len(valid_x9_files),
+                    "files_invalid": len(invalid_file_rows),
+                    "files": hierarchical_reports,
+                },
+                f,
+                indent=2,
+            )
 
     # Convert only valid files
     forward_json_file = f"fw_check_validation_{current_time}.jsonl"
@@ -1906,10 +1913,18 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         "Hierarchical UI Report Export",
         "INFO",
         (
-            f"Hierarchical JSON generated for {len(hierarchical_reports):,} files.\n"
-            f"Path: {hierarchical_report_path}"
+            (
+                f"Hierarchical JSON generated for {len(hierarchical_reports):,} files.\n"
+                f"Path: {hierarchical_report_path}"
+            )
+            if enable_hierarchical_report
+            else "Skipped (enable_hierarchical_report=false)."
         ),
-        "Use this artifact for UI drill-down: file -> cash letter -> bundle -> item -> record details.",
+        (
+            "Use this artifact for UI drill-down: file -> cash letter -> bundle -> item -> record details."
+            if enable_hierarchical_report
+            else "Enable hierarchical report only when UI drill-down artifact is required."
+        ),
     )
 
     # 1.1 Data Continuity
@@ -2369,12 +2384,20 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
     df_forward["25_auxiliary_on_us"] = aux_on_us_series
     df_forward["payer_account"] = on_us_series.str.split("/").str[0].fillna("")
     df_forward["check_number"] = aux_on_us_series.where(aux_on_us_series != "", on_us_last_series)
-    df_forward["TRANSACTION_TYPE"] = df_forward.apply(lambda row: classify_transaction(row, our_aba_list), axis=1)
+    payor_is_ours_series = df_forward["PAYOR_ROUTING"].isin(our_aba_list)
+    bofd_is_ours_series = df_forward["BOFD_ROUTING"].isin(our_aba_list)
+    txn_type = pd.Series("WITHDRAWAL", index=df_forward.index, dtype="string")
+    txn_type.loc[payor_is_ours_series & bofd_is_ours_series] = "ON_US"
+    txn_type.loc[(~payor_is_ours_series) & bofd_is_ours_series] = "DEPOSIT"
+    df_forward["TRANSACTION_TYPE"] = txn_type
     allowed_direction_types = {"DEPOSIT", "ON_US", "WITHDRAWAL"}
     df_forward["TRANSACTION_TYPE"] = df_forward["TRANSACTION_TYPE"].where(
         df_forward["TRANSACTION_TYPE"].isin(allowed_direction_types), "WITHDRAWAL"
     )
-    df_forward["CR_DR_FLAG"] = df_forward.apply(lambda row: credit_debit_flag(row, our_aba_list), axis=1)
+    credit_debit = pd.Series("EXTERNAL", index=df_forward.index, dtype="string")
+    credit_debit.loc[bofd_is_ours_series] = "CREDIT"
+    credit_debit.loc[(~bofd_is_ours_series) & payor_is_ours_series] = "DEBIT"
+    df_forward["CR_DR_FLAG"] = credit_debit
     df_forward["ITEM_AMOUNT_FLOAT"] = pd.to_numeric(df_forward["25_item_amount"], errors="coerce") / 100
     df_forward["onus_elements"] = on_us_series.apply(
         lambda value: len([part for part in value.split("/") if part]) if value else 0
@@ -2397,8 +2420,6 @@ def process_x9_files(x937_dir, sample_days, our_aba, config):
         "Direction model uses three buckets: DEPOSIT, ON_US, WITHDRAWAL.",
     )
 
-    payor_is_ours_series = df_forward["PAYOR_ROUTING"].isin(our_aba_list)
-    bofd_is_ours_series = df_forward["BOFD_ROUTING"].isin(our_aba_list)
     both_external = df_forward[~payor_is_ours_series & ~bofd_is_ours_series]
     payor_ours_bofd_external = df_forward[payor_is_ours_series & ~bofd_is_ours_series]
     payor_external_bofd_ours = df_forward[~payor_is_ours_series & bofd_is_ours_series]
